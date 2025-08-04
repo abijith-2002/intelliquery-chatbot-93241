@@ -1,0 +1,59 @@
+Q: How do I test the user registration feature in our e-commerce application?
+A: Test for valid and invalid inputs, field validations, email format, password strength, duplicate email handling, and successful redirection to the login page upon registration.
+
+Q: What test cases should be included when testing the shopping cart module?
+A: Include adding/removing products, updating quantities, price calculations, stock validations, and session persistence across user logins.
+
+Q: How can I validate the checkout process in the application?
+A: Test address form validations, payment gateway integration, promo code application, tax calculation, and order confirmation emails.
+
+Q: What are the key scenarios for testing login functionality in our platform?
+A: Test for correct/incorrect credentials, account lockout after multiple failed attempts, "Remember Me" functionality, and session timeout.
+
+Q: How do I test the product search feature?
+A: Validate keyword matching, filters (category, price range, brand), search speed, and handling of no results or misspelled terms.
+
+Q: What are common bugs to look for when testing the order history page?
+A: Look for incorrect order statuses, missing items, wrong dates or prices, pagination issues, and slow loading times.
+
+Q: What should I check when testing coupon or promo code functionality?
+A: Validate code application, expiration handling, usage limits, eligibility based on product or cart value, and discount calculation.
+
+Q: What’s the best way to test the product recommendation engine?
+A: Verify that recommendations are relevant, update with browsing/purchase history, and render correctly across different devices.
+
+Q: What performance tests should be run on the e-commerce platform?
+A: Test load handling during sales events, response time for product pages, concurrent checkout processing, and database query optimization.
+
+Q: What security tests are important for our application?
+A: Conduct tests for SQL injection, XSS, CSRF, broken authentication, insecure direct object references, and ensure HTTPS is enforced.
+
+Q: How do I automate the smoke tests for the e-commerce app?
+A: Focus on login, product search, add-to-cart, checkout flow, and logout using tools like Selenium, Cypress, or Playwright.
+
+Q: What should I test on the mobile view of our web app?
+A: Test responsive layout, tap targets, scroll behavior, performance on slow networks, and touch gestures for navigation.
+
+Q: How do we test third-party payment gateway integration?
+A: Validate payment success, failure, cancel flows, fraud detection flags, and webhook response handling from the provider.
+
+Q: What logs or tools help identify issues in the checkout flow?
+A: Use browser console logs, network tab in dev tools, server logs, APM tools like New Relic or Datadog, and error tracking tools like Sentry.
+
+Q: How do I test product image uploads in the admin panel?
+A: Validate file type/size restrictions, image resolution, duplicate uploads, alt-text requirement, and successful storage/display.
+
+Q: What are the test cases for the wishlist feature?
+A: Add/remove items, duplicate handling, wishlist sharing, persistence after login/logout, and stock availability updates.
+
+Q: How should we test order cancellation and refund processes?
+A: Validate cancellation window, refund timeline, payment reversal, status updates, and email notifications.
+
+Q: How do I handle flaky UI tests in our automation suite?
+A: Review synchronization (waits), element stability, network delays, dynamic IDs, and isolate browser/environment-related issues.
+
+Q: What APIs should be tested for the shopping cart service?
+A: Test add item, remove item, update quantity, get cart summary, and clear cart APIs with valid and invalid payloads.
+
+Q: How do we verify data integrity after a successful order?
+A: Confirm order data is saved in the database, inventory is updated, confirmation email is triggered, and the user account shows correct order history.
