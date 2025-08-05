@@ -174,9 +174,10 @@ def chat(request: ChatRequest):
             rag_answer = "No answer available"
             # Do not raise; allow conversation to show the error fallback
 
-        # Add bot's answer to memory before Gemini call, always use {"output": ...}
+        # Add bot's answer to memory before Gemini call, always use {"input": <prev_user>, "output": ...}
         try:
-            memory.save_context({}, {"output": _safe_str_output(rag_answer)})
+            # For consistency, always provide non-empty input with 'input' key for every save_context call
+            memory.save_context({"input": request.query}, {"output": _safe_str_output(rag_answer)})
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save RAG answer to memory: {e}")
 
@@ -190,9 +191,9 @@ def chat(request: ChatRequest):
         except Exception as e:
             gemini_answer = _safe_str_output(f"[Gemini enhancement unavailable: {e}]\nKnowledge base answer: {rag_answer}")
 
-        # Add Gemini-enhanced answer to memory, always use {"output": ...}
+        # Add Gemini-enhanced answer to memory, always use {"input": <prev_user>, "output": ...}
         try:
-            memory.save_context({}, {"output": _safe_str_output(gemini_answer)})
+            memory.save_context({"input": request.query}, {"output": _safe_str_output(gemini_answer)})
         except Exception as e:
             # Compose a warning but do not crash the whole chat
             gemini_answer += f"\n[Warning: Failed to save Gemini response to memory: {e}]"
