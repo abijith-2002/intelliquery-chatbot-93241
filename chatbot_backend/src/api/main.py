@@ -130,42 +130,63 @@ def chat(request: ChatRequest):
     Returns:
         ChatResponse: RAG answer, Gemini-enhanced answer, and conversation context.
     """
-    # Handle conversation memory
-    session_id = request.session_id
-    if session_id not in CONVERSATION_MEMORY:
-        CONVERSATION_MEMORY[session_id] = ConversationBufferMemory(return_messages=True)
-    memory = CONVERSATION_MEMORY[session_id]
+    try:
+        # Validate input
+        if not request.query or not request.query.strip():
+            raise HTTPException(status_code=400, detail="Query cannot be empty")
+        
+        if not request.session_id or not request.session_id.strip():
+            raise HTTPException(status_code=400, detail="Session ID cannot be empty")
 
-    # Add user input to memory
-    memory.save_context({"input": request.query}, {})
+        # Handle conversation memory
+        session_id = request.session_id
+        if session_id not in CONVERSATION_MEMORY:
+            CONVERSATION_MEMORY[session_id] = ConversationBufferMemory(return_messages=True)
+        memory = CONVERSATION_MEMORY[session_id]
 
-    # RAG: Retrieve best match
-    qa = rag_retrieve(request.query, QA_LIST)
-    rag_answer = qa["a"]
+        # RAG: Retrieve best match
+        if not QA_LIST:
+            raise HTTPException(status_code=500, detail="Knowledge base not loaded")
+        
+        qa = rag_retrieve(request.query, QA_LIST)
+        rag_answer = qa["a"]
 
-    # Add bot's answer to memory before Gemini call
-    memory.save_context({}, {"output": rag_answer})
+        # Enhance answer with Gemini
+        gemini_answer = get_gemini_response(request.query, rag_answer, memory)
 
-    # Enhance answer with Gemini
-    gemini_answer = get_gemini_response(request.query, rag_answer, memory)
+        # Add conversation to memory after getting the response
+        try:
+            memory.save_context({"input": request.query}, {"output": gemini_answer})
+        except Exception as memory_error:
+            # If memory fails, continue without saving to memory
+            print(f"Warning: Failed to save to memory: {memory_error}")
 
-    # Add Gemini-enhanced answer to memory
-    memory.save_context({}, {"output": gemini_answer})
+        # Prepare conversation history (latest 10 exchanges)
+        conversation_history = []
+        try:
+            if hasattr(memory, "chat_memory") and hasattr(memory.chat_memory, "messages"):
+                for m in memory.chat_memory.messages[-20:]:
+                    m_dict = {}
+                    if hasattr(m, "type") and hasattr(m, "content"):
+                        m_dict = {"type": m.type, "content": m.content}
+                    conversation_history.append(m_dict)
+        except Exception as history_error:
+            print(f"Warning: Failed to retrieve conversation history: {history_error}")
+            conversation_history = []
 
-    # Prepare conversation history (latest 10 exchanges)
-    conversation_history = []
-    if hasattr(memory, "chat_memory") and hasattr(memory.chat_memory, "messages"):
-        for m in memory.chat_memory.messages[-20:]:
-            m_dict = {}
-            if hasattr(m, "type") and hasattr(m, "content"):
-                m_dict = {"type": m.type, "content": m.content}
-            conversation_history.append(m_dict)
-
-    return ChatResponse(
-        rag_answer=rag_answer,
-        gemini_answer=gemini_answer,
-        conversation_history=conversation_history,
-    )
+        return ChatResponse(
+            rag_answer=rag_answer,
+            gemini_answer=gemini_answer,
+            conversation_history=conversation_history,
+        )
+    
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        # Log the error and return a 500 with a generic message
+        print(f"Unexpected error in chat endpoint: {e}")
+        raise HTTPException(status_code=500, detail="An unexpected error occurred while processing your request")
 
 # Add endpoint doc for WebSocket and real-time (optional, can expand later)
 @app.get("/chat/wsinfo", tags=["Chat"], summary="WebSocket usage info", description="Info about WebSocket/API support for real-time chat.")
