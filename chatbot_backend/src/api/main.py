@@ -77,9 +77,17 @@ def similarity(a: str, b: str) -> float:
         return 0.0
     return len(shared) / max(len(set_a), len(set_b))
 
-def rag_retrieve(query: str, qa_list: List[dict]) -> dict:
-    """Retrieve the QA pair most relevant to the query."""
+def rag_retrieve(query: str, qa_list: List[dict], threshold: float = 0.38) -> dict:
+    """
+    Retrieve the QA pair most relevant to the query based on similarity.
+    If similarity is below the threshold, treat as no relevant information.
+    """
+    if not qa_list:
+        return {"q": "", "a": ""}
     best_match = max(qa_list, key=lambda qa: similarity(query, qa['q']))
+    sim_score = similarity(query, best_match['q'])
+    if sim_score < threshold:
+        return {"q": "", "a": ""}
     return best_match
 
 def get_gemini_response(query: str, rag_answer: str, memory: ConversationBufferMemory) -> str:
@@ -167,13 +175,48 @@ def chat(request: ChatRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
 
-        # RAG: Retrieve best match
+        # RAG: Retrieve best match using threshold-based retrieval
         try:
             qa = rag_retrieve(request.query, QA_LIST)
-            rag_answer = _safe_str_output(qa.get("a", None))
+            if qa.get("a", "") == "":
+                # No relevant information found
+                rag_answer = "No relevant information is present in the knowledge base."
+                # Gemini answer should echo this message
+                gemini_answer = "No relevant information is present in the knowledge base."
+                # Add both to memory to maintain consistent history
+                memory.save_context({"input": request.query}, {"output": rag_answer})
+                memory.save_context({"input": request.query}, {"output": gemini_answer})
+                conversation_history = []
+                if hasattr(memory, "chat_memory") and hasattr(memory.chat_memory, "messages"):
+                    for m in memory.chat_memory.messages[-20:]:
+                        m_dict = {}
+                        if hasattr(m, "type") and hasattr(m, "content"):
+                            m_dict = {"type": m.type, "content": _safe_str_output(m.content)}
+                        conversation_history.append(m_dict)
+                return ChatResponse(
+                    rag_answer=rag_answer,
+                    gemini_answer=gemini_answer,
+                    conversation_history=conversation_history,
+                )
+            else:
+                rag_answer = _safe_str_output(qa.get("a", None))
         except Exception:
-            rag_answer = "No answer available"
-            # Do not raise; allow conversation to show the error fallback
+            rag_answer = "No relevant information is present in the knowledge base."
+            gemini_answer = "No relevant information is present in the knowledge base."
+            memory.save_context({"input": request.query}, {"output": rag_answer})
+            memory.save_context({"input": request.query}, {"output": gemini_answer})
+            conversation_history = []
+            if hasattr(memory, "chat_memory") and hasattr(memory.chat_memory, "messages"):
+                for m in memory.chat_memory.messages[-20:]:
+                    m_dict = {}
+                    if hasattr(m, "type") and hasattr(m, "content"):
+                        m_dict = {"type": m.type, "content": _safe_str_output(m.content)}
+                    conversation_history.append(m_dict)
+            return ChatResponse(
+                rag_answer=rag_answer,
+                gemini_answer=gemini_answer,
+                conversation_history=conversation_history,
+            )
 
         # Add bot's answer to memory before Gemini call, always use {"input": <prev_user>, "output": ...}
         try:
