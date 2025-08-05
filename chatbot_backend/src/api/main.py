@@ -144,77 +144,59 @@ def health_check():
     """
     return {"message": "Healthy"}
 
-@app.post("/chat", response_model=ChatResponse, tags=["Chat"], summary="Chat with bot", description="Submit a chat query. Retrieves an answer from the RAG knowledge base, enhances with Gemini, and returns the chat context.")
+@app.post("/chat", response_model=ChatResponse, tags=["Chat"], summary="Chat with bot", description="Submit a chat query. Gemini always answers; a RAG knowledge base document is included as additional Gemini context if relevant; conversation history is always provided to Gemini for context.")
 def chat(request: ChatRequest):
     """
     PUBLIC_INTERFACE
-    Handles a user's chat request, uses RAG to get initial answer, calls Gemini API for enhanced answer,
-    and maintains conversation context using ConversationBufferMemory.
-
-    Enhanced: If there is no direct KB match, checks if the query is contextually relevant to
-    recent conversation turns (semantic overlap or topical similarity).
-    If context-relevant, Gemini is invoked with full context for response.
+    Handles user's chat request. All answers come directly from Gemini.
+    If a RAG knowledge base document is relevant, its content is included as additional context in the Gemini prompt.
+    The current conversation history is always provided to Gemini to support follow-up queries or context-aware answers.
     """
     import traceback
 
-    def semantic_context_relevance(query: str, memory: ConversationBufferMemory, relevance_threshold: float = 0.17) -> bool:
-        """
-        Returns True if query has semantic/topic overlap with recent conversation history.
-        Conservative if no memory or no prior messages.
-        Uses token overlap (can be replaced by better semantic sim).
-        """
-        if not hasattr(memory, "chat_memory") or not hasattr(memory.chat_memory, "messages"):
-            return False
-        messages = memory.chat_memory.messages[-8:]  # up to last 8 turns
-        if not messages:
-            return False
-        total_score = 0.0
-        for m in messages:
-            # Only check user utterances (could add filter if .type == 'human')
-            content = getattr(m, "content", "")
-            total_score += similarity(query, str(content))
-        avg_score = total_score / max(len(messages), 1)
-        return avg_score > relevance_threshold
-
     try:
-        # Handle conversation memory
         session_id = request.session_id
         if not session_id or not isinstance(session_id, str):
             raise HTTPException(status_code=400, detail="session_id must be a non-empty string.")
 
         if session_id not in CONVERSATION_MEMORY:
-            # Set output_key explicitly to resolve ambiguous/missing output key issues when saving context
             CONVERSATION_MEMORY[session_id] = ConversationBufferMemory(
                 return_messages=True,
                 output_key="output"
             )
         memory = CONVERSATION_MEMORY[session_id]
 
-        # Utility to always ensure output passed to memory is a non-None string
+        # Ensure user input is logged to memory (with a temp placeholder output)
         def _safe_str_output(val, fallback="No answer available"):
             if val is None or (isinstance(val, str) and val.strip() == ""):
                 return fallback
             return str(val)
-
-        # Add user input to memory with output_key structure always present
         try:
-            # For initial user message, output is set to a default response (to avoid None)
             memory.save_context({"input": request.query}, {"output": _safe_str_output("", "No answer available")})
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
 
-        # RAG: Retrieve best match using threshold-based retrieval
-        try:
-            qa = rag_retrieve(request.query, QA_LIST)
-            rag_weak_match = qa.get("weak_match", False)
-            kb_a = qa.get("a", "")
-            no_kb_info = (kb_a == "" and not rag_weak_match)
-        except Exception:
-            no_kb_info = True
-            rag_weak_match = False
-            kb_a = ""
-            qa = {}
-        # Prepare conversation_history always for output
+        # RAG retrieval: Always attempt, regardless of flow
+        qa = rag_retrieve(request.query, QA_LIST)
+        rag_weak_match = qa.get("weak_match", False)
+        kb_q = qa.get("q", "")
+        kb_a = qa.get("a", "")
+        rag_answer = ""
+        rag_context = ""
+        if kb_a != "":
+            # Strong KB answer; include in Gemini context
+            rag_answer = kb_a
+            rag_context = f"Knowledge base answer: \"{kb_a}\""
+        elif kb_q != "" and rag_weak_match:
+            # General/topic match; include topic info in context, but not a real answer
+            rag_answer = ""
+            rag_context = f"This topic is generally covered in the knowledge base, but there is no specific matching answer."
+        else:
+            # No KB info at all
+            rag_answer = ""
+            rag_context = ""
+
+        # Prepare conversation history for output (last 20 messages)
         conversation_history = []
         if hasattr(memory, "chat_memory") and hasattr(memory.chat_memory, "messages"):
             for m in memory.chat_memory.messages[-20:]:
@@ -223,79 +205,48 @@ def chat(request: ChatRequest):
                     m_dict = {"type": m.type, "content": _safe_str_output(m.content)}
                 conversation_history.append(m_dict)
 
-        gemini_answer = None
+        # NEW: Construct Gemini prompt always with conversation history, user query, and any rag_context (if found)
+        def build_gemini_prompt(query: str, rag_context: str, memory: ConversationBufferMemory) -> str:
+            mem_str = memory.buffer_as_str if hasattr(memory, "buffer_as_str") else ""
+            base = "You are an expert software assistant.\n"
+            base += "User's question: '{}'\n".format(query)
+            if rag_context:
+                base += "{}\n".format(rag_context)
+            base += "Conversation history:\n{}\n".format(mem_str)
+            base += "Please answer the user's latest question, using all above information. Be concise, clear, and indicate if any response relies on knowledge base context."
+            return base
 
-        if no_kb_info:
-            # No KB info, so check for context relevance
-            context_relevant = semantic_context_relevance(request.query, memory)
-            if context_relevant:
-                # The query is context-relevant; Gemini should reply in context
-                rag_answer = "No relevant information is present in the knowledge base, but your query relates to our ongoing conversation."
-                try:
-                    # Send full context to Gemini for a plausible, human-likely answer
-                    gemini_answer = get_gemini_response(request.query, rag_answer, memory)
-                except Exception as e:
-                    gemini_answer = _safe_str_output(f"[Gemini enhancement unavailable: {e}]\nKnowledge base answer: {rag_answer}")
-            else:
-                # Not relevant to chat context either: generic reply
-                rag_answer = "No relevant information is present in the knowledge base."
-                gemini_answer = "No relevant information is present in the knowledge base."
-            # Save both
-            try:
-                memory.save_context({"input": request.query}, {"output": _safe_str_output(rag_answer)})
-                memory.save_context({"input": request.query}, {"output": _safe_str_output(gemini_answer)})
-            except Exception:
-                pass
-            return ChatResponse(
-                rag_answer=_safe_str_output(rag_answer),
-                gemini_answer=_safe_str_output(gemini_answer),
-                conversation_history=conversation_history
-            )
-        elif kb_a == "" and rag_weak_match:
-            # Query matches general topic (but no answer); treat as context-aware Gemini invocation
-            rag_answer = "No specific information is present in the knowledge base, but this topic is within its general area."
-            try:
-                gemini_answer = get_gemini_response(request.query, rag_answer, memory)
-            except Exception as e:
-                gemini_answer = _safe_str_output(f"[Gemini enhancement unavailable: {e}]\nKnowledge base answer: {rag_answer}")
-            # Save both
-            try:
-                memory.save_context({"input": request.query}, {"output": _safe_str_output(rag_answer)})
-                memory.save_context({"input": request.query}, {"output": _safe_str_output(gemini_answer)})
-            except Exception:
-                pass
-            return ChatResponse(
-                rag_answer=_safe_str_output(rag_answer),
-                gemini_answer=_safe_str_output(gemini_answer),
-                conversation_history=conversation_history
-            )
-        else:
-            # KB hit, normal flow: save and Gemini
-            rag_answer = _safe_str_output(kb_a)
-            try:
-                memory.save_context({"input": request.query}, {"output": rag_answer})
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Failed to save RAG answer to memory: {e}")
-            try:
-                gemini_answer = get_gemini_response(request.query, rag_answer, memory)
-                gemini_answer = _safe_str_output(gemini_answer)
-            except HTTPException:
-                raise
-            except Exception as e:
-                gemini_answer = _safe_str_output(f"[Gemini enhancement unavailable: {e}]\nKnowledge base answer: {rag_answer}")
-            try:
-                memory.save_context({"input": request.query}, {"output": gemini_answer})
-            except Exception as e:
-                gemini_answer += f"\n[Warning: Failed to save Gemini response to memory: {e}]"
-            return ChatResponse(
-                rag_answer=_safe_str_output(rag_answer),
-                gemini_answer=_safe_str_output(gemini_answer),
-                conversation_history=conversation_history
-            )
+        gemini_prompt = build_gemini_prompt(request.query, rag_context, memory)
+
+        # Prepare Gemini API request with new prompt (always lets Gemini answer, optionally with KB context)
+        gemini_answer = None
+        try:
+            gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+            if not gemini_api_key:
+                raise HTTPException(status_code=500, detail="Gemini API key is not set in environment variables.")
+            genai.configure(api_key=gemini_api_key)
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            response = model.generate_content([{"role": "user", "parts": [gemini_prompt]}])
+            gemini_answer = response.text.strip()
+        except Exception as e:
+            gemini_answer = _safe_str_output("[Gemini unavailable: {}]\n{}".format(e, rag_context or "No relevant KB context."))
+
+        # Save Gemini answer as output for this turn
+        try:
+            memory.save_context({"input": request.query}, {"output": _safe_str_output(gemini_answer)})
+        except Exception:
+            pass  # Don't raise just for failed memory update
+
+        # For output: expose rag_answer for compatibility, but gemini_answer is always the direct chatbot response
+        return ChatResponse(
+            rag_answer=_safe_str_output(rag_answer),  # Could be empty str
+            gemini_answer=_safe_str_output(gemini_answer),  # Always Gemini's answer
+            conversation_history=conversation_history
+        )
+
     except HTTPException:
         raise  # Allow FastAPI HTTPExceptions to propagate
     except Exception as e:
-        # Log details for debugging
         tb = traceback.format_exc()
         print(f"Internal Server Error in /chat endpoint: {e}\nTraceback:\n{tb}")
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {e}")
