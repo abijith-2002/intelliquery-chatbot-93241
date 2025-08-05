@@ -77,38 +77,88 @@ def similarity(a: str, b: str) -> float:
         return 0.0
     return len(shared) / max(len(set_a), len(set_b))
 
-def rag_retrieve(query: str, qa_list: List[dict]) -> dict:
-    """Retrieve the QA pair most relevant to the query."""
+def rag_retrieve(query: str, qa_list: List[dict], threshold: float = 0.38, weak_threshold: float = 0.18) -> dict:
+    """
+    Retrieve the QA pair most relevant to the query based on similarity.
+    Returns a dict with keys:
+        - 'q': question string of best match (empty if none)
+        - 'a': answer string of best match (empty if none)
+        - 'weak_match': True if similarity is above weak_threshold but below main threshold, else False
+    If similarity is below weak_threshold, treat as NO relevant information at all (not even general topic match).
+    If similarity is above weak_threshold but below threshold, treat as GENERAL TOPIC match.
+    If similarity is above threshold, treat as STRONG KB answer.
+    """
+    if not qa_list:
+        return {"q": "", "a": "", "weak_match": False}
     best_match = max(qa_list, key=lambda qa: similarity(query, qa['q']))
-    return best_match
+    sim_score = similarity(query, best_match['q'])
+    if sim_score < weak_threshold:
+        # No KB info, no topic match (totally out-of-scope)
+        return {"q": "", "a": "", "weak_match": False}
+    elif sim_score < threshold:
+        # General/topic match, but not specific – signal weak_match
+        return {"q": best_match['q'], "a": "", "weak_match": True}
+    return {"q": best_match['q'], "a": best_match['a'], "weak_match": False}
 
+def clean_gemini_output(text: str) -> str:
+    """
+    Removes leading/trailing meta, KB source, or disclaimer information from Gemini output.
+    Ensures only direct answers are delivered to the user.
+    """
+    import re
+    META_PATTERNS = [
+        # Remove variants at start of the answer
+        r"(?i)^ *(?:based on (?:the )?(?:provided )?(?:knowledge ?base|context|sources)[^:]*:?)",
+        r"(?i)^(?:as an?\s+[^\s:,]+ [^\s:,]+,?)[\s:.-]*",
+        r"(?i)^ *(?:this information[^:]*:?)",
+        r"(?i)^ *(?:note:)[^\n\r]*",
+        r"(?i)^ *(?:please note)[^\n\r]*",
+        r"(?i)^ *(?:source[sd]?:)[^\n\r]*",
+        r"(?i)^ *(?:from the knowledge base[^:]*:?)",
+        r"(?i)^ *(?:provided context[^:]*:?)",
+        r"(?i)^\(?(?:based on|as an ai language model|this information|provided context)[^\)]*\)?",
+    ]
+    # Remove trailing variants
+    TRAIL_PATTERNS = [
+        r"(?i)\(? *(?:based on (?:the )?(?:provided )?(?:knowledge ?base|context|sources)[^)]*)\)?[.!]? *$",
+        r"(?i)\(? *(?:from the knowledge base)[^)]*\)?[.!]? *$",
+        r"(?i)\(? *(?:provided context)[^)]*\)?[.!]? *$",
+    ]
+    clean_text = text
+    for pat in META_PATTERNS:
+        clean_text = re.sub(pat, "", clean_text, flags=re.IGNORECASE | re.MULTILINE)
+    for pat in TRAIL_PATTERNS:
+        clean_text = re.sub(pat, "", clean_text, flags=re.IGNORECASE | re.MULTILINE)
+    clean_text = clean_text.strip()
+    return clean_text
+
+# PUBLIC_INTERFACE
 def get_gemini_response(query: str, rag_answer: str, memory: ConversationBufferMemory) -> str:
     """
-    PUBLIC_INTERFACE
-    Enhance the RAG answer using Google Gemini API, considering the chat context.
+    Enhance the answer using Google Gemini API, considering the chat context.
+    Never include statements about sources, knowledge base, RAG, or meta-assertions in the prompt or response.
     """
-    # Prepare the prompt
     mem_str = memory.buffer_as_str if hasattr(memory, "buffer_as_str") else ""
     prompt = (
-        f"You are an expert software assistant. The user asked: '{query}'\n"
-        f"Most relevant knowledge base answer: \"{rag_answer}\"\n"
-        f"Conversation context: {mem_str}\n"
-        f"Please provide the clearest and most helpful answer based on all of the above."
+        f"You are an expert software assistant.\n"
+        f"User's question: '{query}'\n"
+        f"{f'Relevant answer: \"{rag_answer}\"\\n' if rag_answer.strip() else ''}"
+        f"Conversation history:\n{mem_str}\n"
+        f"Please answer the user's latest question. Be concise and clear."
     )
 
-    # Call Gemini API
     gemini_api_key = os.getenv("GEMINI_API_KEY", "")
     if not gemini_api_key:
         raise HTTPException(status_code=500, detail="Gemini API key is not set in environment variables.")
     try:
         genai.configure(api_key=gemini_api_key)
-        model = genai.GenerativeModel("gemini-pro")
+        model = genai.GenerativeModel("gemini-2.5-flash")
         response = model.generate_content([{"role": "user", "parts": [prompt]}])
-        answer = response.text.strip()
-        return answer
+        raw_answer = response.text.strip()
+        return clean_gemini_output(raw_answer)
     except Exception as e:
         # Fallback to original RAG answer if Gemini API fails
-        return f"[Gemini enhancement unavailable: {e}]\nKnowledge base answer: {rag_answer}"
+        return clean_gemini_output(f"[Gemini enhancement unavailable: {e}]\n{rag_answer}")
 
 # Load the knowledge base at startup
 ANSWERS_PATH = os.path.join(os.path.dirname(__file__), "answers.txt")
@@ -125,87 +175,89 @@ def health_check():
     """
     return {"message": "Healthy"}
 
-@app.post("/chat", response_model=ChatResponse, tags=["Chat"], summary="Chat with bot", description="Submit a chat query. Retrieves an answer from the RAG knowledge base, enhances with Gemini, and returns the chat context.")
+@app.post("/chat", response_model=ChatResponse, tags=["Chat"], summary="Chat with bot", description="Submit a chat query. Gemini always answers; a RAG knowledge base document is included as additional Gemini context if relevant; conversation history is always provided to Gemini for context.")
 def chat(request: ChatRequest):
     """
     PUBLIC_INTERFACE
-    Handles a user's chat request, uses RAG to get initial answer, calls Gemini API for enhanced answer,
-    and maintains conversation context using ConversationBufferMemory.
-
-    Args:
-        request (ChatRequest): Contains session_id and user query.
-    Returns:
-        ChatResponse: RAG answer, Gemini-enhanced answer, and conversation context.
+    Handles user's chat request. All answers come directly from Gemini.
+    The current conversation history is always provided to Gemini to support follow-up queries or context-aware answers.
     """
     import traceback
 
     try:
-        # Handle conversation memory
         session_id = request.session_id
         if not session_id or not isinstance(session_id, str):
             raise HTTPException(status_code=400, detail="session_id must be a non-empty string.")
 
         if session_id not in CONVERSATION_MEMORY:
-            CONVERSATION_MEMORY[session_id] = ConversationBufferMemory(return_messages=True)
+            CONVERSATION_MEMORY[session_id] = ConversationBufferMemory(
+                return_messages=True,
+                output_key="output"
+            )
         memory = CONVERSATION_MEMORY[session_id]
 
-        # Add user input to memory
+        # Ensure user input is logged to memory (with a temp placeholder output)
+        def _safe_str_output(val, fallback="No answer available"):
+            if val is None or (isinstance(val, str) and val.strip() == ""):
+                return fallback
+            return str(val)
         try:
-            memory.save_context({"input": request.query}, {})
+            memory.save_context({"input": request.query}, {"output": _safe_str_output("", "No answer available")})
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
 
-        # RAG: Retrieve best match
-        try:
-            qa = rag_retrieve(request.query, QA_LIST)
-            rag_answer = qa["a"]
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Knowledge retrieval failed: {e}")
+        # RAG retrieval
+        qa = rag_retrieve(request.query, QA_LIST)
+        rag_weak_match = qa.get("weak_match", False)
+        kb_q = qa.get("q", "")
+        kb_a = qa.get("a", "")
+        rag_answer = ""
+        # For legacy: retain variable, but do not use meta-language
+        if kb_a != "":
+            rag_answer = kb_a
+        elif kb_q != "" and rag_weak_match:
+            rag_answer = ""
+        else:
+            rag_answer = ""
 
-        # Add bot's answer to memory before Gemini call
-        try:
-            memory.save_context({}, {"output": rag_answer})
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to save RAG answer to memory: {e}")
-
-        # Enhance answer with Gemini
-        try:
-            gemini_answer = get_gemini_response(request.query, rag_answer, memory)
-        except HTTPException:
-            # Propagate Gemini API key missing explicitly
-            raise
-        except Exception as e:
-            gemini_answer = f"[Gemini enhancement unavailable: {e}]\nKnowledge base answer: {rag_answer}"
-
-        # Add Gemini-enhanced answer to memory
-        try:
-            memory.save_context({}, {"output": gemini_answer})
-        except Exception as e:
-            # Compose a warning but do not crash the whole chat
-            gemini_answer += f"\n[Warning: Failed to save Gemini response to memory: {e}]"
-
-        # Prepare conversation history (latest 20 exchanges)
+        # Prepare conversation history for output (last 20 messages)
         conversation_history = []
         if hasattr(memory, "chat_memory") and hasattr(memory.chat_memory, "messages"):
             for m in memory.chat_memory.messages[-20:]:
                 m_dict = {}
                 if hasattr(m, "type") and hasattr(m, "content"):
-                    m_dict = {"type": m.type, "content": m.content}
+                    m_dict = {"type": m.type, "content": _safe_str_output(m.content)}
                 conversation_history.append(m_dict)
 
+        # Compose Gemini answer
+        gemini_answer = None
+        try:
+            gemini_answer = get_gemini_response(request.query, rag_answer, memory)
+        except Exception as e:
+            gemini_answer = "[Gemini unavailable: {}]\n{}".format(e, rag_answer or "")
+
+        # Final output cleaning for defense-in-depth
+        gemini_answer = clean_gemini_output(_safe_str_output(gemini_answer))
+
+        # Save Gemini answer as output for this turn
+        try:
+            memory.save_context({"input": request.query}, {"output": _safe_str_output(gemini_answer)})
+        except Exception:
+            pass  # Don't raise just for failed memory update
+
+        # For output: expose rag_answer as legacy, but gemini_answer is always the direct chatbot response
         return ChatResponse(
-            rag_answer=rag_answer,
-            gemini_answer=gemini_answer,
-            conversation_history=conversation_history,
+            rag_answer=_safe_str_output(rag_answer),  # Could be empty str
+            gemini_answer=_safe_str_output(gemini_answer),  # Always Gemini's answer, cleaned of meta/source
+            conversation_history=conversation_history
         )
+
     except HTTPException:
         raise  # Allow FastAPI HTTPExceptions to propagate
     except Exception as e:
-        # Log details for debugging
         tb = traceback.format_exc()
         print(f"Internal Server Error in /chat endpoint: {e}\nTraceback:\n{tb}")
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {e}")
-
 
 # Add endpoint doc for WebSocket and real-time (optional, can expand later)
 @app.get("/chat/wsinfo", tags=["Chat"], summary="WebSocket usage info", description="Info about WebSocket/API support for real-time chat.")
@@ -215,3 +267,4 @@ def chat_wsinfo():
     Returns information about real-time chat support (WebSocket or usual polling).
     """
     return {"detail": "Current version supports REST API chat only. Real-time WebSocket may be added in future versions."}
+
