@@ -77,18 +77,28 @@ def similarity(a: str, b: str) -> float:
         return 0.0
     return len(shared) / max(len(set_a), len(set_b))
 
-def rag_retrieve(query: str, qa_list: List[dict], threshold: float = 0.38) -> dict:
+def rag_retrieve(query: str, qa_list: List[dict], threshold: float = 0.38, weak_threshold: float = 0.18) -> dict:
     """
     Retrieve the QA pair most relevant to the query based on similarity.
-    If similarity is below the threshold, treat as no relevant information.
+    Returns a dict with keys:
+        - 'q': question string of best match (empty if none)
+        - 'a': answer string of best match (empty if none)
+        - 'weak_match': True if similarity is above weak_threshold but below main threshold, else False
+    If similarity is below weak_threshold, treat as NO relevant information at all (not even general topic match).
+    If similarity is above weak_threshold but below threshold, treat as GENERAL TOPIC match.
+    If similarity is above threshold, treat as STRONG KB answer.
     """
     if not qa_list:
-        return {"q": "", "a": ""}
+        return {"q": "", "a": "", "weak_match": False}
     best_match = max(qa_list, key=lambda qa: similarity(query, qa['q']))
     sim_score = similarity(query, best_match['q'])
-    if sim_score < threshold:
-        return {"q": "", "a": ""}
-    return best_match
+    if sim_score < weak_threshold:
+        # No KB info, no topic match (totally out-of-scope)
+        return {"q": "", "a": "", "weak_match": False}
+    elif sim_score < threshold:
+        # General/topic match, but not specific – signal weak_match
+        return {"q": best_match['q'], "a": "", "weak_match": True}
+    return {"q": best_match['q'], "a": best_match['a'], "weak_match": False}
 
 def get_gemini_response(query: str, rag_answer: str, memory: ConversationBufferMemory) -> str:
     """
@@ -178,10 +188,13 @@ def chat(request: ChatRequest):
         # RAG: Retrieve best match using threshold-based retrieval
         try:
             qa = rag_retrieve(request.query, QA_LIST)
-            if qa.get("a", "") == "":
-                # No relevant information found
+            rag_weak_match = qa.get("weak_match", False)
+            # kb_q removed to resolve linter error
+            kb_a = qa.get("a", "")
+            if kb_a == "" and not rag_weak_match:
+                # No relevant information found, not even general topic
                 rag_answer = "No relevant information is present in the knowledge base."
-                # Gemini answer should echo this message
+                # Gemini answer echoes this, as it has no clear context tie
                 gemini_answer = "No relevant information is present in the knowledge base."
                 # Add both to memory to maintain consistent history
                 memory.save_context({"input": request.query}, {"output": rag_answer})
@@ -198,9 +211,15 @@ def chat(request: ChatRequest):
                     gemini_answer=gemini_answer,
                     conversation_history=conversation_history,
                 )
+            elif kb_a == "" and rag_weak_match:
+                # Query matches topic area, but no specific answer.
+                rag_answer = "No specific information is present in the knowledge base, but this topic is within its general area."
+                # Gemini is called anyway for broader knowledge
+                pass  # will proceed to Gemini enhancement below
             else:
-                rag_answer = _safe_str_output(qa.get("a", None))
+                rag_answer = _safe_str_output(kb_a)
         except Exception:
+            # Defensive fallback – behave as full miss
             rag_answer = "No relevant information is present in the knowledge base."
             gemini_answer = "No relevant information is present in the knowledge base."
             memory.save_context({"input": request.query}, {"output": rag_answer})
@@ -220,7 +239,6 @@ def chat(request: ChatRequest):
 
         # Add bot's answer to memory before Gemini call, always use {"input": <prev_user>, "output": ...}
         try:
-            # For consistency, always provide non-empty input with 'input' key for every save_context call
             memory.save_context({"input": request.query}, {"output": _safe_str_output(rag_answer)})
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save RAG answer to memory: {e}")
@@ -230,16 +248,14 @@ def chat(request: ChatRequest):
             gemini_answer = get_gemini_response(request.query, rag_answer, memory)
             gemini_answer = _safe_str_output(gemini_answer)
         except HTTPException:
-            # Propagate Gemini API key missing explicitly
             raise
         except Exception as e:
             gemini_answer = _safe_str_output(f"[Gemini enhancement unavailable: {e}]\nKnowledge base answer: {rag_answer}")
 
-        # Add Gemini-enhanced answer to memory, always use {"input": <prev_user>, "output": ...}
+        # Add Gemini-enhanced answer to memory
         try:
             memory.save_context({"input": request.query}, {"output": _safe_str_output(gemini_answer)})
         except Exception as e:
-            # Compose a warning but do not crash the whole chat
             gemini_answer += f"\n[Warning: Failed to save Gemini response to memory: {e}]"
 
         # Prepare conversation history (latest 20 exchanges)
@@ -248,7 +264,6 @@ def chat(request: ChatRequest):
             for m in memory.chat_memory.messages[-20:]:
                 m_dict = {}
                 if hasattr(m, "type") and hasattr(m, "content"):
-                    # Ensure conversation history never exposes None as content
                     m_dict = {"type": m.type, "content": _safe_str_output(m.content)}
                 conversation_history.append(m_dict)
 
