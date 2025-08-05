@@ -146,7 +146,11 @@ def chat(request: ChatRequest):
             raise HTTPException(status_code=400, detail="session_id must be a non-empty string.")
 
         if session_id not in CONVERSATION_MEMORY:
-            CONVERSATION_MEMORY[session_id] = ConversationBufferMemory(return_messages=True)
+            # Set output_key explicitly to resolve ambiguous/missing output key issues when saving context
+            CONVERSATION_MEMORY[session_id] = ConversationBufferMemory(
+                return_messages=True,
+                output_key="output"
+            )
         memory = CONVERSATION_MEMORY[session_id]
 
         # Add user input to memory
