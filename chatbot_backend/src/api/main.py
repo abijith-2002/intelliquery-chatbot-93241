@@ -102,7 +102,8 @@ def get_gemini_response(query: str, rag_answer: str, memory: ConversationBufferM
         raise HTTPException(status_code=500, detail="Gemini API key is not set in environment variables.")
     try:
         genai.configure(api_key=gemini_api_key)
-        model = genai.GenerativeModel("gemini-pro")
+        # Changed model name from 'gemini-pro' to 'gemini-2.5-flash'
+        model = genai.GenerativeModel("gemini-2.5-flash")
         response = model.generate_content([{"role": "user", "parts": [prompt]}])
         answer = response.text.strip()
         return answer
