@@ -153,38 +153,46 @@ def chat(request: ChatRequest):
             )
         memory = CONVERSATION_MEMORY[session_id]
 
+        # Utility to always ensure output passed to memory is a non-None string
+        def _safe_str_output(val, fallback="No answer available"):
+            if val is None or (isinstance(val, str) and val.strip() == ""):
+                return fallback
+            return str(val)
+
         # Add user input to memory with output_key structure always present
         try:
-            # For initial user message, output is empty or None but must use output_key
-            memory.save_context({"input": request.query}, {"output": None})
+            # For initial user message, output is set to a default response (to avoid None)
+            memory.save_context({"input": request.query}, {"output": _safe_str_output("", "No answer available")})
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
 
         # RAG: Retrieve best match
         try:
             qa = rag_retrieve(request.query, QA_LIST)
-            rag_answer = qa["a"]
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Knowledge retrieval failed: {e}")
+            rag_answer = _safe_str_output(qa.get("a", None))
+        except Exception:
+            rag_answer = "No answer available"
+            # Do not raise; allow conversation to show the error fallback
 
         # Add bot's answer to memory before Gemini call, always use {"output": ...}
         try:
-            memory.save_context({}, {"output": rag_answer})
+            memory.save_context({}, {"output": _safe_str_output(rag_answer)})
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save RAG answer to memory: {e}")
 
         # Enhance answer with Gemini
         try:
             gemini_answer = get_gemini_response(request.query, rag_answer, memory)
+            gemini_answer = _safe_str_output(gemini_answer)
         except HTTPException:
             # Propagate Gemini API key missing explicitly
             raise
         except Exception as e:
-            gemini_answer = f"[Gemini enhancement unavailable: {e}]\nKnowledge base answer: {rag_answer}"
+            gemini_answer = _safe_str_output(f"[Gemini enhancement unavailable: {e}]\nKnowledge base answer: {rag_answer}")
 
         # Add Gemini-enhanced answer to memory, always use {"output": ...}
         try:
-            memory.save_context({}, {"output": gemini_answer})
+            memory.save_context({}, {"output": _safe_str_output(gemini_answer)})
         except Exception as e:
             # Compose a warning but do not crash the whole chat
             gemini_answer += f"\n[Warning: Failed to save Gemini response to memory: {e}]"
@@ -195,12 +203,13 @@ def chat(request: ChatRequest):
             for m in memory.chat_memory.messages[-20:]:
                 m_dict = {}
                 if hasattr(m, "type") and hasattr(m, "content"):
-                    m_dict = {"type": m.type, "content": m.content}
+                    # Ensure conversation history never exposes None as content
+                    m_dict = {"type": m.type, "content": _safe_str_output(m.content)}
                 conversation_history.append(m_dict)
 
         return ChatResponse(
-            rag_answer=rag_answer,
-            gemini_answer=gemini_answer,
+            rag_answer=_safe_str_output(rag_answer),
+            gemini_answer=_safe_str_output(gemini_answer),
             conversation_history=conversation_history,
         )
     except HTTPException:
