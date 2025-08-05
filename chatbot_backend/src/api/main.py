@@ -153,9 +153,10 @@ def chat(request: ChatRequest):
             )
         memory = CONVERSATION_MEMORY[session_id]
 
-        # Add user input to memory
+        # Add user input to memory with output_key structure always present
         try:
-            memory.save_context({"input": request.query}, {})
+            # For initial user message, output is empty or None but must use output_key
+            memory.save_context({"input": request.query}, {"output": None})
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
 
@@ -166,7 +167,7 @@ def chat(request: ChatRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Knowledge retrieval failed: {e}")
 
-        # Add bot's answer to memory before Gemini call
+        # Add bot's answer to memory before Gemini call, always use {"output": ...}
         try:
             memory.save_context({}, {"output": rag_answer})
         except Exception as e:
@@ -181,7 +182,7 @@ def chat(request: ChatRequest):
         except Exception as e:
             gemini_answer = f"[Gemini enhancement unavailable: {e}]\nKnowledge base answer: {rag_answer}"
 
-        # Add Gemini-enhanced answer to memory
+        # Add Gemini-enhanced answer to memory, always use {"output": ...}
         try:
             memory.save_context({}, {"output": gemini_answer})
         except Exception as e:
