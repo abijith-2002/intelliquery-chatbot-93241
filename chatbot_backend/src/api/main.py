@@ -127,7 +127,7 @@ def get_gemini_response(query: str, rag_answer: str, memory: ConversationBufferM
         return answer
     except Exception as e:
         # Fallback to original RAG answer if Gemini API fails
-        return f"[Gemini enhancement unavailable: {e}]\nKnowledge base answer: {rag_answer}"
+        return "[Gemini enhancement unavailable: {}]\nKnowledge base answer: {}".format(e, rag_answer)
 
 # Load the knowledge base at startup
 ANSWERS_PATH = os.path.join(os.path.dirname(__file__), "answers.txt")
@@ -190,7 +190,7 @@ def chat(request: ChatRequest):
         elif kb_q != "" and rag_weak_match:
             # General/topic match; include topic info in context, but not a real answer
             rag_answer = ""
-            rag_context = f"This topic is generally covered in the knowledge base, but there is no specific matching answer."
+            rag_context = "This topic is generally covered in the knowledge base, but there is no specific matching answer."
         else:
             # No KB info at all
             rag_answer = ""
@@ -227,7 +227,26 @@ def chat(request: ChatRequest):
             genai.configure(api_key=gemini_api_key)
             model = genai.GenerativeModel("gemini-2.5-flash")
             response = model.generate_content([{"role": "user", "parts": [gemini_prompt]}])
-            gemini_answer = response.text.strip()
+            raw_text = response.text.strip()
+
+            # Strip out any meta disclaimers or statements (such as parenthetical notes or lead-ins)
+            # Remove known meta patterns (expandable if Gemini ever adds new ones)
+            import re
+            META_PATTERNS = [
+                r"(?i)\(?(this information).*?\)?",  # (This information...)
+                r"(?i)\(?(based on the provided knowledge base).*?\)?",
+                r"(?i)\(?(as an ai language model)[\., ]*",
+                r"(?i)\(?(note:)[^\n\r]*",  # note: ...
+                r"(?i)\(?(please note)[^\n\r]*",
+                r"(?i)(?:\(Based on.*?\))",
+                r"(?i)(?:As an AI language model[\., ]*)"
+            ]
+            clean_text = raw_text
+            for pat in META_PATTERNS:
+                clean_text = re.sub(pat, "", clean_text, flags=re.IGNORECASE)
+
+            # Remove leading/trailing whitespace left by removals
+            gemini_answer = clean_text.strip()
         except Exception as e:
             gemini_answer = _safe_str_output("[Gemini unavailable: {}]\n{}".format(e, rag_context or "No relevant KB context."))
 
