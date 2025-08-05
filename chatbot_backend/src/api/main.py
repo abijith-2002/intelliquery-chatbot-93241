@@ -1,3 +1,10 @@
+# ==============================================================================
+# IMPORTANT: This backend requires the following environment variable to function:
+#   - GEMINI_API_KEY : Your Google Gemini API key
+# Make sure to create a `.env` file or provide GEMINI_API_KEY at deployment.
+# Without this, POST /chat will return a 500 Internal Server Error.
+# ==============================================================================
+
 import os
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -130,42 +137,75 @@ def chat(request: ChatRequest):
     Returns:
         ChatResponse: RAG answer, Gemini-enhanced answer, and conversation context.
     """
-    # Handle conversation memory
-    session_id = request.session_id
-    if session_id not in CONVERSATION_MEMORY:
-        CONVERSATION_MEMORY[session_id] = ConversationBufferMemory(return_messages=True)
-    memory = CONVERSATION_MEMORY[session_id]
+    import traceback
 
-    # Add user input to memory
-    memory.save_context({"input": request.query}, {})
+    try:
+        # Handle conversation memory
+        session_id = request.session_id
+        if not session_id or not isinstance(session_id, str):
+            raise HTTPException(status_code=400, detail="session_id must be a non-empty string.")
 
-    # RAG: Retrieve best match
-    qa = rag_retrieve(request.query, QA_LIST)
-    rag_answer = qa["a"]
+        if session_id not in CONVERSATION_MEMORY:
+            CONVERSATION_MEMORY[session_id] = ConversationBufferMemory(return_messages=True)
+        memory = CONVERSATION_MEMORY[session_id]
 
-    # Add bot's answer to memory before Gemini call
-    memory.save_context({}, {"output": rag_answer})
+        # Add user input to memory
+        try:
+            memory.save_context({"input": request.query}, {})
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
 
-    # Enhance answer with Gemini
-    gemini_answer = get_gemini_response(request.query, rag_answer, memory)
+        # RAG: Retrieve best match
+        try:
+            qa = rag_retrieve(request.query, QA_LIST)
+            rag_answer = qa["a"]
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Knowledge retrieval failed: {e}")
 
-    # Add Gemini-enhanced answer to memory
-    memory.save_context({}, {"output": gemini_answer})
+        # Add bot's answer to memory before Gemini call
+        try:
+            memory.save_context({}, {"output": rag_answer})
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to save RAG answer to memory: {e}")
 
-    # Prepare conversation history (latest 10 exchanges)
-    conversation_history = []
-    if hasattr(memory, "chat_memory") and hasattr(memory.chat_memory, "messages"):
-        for m in memory.chat_memory.messages[-20:]:
-            m_dict = {}
-            if hasattr(m, "type") and hasattr(m, "content"):
-                m_dict = {"type": m.type, "content": m.content}
-            conversation_history.append(m_dict)
+        # Enhance answer with Gemini
+        try:
+            gemini_answer = get_gemini_response(request.query, rag_answer, memory)
+        except HTTPException:
+            # Propagate Gemini API key missing explicitly
+            raise
+        except Exception as e:
+            gemini_answer = f"[Gemini enhancement unavailable: {e}]\nKnowledge base answer: {rag_answer}"
 
-    return ChatResponse(
-        rag_answer=rag_answer,
-        gemini_answer=gemini_answer,
-        conversation_history=conversation_history,
-    )
+        # Add Gemini-enhanced answer to memory
+        try:
+            memory.save_context({}, {"output": gemini_answer})
+        except Exception as e:
+            # Compose a warning but do not crash the whole chat
+            gemini_answer += f"\n[Warning: Failed to save Gemini response to memory: {e}]"
+
+        # Prepare conversation history (latest 20 exchanges)
+        conversation_history = []
+        if hasattr(memory, "chat_memory") and hasattr(memory.chat_memory, "messages"):
+            for m in memory.chat_memory.messages[-20:]:
+                m_dict = {}
+                if hasattr(m, "type") and hasattr(m, "content"):
+                    m_dict = {"type": m.type, "content": m.content}
+                conversation_history.append(m_dict)
+
+        return ChatResponse(
+            rag_answer=rag_answer,
+            gemini_answer=gemini_answer,
+            conversation_history=conversation_history,
+        )
+    except HTTPException:
+        raise  # Allow FastAPI HTTPExceptions to propagate
+    except Exception as e:
+        # Log details for debugging
+        tb = traceback.format_exc()
+        print(f"Internal Server Error in /chat endpoint: {e}\nTraceback:\n{tb}")
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {e}")
+
 
 # Add endpoint doc for WebSocket and real-time (optional, can expand later)
 @app.get("/chat/wsinfo", tags=["Chat"], summary="WebSocket usage info", description="Info about WebSocket/API support for real-time chat.")
