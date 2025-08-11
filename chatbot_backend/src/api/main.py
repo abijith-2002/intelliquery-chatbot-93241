@@ -22,6 +22,8 @@ from .auth_utils import (
     get_user_by_username,
     verify_password,
 )
+# Import the chat title router
+from .chat_title import router as chat_title_router
 
 # Load environment variables
 load_dotenv()
@@ -37,9 +39,12 @@ app = FastAPI(
 
 openapi_tags = [
     {"name": "Health", "description": "Health check endpoint."},
-    {"name": "Chat", "description": "Endpoints for chat, response retrieval, and context management."},
+    {"name": "Chat", "description": "Endpoints for chat, history/title generation, response retrieval, and context management."},
     {"name": "UserAuth", "description": "Endpoints for user registration and login."}
 ]
+
+# Register chat title router (Gemini-powered title generator)
+app.include_router(chat_title_router)
 
 # Allow CORS from everywhere for demo/dev
 app.add_middleware(
