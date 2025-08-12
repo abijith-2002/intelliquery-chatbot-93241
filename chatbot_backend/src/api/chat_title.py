@@ -43,7 +43,7 @@ async def generate_title(request: TitleRequest) -> str:
     prompt = (request.prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt is required and cannot be blank.")
-    gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+    gemini_api_key = os.getenv("REACT_APP_GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY", "")
     if not gemini_api_key:
         raise HTTPException(status_code=500, detail="Gemini API key not set in environment.")
 

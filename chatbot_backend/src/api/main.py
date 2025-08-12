@@ -1,9 +1,9 @@
 # ==============================================================================
 # IMPORTANT: This backend requires the following environment variables to function:
-#   - GEMINI_API_KEY : Your Google Gemini API key
-#   - SUPABASE_DB_URL : Postgres connection string for Supabase (sslmode=require recommended)
+#   - REACT_APP_GEMINI_API_KEY (preferred) or GEMINI_API_KEY : Your Google Gemini API key
+#   - REACT_APP_SUPABASE_DB_URL (preferred) or SUPABASE_DB_URL : Postgres connection string for Supabase (sslmode=require recommended)
 # Make sure to create a `.env` file or provide these at deployment.
-# Without SUPABASE_DB_URL the app will not start (enforced in auth_utils).
+# Without a Supabase DB URL the app will not start (enforced in auth_utils).
 # ==============================================================================
 
 import os
@@ -28,6 +28,8 @@ from .auth_utils import (
     get_or_create_conversation,
     create_message,
     get_messages_for_session,
+    get_conversations_for_user,
+    attach_session_to_user,
 )
 
 # Import the chat title router
@@ -41,8 +43,8 @@ CONVERSATION_MEMORY: dict[str, ConversationBufferMemory] = {}
 
 app = FastAPI(
     title="IntelliQuery Chatbot API",
-    version="1.0.0",
-    description="FastAPI backend for the IntelliQuery chatbot, providing chat endpoints using RAG from answers.txt, Google Gemini API, and context tracking.",
+    version="1.1.0",
+    description="FastAPI backend for the IntelliQuery chatbot, providing chat endpoints using RAG from answers.txt, Google Gemini API, and context tracking. Supabase stores users, conversations, and messages.",
 )
 
 openapi_tags = [
@@ -111,6 +113,21 @@ class HistoryItem(BaseModel):
     type: str = Field(..., description="Message type: 'human' or 'ai'")
     content: str = Field(..., description="Message text content")
     created_at: Optional[str] = Field(None, description="ISO timestamp of the message")
+
+
+class ConversationInfo(BaseModel):
+    """Schema representing minimal conversation metadata."""
+    id: int = Field(..., description="Conversation id")
+    session_id: str = Field(..., description="Conversation session id")
+    title: Optional[str] = Field(None, description="Conversation title")
+    created_at: Optional[str] = Field(None, description="Conversation creation timestamp (ISO)")
+
+
+class AttachSessionRequest(BaseModel):
+    """Schema to attach a session to a user (bind conversation to account)."""
+    session_id: str = Field(..., description="Session to bind")
+    username: str = Field(..., description="Username to bind the session to")
+    title: Optional[str] = Field(None, description="Optional title to set if not already set")
 
 
 def load_answers(filepath: str) -> List[dict]:
@@ -212,7 +229,8 @@ def get_gemini_response(query: str, rag_answer: str, memory: ConversationBufferM
         f"Please answer the user's latest question. Be concise and clear."
     )
 
-    gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+    # Support container_env naming with fallback
+    gemini_api_key = os.getenv("REACT_APP_GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
     if not gemini_api_key:
         raise HTTPException(status_code=500, detail="Gemini API key is not set in environment variables.")
     try:
@@ -226,7 +244,7 @@ def get_gemini_response(query: str, rag_answer: str, memory: ConversationBufferM
         return clean_gemini_output(f"[Gemini enhancement unavailable: {e}]\n{rag_answer}")
 
 
-# Ensure user table exists on startup
+# Ensure tables exist on startup
 create_tables()
 
 # Load the knowledge base at startup
@@ -472,6 +490,80 @@ def chat_history(session_id: str, db=Depends(get_db)):
         content = str(m.get("content") or "")
         history.append(HistoryItem(type=msg_type, content=content, created_at=m.get("created_at")))
     return history
+
+
+# PUBLIC_INTERFACE
+@app.post(
+    "/chat/session/attach",
+    tags=["Chat"],
+    response_model=ConversationInfo,
+    summary="Attach a session to a user",
+    description="Bind an existing or new conversation (by session_id) to a specific user so their chat sessions are associated with their account. Optionally provide a title to set if one isn't already set.",
+    responses={
+        404: {"description": "User not found"},
+        400: {"description": "Validation error"},
+    },
+)
+def attach_session(request: AttachSessionRequest, db=Depends(get_db)):
+    """
+    PUBLIC_INTERFACE
+    Attach a conversation identified by session_id to a user account.
+
+    Args:
+        request (AttachSessionRequest): session_id, username, optional title.
+        db (Session): SQLAlchemy Session dependency.
+
+    Returns:
+        ConversationInfo: The conversation metadata after binding.
+    """
+    if not request.session_id.strip():
+        raise HTTPException(status_code=400, detail="session_id must be a non-empty string.")
+    user = get_user_by_username(db, request.username)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    convo = attach_session_to_user(db, session_id=request.session_id, user_id=user.id, title=request.title)
+    return ConversationInfo(id=convo.id, session_id=convo.session_id, title=convo.title, created_at=convo.created_at.isoformat() if convo.created_at else None)
+
+
+# PUBLIC_INTERFACE
+@app.get(
+    "/conversations/{username}",
+    tags=["Chat"],
+    response_model=List[ConversationInfo],
+    summary="List conversations for a user",
+    description="Return the list of conversations associated with the given username, ordered by most recent.",
+    responses={
+        404: {"description": "User not found"},
+        400: {"description": "Validation error"},
+    },
+)
+def list_conversations(username: str, db=Depends(get_db)):
+    """
+    PUBLIC_INTERFACE
+    List a user's conversations.
+
+    Args:
+        username (str): Username whose conversations are requested.
+        db (Session): SQLAlchemy Session dependency.
+
+    Returns:
+        List[ConversationInfo]: Conversations with id, session_id, title, created_at.
+    """
+    if not username or not isinstance(username, str):
+        raise HTTPException(status_code=400, detail="username must be a non-empty string.")
+    user = get_user_by_username(db, username)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    rows = get_conversations_for_user(db, user_id=user.id, limit=100)
+    return [
+        ConversationInfo(
+            id=r["id"],
+            session_id=r["session_id"],
+            title=r["title"],
+            created_at=r["created_at"],
+        )
+        for r in rows
+    ]
 
 
 # Add endpoint doc for WebSocket and real-time (optional, can expand later)

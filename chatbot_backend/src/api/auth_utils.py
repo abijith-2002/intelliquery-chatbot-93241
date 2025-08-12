@@ -19,21 +19,25 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
-# Load environment variables early so SUPABASE_DB_URL is available on import
+# Load environment variables early so DB URL is available on import
 load_dotenv()
 
 # SQLAlchemy base
 Base = declarative_base()
 
 # Enforce Supabase Postgres usage for all connections
-# Note for deployment: SUPABASE_DB_URL must be set in the environment.
-DATABASE_URL = os.environ.get("SUPABASE_DB_URL")
+# Prefer container_env style variable, fallback to legacy name
+DATABASE_URL = (
+    os.environ.get("REACT_APP_SUPABASE_DB_URL")
+    or os.environ.get("SUPABASE_DB_URL")
+)
+
 if not DATABASE_URL:
     # Fail fast to avoid accidental local SQLite usage
     raise RuntimeError(
-        "SUPABASE_DB_URL is required for the backend to run. "
-        "Please set SUPABASE_DB_URL in the environment (e.g., "
-        "postgresql://<user>:<password>@<host>:<port>/<db>?sslmode=require)."
+        "Supabase Postgres connection string is required. "
+        "Please set REACT_APP_SUPABASE_DB_URL (preferred) or SUPABASE_DB_URL in the environment, e.g., "
+        "postgresql://<user>:<password>@<host>:<port>/<db>?sslmode=require"
     )
 
 # Create engine configured for cloud Postgres (Supabase)
@@ -42,7 +46,7 @@ engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
     pool_recycle=300,
-    # No connect_args needed for Postgres; sslmode should be in the URL for Supabase
+    # sslmode should be in the URL for Supabase
 )
 
 # Session factory; expire_on_commit=False to keep objects usable post-commit
@@ -76,7 +80,7 @@ class Conversation(Base):
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     session_id = Column(Text, unique=True, nullable=False, index=True)
     title = Column(Text, nullable=True)
-    # Optional link to app-managed users; on user delete you may manage cascading in app logic
+    # Optional link to app-managed users; on user delete manage cascading in app logic or via policies
     user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
@@ -165,9 +169,20 @@ def get_or_create_conversation(
     user_id: int | None = None,
     title: str | None = None,
 ) -> Conversation:
-    """Get a conversation by session_id, or create it if missing."""
+    """Get a conversation by session_id, or create it if missing. If provided, set user_id/title when absent."""
     convo = db.query(Conversation).filter(Conversation.session_id == session_id).first()
     if convo:
+        updated = False
+        if user_id is not None and convo.user_id is None:
+            convo.user_id = user_id
+            updated = True
+        if title and not convo.title:
+            convo.title = title
+            updated = True
+        if updated:
+            db.add(convo)
+            db.commit()
+            db.refresh(convo)
         return convo
     convo = Conversation(session_id=session_id, user_id=user_id, title=title)
     db.add(convo)
@@ -210,3 +225,51 @@ def get_messages_for_session(db: Session, session_id: str, limit: int = 50) -> l
         }
         for r in rows
     ]
+
+
+# PUBLIC_INTERFACE
+def get_conversations_for_user(db: Session, user_id: int, limit: int = 50) -> list[dict]:
+    """Return a list of conversations for a given user, ordered by creation date descending."""
+    from sqlalchemy import select
+
+    stmt = (
+        select(Conversation.id, Conversation.session_id, Conversation.title, Conversation.created_at)
+        .where(Conversation.user_id == user_id)
+        .order_by(Conversation.created_at.desc(), Conversation.id.desc())
+        .limit(limit)
+    )
+    rows = db.execute(stmt).fetchall()
+    return [
+        {
+            "id": r.id,
+            "session_id": r.session_id,
+            "title": r.title,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+
+
+# PUBLIC_INTERFACE
+def attach_session_to_user(db: Session, session_id: str, user_id: int, title: str | None = None) -> Conversation:
+    """Attach a session to a user, creating the conversation if needed. Set title if provided and missing."""
+    convo = db.query(Conversation).filter(Conversation.session_id == session_id).first()
+    if convo:
+        updated = False
+        if convo.user_id is None:
+            convo.user_id = user_id
+            updated = True
+        if title and not convo.title:
+            convo.title = title
+            updated = True
+        if updated:
+            db.add(convo)
+            db.commit()
+            db.refresh(convo)
+        return convo
+    # Create new conversation for this user
+    convo = Conversation(session_id=session_id, user_id=user_id, title=title)
+    db.add(convo)
+    db.commit()
+    db.refresh(convo)
+    return convo
