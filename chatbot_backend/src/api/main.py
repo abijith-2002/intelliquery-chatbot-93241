@@ -21,6 +21,9 @@ from .auth_utils import (
     create_user,
     get_user_by_username,
     verify_password,
+    get_or_create_conversation,
+    create_message,
+    get_messages_for_session,
 )
 # Import the chat title router
 from .chat_title import router as chat_title_router
@@ -218,7 +221,7 @@ def health_check():
     return {"message": "Healthy"}
 
 @app.post("/chat", response_model=ChatResponse, tags=["Chat"], summary="Chat with bot", description="Submit a chat query. Gemini always answers; a RAG knowledge base document is included as additional Gemini context if relevant; conversation history is always provided to Gemini for context.")
-def chat(request: ChatRequest):
+def chat(request: ChatRequest, db=Depends(get_db)):
     """
     PUBLIC_INTERFACE
     Handles user's chat request. All answers come directly from Gemini.
@@ -238,12 +241,41 @@ def chat(request: ChatRequest):
             )
         memory = CONVERSATION_MEMORY[session_id]
 
-        # Ensure user input is logged to memory (with a temp placeholder output)
+        # Ensure a conversation exists in DB and hydrate memory from DB on first use
+        convo = get_or_create_conversation(db, session_id=session_id, user_id=None, title=None)
+
+        # Hydrate memory once per session from DB if memory empty
+        try:
+            msgs = getattr(memory, "chat_memory").messages if hasattr(memory, "chat_memory") else []
+            if not msgs:
+                db_msgs = get_messages_for_session(db, session_id=session_id, limit=50)
+                last_user = None
+                for m in db_msgs:
+                    role = (m.get("role") or "").lower()
+                    content = (m.get("content") or "")
+                    if role == "user":
+                        last_user = content
+                    elif role == "assistant":
+                        # pair with last user if present
+                        if last_user is not None:
+                            memory.save_context({"input": last_user}, {"output": content})
+                            last_user = None
+                # If trailing user message without assistant, store with placeholder output
+                if last_user is not None:
+                    memory.save_context({"input": last_user}, {"output": "No answer available"})
+        except Exception:
+            # Do not hard fail; proceed with empty memory
+            pass
+
+        # Ensure user input is logged to memory (with a temp placeholder output), and persist to DB
         def _safe_str_output(val, fallback="No answer available"):
             if val is None or (isinstance(val, str) and val.strip() == ""):
                 return fallback
             return str(val)
         try:
+            # Persist the user message
+            create_message(db, conversation_id=convo.id, role="user", content=_safe_str_output(request.query, ""))
+            # Add to memory with placeholder
             memory.save_context({"input": request.query}, {"output": _safe_str_output("", "No answer available")})
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
@@ -262,15 +294,6 @@ def chat(request: ChatRequest):
         else:
             rag_answer = ""
 
-        # Prepare conversation history for output (last 20 messages)
-        conversation_history = []
-        if hasattr(memory, "chat_memory") and hasattr(memory.chat_memory, "messages"):
-            for m in memory.chat_memory.messages[-20:]:
-                m_dict = {}
-                if hasattr(m, "type") and hasattr(m, "content"):
-                    m_dict = {"type": m.type, "content": _safe_str_output(m.content)}
-                conversation_history.append(m_dict)
-
         # Compose Gemini answer
         gemini_answer = None
         try:
@@ -281,11 +304,35 @@ def chat(request: ChatRequest):
         # Final output cleaning for defense-in-depth
         gemini_answer = clean_gemini_output(_safe_str_output(gemini_answer))
 
-        # Save Gemini answer as output for this turn
+        # Save Gemini answer as output for this turn and persist to DB
         try:
             memory.save_context({"input": request.query}, {"output": _safe_str_output(gemini_answer)})
         except Exception:
             pass  # Don't raise just for failed memory update
+        try:
+            create_message(db, conversation_id=convo.id, role="assistant", content=_safe_str_output(gemini_answer))
+        except Exception:
+            pass  # If DB write fails, do not fail the whole request
+
+        # Prepare conversation history for output (last 20 messages) from DB
+        conversation_history = []
+        try:
+            history = get_messages_for_session(db, session_id=session_id, limit=20)
+            # Normalize to API schema: type + content
+            for m in history:
+                role = (m.get("role") or "").lower()
+                content = _safe_str_output(m.get("content"))
+                # Map to 'type' for compatibility with existing response schema
+                msg_type = "ai" if role == "assistant" else "human"
+                conversation_history.append({"type": msg_type, "content": content})
+        except Exception:
+            # Fallback to memory if DB history fails
+            if hasattr(memory, "chat_memory") and hasattr(memory.chat_memory, "messages"):
+                for m in memory.chat_memory.messages[-20:]:
+                    m_dict = {}
+                    if hasattr(m, "type") and hasattr(m, "content"):
+                        m_dict = {"type": m.type, "content": _safe_str_output(m.content)}
+                    conversation_history.append(m_dict)
 
         # For output: expose rag_answer as legacy, but gemini_answer is always the direct chatbot response
         return ChatResponse(

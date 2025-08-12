@@ -46,3 +46,4 @@ websockets==15.0.1
 # For authentication and ORM
 passlib[bcrypt]==1.7.4
 SQLAlchemy==2.0.29
+psycopg2-binary==2.9.9
