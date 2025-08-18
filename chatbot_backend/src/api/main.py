@@ -212,6 +212,53 @@ def _split_into_chunks(text: str, chunk_size_words: int = 180, overlap_words: in
     return chunks
 
 
+def _chunk_xlsx_text_special(text: str, max_chunk_chars: int = 2600) -> List[str]:
+    """
+    Preserve Excel sheet blocks and table previews when chunking, to keep row/column context intact.
+
+    Strategy:
+      - Split by blank lines to get sheet/section blocks.
+      - If a block is larger than `max_chunk_chars`, split by lines without breaking TSV header+rows adjacency.
+      - Favor keeping sections that include 'Columns', 'JSON sample', and 'TSV preview' together.
+
+    This greatly improves retrieval accuracy for table questions.
+    """
+    if not text:
+        return []
+    blocks: List[str] = []
+    current: List[str] = []
+    lines = text.splitlines()
+    def flush_block():
+        if current:
+            blocks.append("\n".join(current).strip())
+            current.clear()
+    for line in lines:
+        if line.strip() == "":
+            flush_block()
+            continue
+        current.append(line)
+    flush_block()
+
+    chunks: List[str] = []
+    for block in blocks:
+        if len(block) <= max_chunk_chars:
+            chunks.append(block)
+            continue
+        # Split large block by lines
+        blines = block.splitlines()
+        buf: List[str] = []
+        for ln in blines:
+            # avoid splitting TSV header from the immediate next rows by keeping small groups together
+            buf.append(ln)
+            if sum(len(x) + 1 for x in buf) >= max_chunk_chars:
+                chunks.append("\n".join(buf).strip())
+                buf = []
+        if buf:
+            chunks.append("\n".join(buf).strip())
+    # Return only non-empty chunks
+    return [c for c in chunks if c.strip()]
+
+
 def _cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
     """
     Compute cosine similarity between two vectors. Zero-safe.
@@ -284,9 +331,16 @@ def _index_text_for_session(session_id: str, filename: str, text: str):
     """
     Chunk, embed, and store vectors and their source chunks for a session.
     Falls back to storing chunks without embeddings if embeddings are unavailable.
+
+    For .xlsx files, use special chunking to preserve table blocks and TSV/JSON previews.
     """
     _ensure_session_index(session_id)
-    chunks = _split_into_chunks(text, chunk_size_words=180, overlap_words=40)
+    # Prefer sheet/TSV-preserving chunking for Excel files
+    if (filename or "").lower().endswith(".xlsx"):
+        chunks = _chunk_xlsx_text_special(text, max_chunk_chars=2600)
+    else:
+        chunks = _split_into_chunks(text, chunk_size_words=180, overlap_words=40)
+
     if not chunks:
         return
     vectors = _embed_texts(chunks)
@@ -329,6 +383,48 @@ def _vector_search(session_id: str, query: str, top_k: int = 3) -> List[str]:
     return [text for _, text in scored_lex[:top_k]]
 
 
+def _extract_table_snippets_from_combined(combined: str, max_chars: int = 12000) -> str:
+    """
+    Extracts the most useful Excel table snippets from the combined uploaded context:
+      - [Sheet: ...] headers
+      - Columns (...)
+      - JSON sample (first rows):
+      - TSV preview:
+    Stops each section at the first blank line after it to avoid dragging unrelated text.
+    Returns a trimmed string limited by max_chars.
+    """
+    if not combined:
+        return ""
+    lines = combined.splitlines()
+    out: List[str] = []
+    i = 0
+    def add_until_blank(start_idx: int) -> int:
+        j = start_idx
+        while j < len(lines) and lines[j].strip() != "":
+            out.append(lines[j])
+            j += 1
+        # append one blank line as separator
+        out.append("")
+        return j
+
+    while i < len(lines) and sum(len(x) + 1 for x in out) < max_chars:
+        line = lines[i]
+        if line.startswith("[Sheet:"):
+            # Always include the sheet line
+            out.append(line)
+            i += 1
+            continue
+        if line.startswith("Columns (") or line.startswith("JSON sample") or line.startswith("TSV preview"):
+            i = add_until_blank(i)
+            continue
+        i += 1
+
+    result = "\n".join(out).strip()
+    if len(result) > max_chars:
+        return result[:max_chars]
+    return result
+
+
 # PUBLIC_INTERFACE
 def get_gemini_response(
     query: str,
@@ -357,11 +453,19 @@ def get_gemini_response(
         trimmed_extra = trimmed_extra[: MAX_CONTEXT_CHARS]
 
     # Compose prompt with uploaded/retrieved context primarily.
+    # Important: instruct Gemini to parse TSV/JSON table previews precisely to answer data-based questions.
+    guidance = (
+        "If the provided context contains 'JSON sample' or 'TSV preview' sections from a spreadsheet, "
+        "interpret them as tabular data with the given 'Columns'. Use exact cell values and perform any "
+        "requested calculations (sums, averages, lookups) directly from those tables. When answering, "
+        "state the result clearly and, if helpful, mention the column names you used. Do not add disclaimers."
+    )
     prompt = (
         f"You are an expert software assistant.\n"
         f"User's question: '{query}'\n"
         f"{f'Additional user-provided context (may be relevant):\n{trimmed_extra}\n' if trimmed_extra else ''}"
         f"Conversation history:\n{mem_str}\n"
+        f"{guidance}\n"
         f"Please answer the user's latest question. Be concise and clear."
     )
 
@@ -436,6 +540,17 @@ def chat(request: ChatRequest):
         # Retrieve top-k relevant chunks from vector index
         top_chunks = _vector_search(session_id, request.query, top_k=3)
         retrieved_context = "\n---\n".join(top_chunks).strip()
+
+        # Fallback strategy for spreadsheet context:
+        # If retrieval is empty or too small, extract table-focused snippets (Columns/JSON sample/TSV preview)
+        if not retrieved_context or len(retrieved_context) < 200:
+            combined = CONTEXT_STORE.get(session_id, {}).get("combined", "")
+            table_snips = _extract_table_snippets_from_combined(combined)
+            if table_snips:
+                retrieved_context = table_snips
+            elif combined:
+                # ultimate fallback: include a truncated combined context
+                retrieved_context = combined[:12000]
 
         # Compose Gemini answer with retrieved context (if any)
         try:
