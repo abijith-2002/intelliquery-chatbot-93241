@@ -6,10 +6,10 @@
 # ==============================================================================
 
 import os
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
-from typing import List
+from typing import List, Optional, Dict, Any
 import google.generativeai as genai
 
 from dotenv import load_dotenv
@@ -30,6 +30,10 @@ load_dotenv()
 
 # Memory store for chat contexts (keyed by session_id).
 CONVERSATION_MEMORY = {}
+
+# Per-session uploaded context store.
+# Structure: { session_id: { "files": [ {filename, size, chars, preview, error?} ], "combined": str } }
+CONTEXT_STORE: Dict[str, Dict[str, Any]] = {}
 
 app = FastAPI(
     title="IntelliQuery Chatbot API",
@@ -90,6 +94,23 @@ class LoginResponse(BaseModel):
     id: int
     username: str
     email: EmailStr
+
+
+class UploadedFileResult(BaseModel):
+    """Schema describing the processing result for a single uploaded file."""
+    filename: str = Field(..., description="Original file name")
+    size: int = Field(..., description="File size in bytes")
+    content_chars: int = Field(..., description="Number of characters extracted from the file")
+    preview: str = Field(..., description="A short preview/summary of extracted content")
+    error: Optional[str] = Field(default=None, description="Error message if processing failed")
+
+
+class UploadContextResponse(BaseModel):
+    """Schema for the response from the context upload endpoint."""
+    session_id: str = Field(..., description="Session ID associated with the uploaded context")
+    files_processed: List[UploadedFileResult] = Field(..., description="Per-file processing results")
+    total_chars: int = Field(..., description="Total number of characters added to session context")
+    message: str = Field(..., description="Status message/acknowledgment")
 
 def load_answers(filepath: str) -> List[dict]:
     """Load questions and answers from the answers.txt file as a list of dicts ([{'q': ..., 'a': ...}, ...])."""
@@ -172,16 +193,38 @@ def clean_gemini_output(text: str) -> str:
     return clean_text
 
 # PUBLIC_INTERFACE
-def get_gemini_response(query: str, rag_answer: str, memory: ConversationBufferMemory) -> str:
+def get_gemini_response(
+    query: str,
+    rag_answer: str,
+    memory: ConversationBufferMemory,
+    extra_context: str = "",
+) -> str:
     """
-    Enhance the answer using Google Gemini API, considering the chat context.
+    Enhance the answer using Google Gemini API, considering the chat context and any user-uploaded context.
+
     Never include statements about sources, knowledge base, RAG, or meta-assertions in the prompt or response.
+
+    Args:
+        query (str): User query.
+        rag_answer (str): Retrieved answer from the internal KB (can be empty).
+        memory (ConversationBufferMemory): Conversation memory buffer.
+        extra_context (str): Additional, user-provided context extracted from uploaded files. May be empty.
+
+    Returns:
+        str: Model answer.
     """
     mem_str = memory.buffer_as_str if hasattr(memory, "buffer_as_str") else ""
+    # Trim extra context to a reasonable size to avoid overwhelming the model
+    MAX_CONTEXT_CHARS = 12000
+    trimmed_extra = (extra_context or "").strip()
+    if len(trimmed_extra) > MAX_CONTEXT_CHARS:
+        trimmed_extra = trimmed_extra[: MAX_CONTEXT_CHARS]
+
     prompt = (
         f"You are an expert software assistant.\n"
         f"User's question: '{query}'\n"
         f"{f'Relevant answer: \"{rag_answer}\"\n' if rag_answer.strip() else ''}"
+        f"{f'Additional user-provided context (may be relevant):\\n{trimmed_extra}\\n' if trimmed_extra else ''}"
         f"Conversation history:\n{mem_str}\n"
         f"Please answer the user's latest question. Be concise and clear."
     )
@@ -274,7 +317,10 @@ def chat(request: ChatRequest):
         # Compose Gemini answer
         gemini_answer = None
         try:
-            gemini_answer = get_gemini_response(request.query, rag_answer, memory)
+            # Retrieve any uploaded context for this session
+            session_ctx = CONTEXT_STORE.get(session_id, {})
+            extra_context = session_ctx.get("combined", "") if isinstance(session_ctx, dict) else ""
+            gemini_answer = get_gemini_response(request.query, rag_answer, memory, extra_context=extra_context)
         except Exception as e:
             gemini_answer = "[Gemini unavailable: {}]\n{}".format(e, rag_answer or "")
 
@@ -374,4 +420,110 @@ def chat_wsinfo():
     Returns information about real-time chat support (WebSocket or usual polling).
     """
     return {"detail": "Current version supports REST API chat only. Real-time WebSocket may be added in future versions."}
+
+
+# --- FILE UPLOAD ENDPOINTS FOR CONTEXT ---
+
+# PUBLIC_INTERFACE
+@app.post(
+    "/chat/upload-context",
+    response_model=UploadContextResponse,
+    tags=["Chat"],
+    summary="Upload context files for a chat session",
+    description=(
+        "Accepts one or more files via multipart/form-data and extracts readable text from supported types "
+        "(.docx, .xlsx, .pdf, .txt). The extracted content is stored per session and used as additional context "
+        "when answering subsequent chat queries. Returns an acknowledgment with per-file processing results and a preview."
+    ),
+    responses={
+        400: {"description": "Validation error or no files provided"},
+        415: {"description": "Unsupported media type"},
+    },
+)
+def upload_chat_context(
+    session_id: str = Form(..., description="Session ID to associate uploaded context with"),
+    files: List[UploadFile] = File(..., description="One or more files (.docx, .xlsx, .pdf, .txt)"),
+):
+    """
+    PUBLIC_INTERFACE
+    Upload and process files to add user-provided context for a given chat session.
+
+    Args:
+        session_id (str): The chat session ID.
+        files (List[UploadFile]): Uploaded files (multipart/form-data).
+
+    Returns:
+        UploadContextResponse: Processing results and acknowledgment.
+    """
+    from .file_utils import extract_text_from_bytes, summarize_text_preview
+
+    if not session_id or not isinstance(session_id, str):
+        raise HTTPException(status_code=400, detail="session_id must be provided as a non-empty string.")
+    if not files or len(files) == 0:
+        raise HTTPException(status_code=400, detail="At least one file must be provided.")
+
+    results: List[UploadedFileResult] = []
+    combined_text_parts: List[str] = []
+    total_chars = 0
+
+    for f in files:
+        filename = f.filename or "unnamed"
+        # Read file bytes
+        try:
+            data = f.file.read()
+        except Exception as e:
+            results.append(
+                UploadedFileResult(
+                    filename=filename, size=0, content_chars=0, preview="", error=f"Failed to read file: {e}"
+                )
+            )
+            continue
+
+        size = len(data or b"")
+        # Extract
+        text, err = extract_text_from_bytes(filename, data or b"")
+        preview = summarize_text_preview(text, max_chars=500) if text else ""
+        chars = len(text)
+
+        # Append to combined only if successful and non-empty
+        if text and not err:
+            combined_text_parts.append(f"[{filename}]\n{text}\n")
+            total_chars += chars
+
+        results.append(
+            UploadedFileResult(
+                filename=filename,
+                size=size,
+                content_chars=chars,
+                preview=preview,
+                error=err,
+            )
+        )
+
+    # If at least one file produced content, update the session context store
+    if total_chars > 0:
+        combined_text = "\n".join(combined_text_parts).strip()
+        prev_ctx = CONTEXT_STORE.get(session_id, {})
+        prev_combined = prev_ctx.get("combined", "")
+        prev_files = prev_ctx.get("files", [])
+
+        # Merge with previous context if any
+        merged_combined = (prev_combined + "\n\n" + combined_text).strip() if prev_combined else combined_text
+        CONTEXT_STORE[session_id] = {
+            "files": prev_files + [r.model_dump() for r in results],
+            "combined": merged_combined,
+        }
+
+    message = (
+        "Processed files successfully. Session context updated."
+        if total_chars > 0
+        else "Processed files, but no readable content was extracted."
+    )
+
+    return UploadContextResponse(
+        session_id=session_id,
+        files_processed=results,
+        total_chars=total_chars,
+        message=message,
+    )
 
