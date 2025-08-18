@@ -24,13 +24,16 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
         - .pdf  : pdfminer.six text extraction
         - .docx : python-docx extraction (paragraphs and table cells)
         - .xlsx : openpyxl extraction (sheet-by-sheet parsing, table detection with headers,
-                  JSON sample, and TSV preview for robust, structured context)
+                  JSON sample, TSV preview, and per-column unique values for robust, structured context)
 
     For .xlsx, this function:
         - Detects the header row heuristically (first row with >=2 non-empty cells, not mostly numeric)
         - Sanitizes header names (non-empty, unique)
         - Maps each subsequent row to a dict of {column_name: value}
-        - Generates a JSON sample (first N rows) and a TSV preview for human readability
+        - Generates:
+            * a JSON sample (first N rows)
+            * a TSV preview for human readability
+            * per-column Unique values (first M distinct values per column)
         - Returns a consolidated, annotated text summary of all sheets
 
     Args:
@@ -160,6 +163,7 @@ def _extract_xlsx(content: bytes) -> str:
     - Detect header row and map subsequent rows to column names.
     - Produce a JSON sample (first N rows per sheet) with clean types.
     - Include a TSV preview for readability.
+    - Include per-column Unique values (first M values) to support listing queries.
     - Annotate with sheet name, columns, and approximate row counts.
 
     Performance safeguards:
@@ -169,6 +173,7 @@ def _extract_xlsx(content: bytes) -> str:
         FILE_EXTRACT_MAX_XLSX_ROWS_PER_SHEET (int): per-sheet row cap (default: 20000)
         FILE_EXTRACT_XLSX_JSON_SAMPLE_ROWS (int): number of records to include in JSON sample per sheet (default: 50)
         FILE_EXTRACT_XLSX_TSV_PREVIEW_ROWS (int): number of TSV rows to preview per sheet (default: 20)
+        FILE_EXTRACT_XLSX_UNIQUE_LIMIT (int): number of distinct values to collect per column (default: 50)
     When limits are hit, extraction stops gracefully for speed and reliability.
     """
     # Read limits from environment with sensible defaults
@@ -176,6 +181,7 @@ def _extract_xlsx(content: bytes) -> str:
     max_rows_per_sheet = _safe_int_env("FILE_EXTRACT_MAX_XLSX_ROWS_PER_SHEET", 20000)
     json_sample_rows = _safe_int_env("FILE_EXTRACT_XLSX_JSON_SAMPLE_ROWS", 50)
     tsv_preview_rows = _safe_int_env("FILE_EXTRACT_XLSX_TSV_PREVIEW_ROWS", 20)
+    unique_limit = _safe_int_env("FILE_EXTRACT_XLSX_UNIQUE_LIMIT", 50)
 
     bio = io.BytesIO(content)
     wb = load_workbook(bio, data_only=True, read_only=True)
@@ -194,6 +200,9 @@ def _extract_xlsx(content: bytes) -> str:
             tsv_lines: List[str] = []
             parsed_data_rows = 0
             truncated_notice_added = False
+
+            # Track unique values per column (strings for consistency)
+            uniques: Dict[str, set] = {}
 
             for row in ws.iter_rows(values_only=True):
                 row_index += 1
@@ -220,6 +229,9 @@ def _extract_xlsx(content: bytes) -> str:
                         headers = _sanitize_headers(row_vals)
                         header_found = True
 
+                        # Initialize uniques dictionary for columns
+                        uniques = {h: set() for h in headers}
+
                         # TSV header line for preview
                         tsv_lines.append("\t".join(headers))
 
@@ -230,6 +242,9 @@ def _extract_xlsx(content: bytes) -> str:
                                 continue
                             record = _row_to_record(headers, data_row)
                             parsed_data_rows += 1
+
+                            # Update uniques
+                            _update_uniques(uniques, headers, record, unique_limit)
 
                             # JSON sample
                             if len(sample_records) < json_sample_rows:
@@ -249,6 +264,9 @@ def _extract_xlsx(content: bytes) -> str:
                         continue
                     record = _row_to_record(headers, row_vals)
                     parsed_data_rows += 1
+
+                    # Update uniques
+                    _update_uniques(uniques, headers, record, unique_limit)
 
                     if len(sample_records) < json_sample_rows:
                         sample_records.append(record)
@@ -272,12 +290,15 @@ def _extract_xlsx(content: bytes) -> str:
                     headers = _sanitize_headers(raw_headers)
                     header_found = True
                     tsv_lines.append("\t".join(headers))
+                    # Initialize uniques dictionary for columns
+                    uniques = {h: set() for h in headers}
                     # Process remaining as data
                     for data_row in buffered_rows[first_non_empty_idx + 1 :]:
                         if not any(v is not None and str(v).strip() != "" for v in data_row):
                             continue
                         record = _row_to_record(headers, data_row)
                         parsed_data_rows += 1
+                        _update_uniques(uniques, headers, record, unique_limit)
                         if len(sample_records) < json_sample_rows:
                             sample_records.append(record)
                         if len(tsv_lines) < tsv_preview_rows + 1:
@@ -287,6 +308,15 @@ def _extract_xlsx(content: bytes) -> str:
             if header_found:
                 parts.append(f"Columns ({len(headers)}): {json.dumps(headers, ensure_ascii=False)}")
                 parts.append(f"Parsed data rows (approx): {parsed_data_rows}")
+                # Unique values by column
+                unique_map = {
+                    col: sorted([v for v in vals if isinstance(v, str) and v.strip() != ""])[ : unique_limit]
+                    for col, vals in uniques.items()
+                    if any((isinstance(v, str) and v.strip() != "") for v in vals)
+                } if uniques else {}
+                if unique_map:
+                    parts.append(f"Unique values by column (first {unique_limit}):")
+                    parts.append(json.dumps(unique_map, ensure_ascii=False, indent=2))
                 # JSON sample
                 parts.append("JSON sample (first rows):")
                 parts.append(json.dumps(sample_records, ensure_ascii=False, indent=2))
@@ -339,6 +369,35 @@ def _record_to_tsv(headers: List[str], record: Dict[str, Any]) -> str:
             s = s.replace("\n", " ").replace("\r", " ").replace("\t", " ")
             vals.append(s)
     return "\t".join(vals)
+
+
+def _update_uniques(uniques: Dict[str, set], headers: List[str], record: Dict[str, Any], limit: int) -> None:
+    """
+    Update per-column unique values set using a record. Collect up to 'limit' distinct values per column.
+    Only string-like non-empty values are recorded to support name/listing queries.
+    """
+    if not uniques:
+        return
+    for h in headers:
+        try:
+            if len(uniques.get(h, set())) >= limit:
+                continue
+            v = record.get(h)
+            if v is None:
+                continue
+            s = str(v).strip()
+            if not s:
+                continue
+            # Normalize whitespace
+            s = " ".join(s.split())
+            # Initialize set if needed (robustness if headers changed)
+            if h not in uniques:
+                uniques[h] = set()
+            if len(uniques[h]) < limit:
+                uniques[h].add(s)
+        except Exception:
+            # Do not break extraction on edge cases
+            continue
 
 
 # PUBLIC_INTERFACE

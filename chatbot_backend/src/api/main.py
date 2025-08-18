@@ -383,6 +383,43 @@ def _vector_search(session_id: str, query: str, top_k: int = 3) -> List[str]:
     return [text for _, text in scored_lex[:top_k]]
 
 
+def _is_debug_enabled() -> bool:
+    """
+    Check env var CHATBOT_DEBUG_CONTEXT to enable verbose context logging.
+    """
+    import os
+    return os.getenv("CHATBOT_DEBUG_CONTEXT", "").lower() in ("1", "true", "yes", "on")
+
+def _debug_log(msg: str) -> None:
+    """
+    Print debug logs only when debug is enabled to avoid noisy output in prod.
+    """
+    if _is_debug_enabled():
+        try:
+            print(f"[DEBUG] {msg}")
+        except Exception:
+            pass
+
+def _is_schema_or_list_query(q: str) -> bool:
+    """
+    Heuristic to detect queries asking for schema/columns or listing unique values.
+    Examples: "what are the customer names", "list all columns", "distinct model names", "what are the values of ..."
+    """
+    import re
+    ql = (q or "").lower()
+    patterns = [
+        r"\bcolumns?\b",
+        r"\bschema\b",
+        r"\bwhat\s+are\s+the\s+.+\bnames?\b",
+        r"\blist\s+all\b",
+        r"\bunique\b",
+        r"\bdistinct\b",
+        r"\bvalues?\b\s+of\b",
+        r"\bwhat\s+are\s+the\s+customer\s+names\b",
+        r"\bmodel\s+names?\b",
+    ]
+    return any(re.search(p, ql) for p in patterns)
+
 def _extract_table_snippets_from_combined(combined: str, max_chars: int = 12000) -> str:
     """
     Extracts the most useful Excel table snippets from the combined uploaded context:
@@ -414,7 +451,7 @@ def _extract_table_snippets_from_combined(combined: str, max_chars: int = 12000)
             out.append(line)
             i += 1
             continue
-        if line.startswith("Columns (") or line.startswith("JSON sample") or line.startswith("TSV preview"):
+        if line.startswith("Columns (") or line.startswith("JSON sample") or line.startswith("TSV preview") or line.startswith("Unique values by column"):
             i = add_until_blank(i)
             continue
         i += 1
@@ -455,10 +492,13 @@ def get_gemini_response(
     # Compose prompt with uploaded/retrieved context primarily.
     # Important: instruct Gemini to parse TSV/JSON table previews precisely to answer data-based questions.
     guidance = (
-        "If the provided context contains 'JSON sample' or 'TSV preview' sections from a spreadsheet, "
-        "interpret them as tabular data with the given 'Columns'. Use exact cell values and perform any "
-        "requested calculations (sums, averages, lookups) directly from those tables. When answering, "
-        "state the result clearly and, if helpful, mention the column names you used. Do not add disclaimers."
+        "If the provided context contains 'Columns', 'Unique values by column', 'JSON sample', or 'TSV preview' "
+        "sections from a spreadsheet, interpret them as tabular data with the given 'Columns'. For listing-type "
+        "questions (e.g., 'what are the customer names?' or 'list all model names'), use the 'Unique values by column' "
+        "section directly if available. If it is not available for the requested column, derive the unique values "
+        "from the TSV/JSON sample provided. Use exact cell values, avoid fabricating values, and present the result "
+        "clearly as a list or concise sentence. For calculation/lookup questions, use the TSV/JSON data to compute the "
+        "answer precisely. Do not add disclaimers."
     )
     prompt = (
         f"You are an expert software assistant.\n"
@@ -531,26 +571,58 @@ def chat(request: ChatRequest):
                 return fallback
             return str(val)
 
-        # Log user input with a temp placeholder output
-        try:
-            memory.save_context({"input": request.query}, {"output": _safe_str_output("", "No answer available")})
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
+        # Do not pre-save placeholder; save only final answer to memory after generation
 
         # Retrieve top-k relevant chunks from vector index
         top_chunks = _vector_search(session_id, request.query, top_k=3)
         retrieved_context = "\n---\n".join(top_chunks).strip()
 
-        # Fallback strategy for spreadsheet context:
-        # If retrieval is empty or too small, extract table-focused snippets (Columns/JSON sample/TSV preview)
-        if not retrieved_context or len(retrieved_context) < 200:
-            combined = CONTEXT_STORE.get(session_id, {}).get("combined", "")
+        # Fallback and forcing strategy for spreadsheet context:
+        # - If retrieval is empty/weak, extract table-focused snippets (Columns/Unique values/JSON/TSV)
+        # - If the query asks for schema/columns/unique values, force-include table snippets
+        combined = CONTEXT_STORE.get(session_id, {}).get("combined", "")
+        should_force_table = _is_schema_or_list_query(request.query)
+        used_table_snippets = False
+
+        # Determine if vector search seems weak (short or lacks key table markers)
+        retrieval_is_weak = (
+            not retrieved_context
+            or len(retrieved_context) < 200
+            or ("Columns (" not in retrieved_context and "TSV preview" not in retrieved_context and "Unique values by column" not in retrieved_context)
+        )
+
+        if should_force_table or retrieval_is_weak:
             table_snips = _extract_table_snippets_from_combined(combined)
             if table_snips:
-                retrieved_context = table_snips
+                if retrieved_context:
+                    # Prepend table snippets to ensure schema is visible
+                    retrieved_context = f"{table_snips}\n\n{retrieved_context}"
+                else:
+                    retrieved_context = table_snips
+                used_table_snippets = True
             elif combined:
                 # ultimate fallback: include a truncated combined context
                 retrieved_context = combined[:12000]
+                used_table_snippets = True
+
+        # Debug/logging: store what reached Gemini for traceability
+        try:
+            # Ensure session context dictionary exists
+            ctx = CONTEXT_STORE.get(session_id) or {}
+            ctx["last_query"] = request.query
+            ctx["last_top_chunks_count"] = len(top_chunks)
+            ctx["last_used_table_snippets"] = used_table_snippets
+            ctx["last_context_chars"] = len(retrieved_context)
+            ctx["last_retrieved_context"] = (retrieved_context or "")[:4000]
+            CONTEXT_STORE[session_id] = ctx
+            _debug_log(
+                f"session={session_id} top_chunks={len(top_chunks)} used_table_snips={used_table_snippets} "
+                f"extra_len={len(retrieved_context)} "
+                f"context_sample={(retrieved_context or '')[:300].replace('\\n',' ')[:300]}"
+            )
+        except Exception:
+            # Non-fatal
+            pass
 
         # Compose Gemini answer with retrieved context (if any)
         try:
