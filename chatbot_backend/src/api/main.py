@@ -335,8 +335,9 @@ def _index_text_for_session(session_id: str, filename: str, text: str):
     For .xlsx files, use special chunking to preserve table blocks and TSV/JSON previews.
     """
     _ensure_session_index(session_id)
-    # Prefer sheet/TSV-preserving chunking for Excel files
-    if (filename or "").lower().endswith(".xlsx"):
+    # Prefer sheet/TSV-preserving chunking for Excel/JSON structured summaries
+    lower_name = (filename or "").lower()
+    if lower_name.endswith(".xlsx") or lower_name.endswith(".json"):
         chunks = _chunk_xlsx_text_special(text, max_chunk_chars=2600)
     else:
         chunks = _split_into_chunks(text, chunk_size_words=180, overlap_words=40)
@@ -734,7 +735,7 @@ def chat_wsinfo():
     summary="Upload context files for a chat session",
     description=(
         "Accepts one or more files via multipart/form-data and extracts readable text from supported types "
-        "(.docx, .xlsx, .pdf, .txt). The extracted content is stored per session and used as additional context "
+        "(.docx, .xlsx, .pdf, .txt, .json). The extracted content is stored per session and used as additional context "
         "when answering subsequent chat queries. Builds a vector index (Gemini embeddings) for semantic retrieval. "
         "To improve reliability and avoid timeouts on large files, heavy indexing is performed in the background. "
         "Returns an acknowledgment with per-file processing results and a preview."
@@ -746,7 +747,7 @@ def chat_wsinfo():
 )
 async def upload_chat_context(
     session_id: str = Form(..., description="Session ID to associate uploaded context with"),
-    files: List[UploadFile] = File(..., description="One or more files (.docx, .xlsx, .pdf, .txt)"),
+    files: List[UploadFile] = File(..., description="One or more files (.docx, .xlsx, .pdf, .txt, .json)"),
     background_tasks: BackgroundTasks = None,
 ):
     """

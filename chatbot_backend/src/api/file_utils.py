@@ -25,6 +25,8 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
         - .docx : python-docx extraction (paragraphs and table cells)
         - .xlsx : openpyxl extraction (sheet-by-sheet parsing, table detection with headers,
                   JSON sample, TSV preview, and per-column unique values for robust, structured context)
+        - .json : JSON parsing with structure discovery, array-of-objects tabular summary,
+                  unique values per key, JSON sample, and TSV preview
 
     For .xlsx, this function:
         - Detects the header row heuristically (first row with >=2 non-empty cells, not mostly numeric)
@@ -35,6 +37,16 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
             * a TSV preview for human readability
             * per-column Unique values (first M distinct values per column)
         - Returns a consolidated, annotated text summary of all sheets
+
+    For .json, this function:
+        - Accepts both a single object and an array of objects
+        - If array of objects, treats as a table and produces:
+            * Columns (union of keys; dot-notation for nested up to depth 2)
+            * Unique values per column (first M)
+            * JSON sample (first N records)
+            * TSV preview (first K rows)
+        - If a single object, enumerates keys/types and, for any array-of-objects fields,
+          produces a similar tabular summary per field.
 
     Args:
         filename (str): Original filename (used for type detection).
@@ -56,7 +68,9 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
             return _extract_docx(content), None
         if name_lower.endswith(".xlsx"):
             return _extract_xlsx(content), None
-        return "", f"Unsupported file type for '{filename}'. Allowed: .txt, .pdf, .docx, .xlsx"
+        if name_lower.endswith(".json"):
+            return _extract_json(content), None
+        return "", f"Unsupported file type for '{filename}'. Allowed: .txt, .pdf, .docx, .xlsx, .json"
     except Exception as e:
         return "", f"Failed to extract '{filename}': {e}"
 
@@ -339,6 +353,242 @@ def _extract_xlsx(content: bytes) -> str:
 
     return "\n".join(parts).strip()
 
+
+def _safe_str_len(s: str, max_len: int) -> str:
+    """Trim a string to max_len characters with ellipsis."""
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 3] + "..."
+
+
+def _flatten_keys(d: Dict[str, Any], parent: str = "", sep: str = ".", depth: int = 0, max_depth: int = 2) -> List[str]:
+    """
+    Collect flattened keys (dot notation) up to max_depth levels.
+    Values that are dicts/lists beyond max_depth are not expanded further.
+    """
+    keys: List[str] = []
+    if not isinstance(d, dict):
+        return keys
+    for k, v in d.items():
+        if not isinstance(k, str):
+            k = str(k)
+        nk = f"{parent}{sep}{k}" if parent else k
+        if isinstance(v, dict) and depth < max_depth:
+            keys.extend(_flatten_keys(v, nk, sep, depth + 1, max_depth))
+        else:
+            keys.append(nk)
+    return keys
+
+
+def _flatten_to_record(obj: Dict[str, Any], max_depth: int = 2, max_str_len: int = 300) -> Dict[str, Any]:
+    """
+    Flatten a JSON object (dict) to a single level using dot notation for keys up to max_depth.
+    Values are coerced to JSON-friendly scalars/strings with trimming.
+    """
+    record: Dict[str, Any] = {}
+
+    def _walk(o: Any, parent: str = "", depth: int = 0):
+        if isinstance(o, dict) and depth < max_depth:
+            for kk, vv in o.items():
+                key = f"{parent}.{kk}" if parent else str(kk)
+                _walk(vv, key, depth + 1)
+        else:
+            # Coerce value
+            v = _coerce_cell_value(o)
+            if isinstance(v, str):
+                v = _safe_str_len(v, max_str_len)
+            record[parent] = v
+
+    if isinstance(obj, dict):
+        _walk(obj, "", 0)
+    return record
+
+
+def _json_array_of_objects_summary(
+    arr: List[Any],
+    title: str = "[JSON Array of objects]",
+    json_sample_rows_env: str = "FILE_EXTRACT_JSON_SAMPLE_ROWS",
+    tsv_preview_rows_env: str = "FILE_EXTRACT_JSON_TSV_PREVIEW_ROWS",
+    unique_limit_env: str = "FILE_EXTRACT_JSON_UNIQUE_LIMIT",
+    scan_rows_env: str = "FILE_EXTRACT_JSON_SCAN_ROWS",
+) -> str:
+    """
+    Produce a structured summary for an array of objects:
+    - Columns (union of flattened keys up to depth 2)
+    - Approx record count
+    - Unique values by column (first M string values)
+    - JSON sample (first N rows)
+    - TSV preview (first K rows)
+    """
+    json_sample_rows = _safe_int_env(json_sample_rows_env, 50)
+    tsv_preview_rows = _safe_int_env(tsv_preview_rows_env, 20)
+    unique_limit = _safe_int_env(unique_limit_env, 50)
+    scan_rows = _safe_int_env(scan_rows_env, 1000)
+
+    # Determine union of columns from first scan_rows items
+    cols_set: set = set()
+    count = 0
+    for item in arr[:scan_rows]:
+        if isinstance(item, dict):
+            for k in _flatten_keys(item, max_depth=2):
+                cols_set.add(k)
+        count += 1
+    columns = sorted(list(cols_set))
+
+    # Initialize uniques map
+    uniques: Dict[str, set] = {c: set() for c in columns}
+
+    # Build samples and TSV
+    sample_records: List[Dict[str, Any]] = []
+    tsv_lines: List[str] = []
+    if columns:
+        tsv_lines.append("\t".join(columns))
+    parsed_rows = 0
+    for item in arr:
+        if not isinstance(item, dict):
+            # skip non-dict entries in mixed arrays
+            continue
+        rec_full = _flatten_to_record(item, max_depth=2)
+        # Normalize to target columns
+        rec: Dict[str, Any] = {c: rec_full.get(c) for c in columns}
+        parsed_rows += 1
+
+        # Update uniques for string-like non-empty values
+        _update_uniques(uniques, columns, rec, unique_limit)
+
+        if len(sample_records) < json_sample_rows:
+            sample_records.append(rec)
+        if len(tsv_lines) < tsv_preview_rows + 1:  # +1 header
+            tsv_lines.append(_record_to_tsv(columns, rec))
+
+    parts: List[str] = []
+    parts.append(title)
+    parts.append(f"Columns ({len(columns)}): {json.dumps(columns, ensure_ascii=False)}")
+    parts.append(f"Parsed data rows (approx): {parsed_rows}")
+    # Unique values map
+    unique_map = {
+        col: sorted([v for v in vals if isinstance(v, str) and v.strip() != ""])[: unique_limit]
+        for col, vals in uniques.items()
+        if any((isinstance(v, str) and v.strip() != "") for v in vals)
+    } if uniques else {}
+    if unique_map:
+        parts.append(f"Unique values by column (first {unique_limit}):")
+        parts.append(json.dumps(unique_map, ensure_ascii=False, indent=2))
+    # JSON sample
+    parts.append("JSON sample (first rows):")
+    parts.append(json.dumps(sample_records, ensure_ascii=False, indent=2))
+    # TSV preview
+    parts.append("TSV preview:")
+    parts.append("\n".join(tsv_lines))
+    parts.append("")  # spacer
+    return "\n".join(parts).strip()
+
+
+def _extract_json(content: bytes) -> str:
+    """
+    Extract structured context from a JSON file.
+
+    Behavior:
+      - If the root is an array:
+          * If elements are objects: treat as a table and output Columns/Unique/JSON sample/TSV preview
+          * Else: show element type summary and sample values
+      - If the root is an object:
+          * List top-level keys and value types
+          * For any key whose value is an array of objects, produce a dataset block similar to the table output
+          * Include a compact JSON sample of the root object (trimmed)
+    """
+    raw = content.decode("utf-8", errors="ignore").strip()
+    if raw == "":
+        return "Empty JSON content."
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        # Raise an exception so the caller wraps it into an error message
+        raise Exception(f"Invalid JSON: {e.msg} at line {e.lineno} column {e.colno}")
+
+    parts: List[str] = []
+    # Limits
+    sample_preview_len = _safe_int_env("FILE_EXTRACT_JSON_STRING_TRIM", 300)
+
+    if isinstance(data, list):
+        if not data:
+            return "[JSON Array] The array is empty."
+        # Check if majority are dicts
+        dict_count = sum(1 for x in data if isinstance(x, dict))
+        if dict_count >= max(1, len(data) // 2):
+            # Treat as table
+            summary = _json_array_of_objects_summary(data, title="[JSON Array of objects]")
+            parts.append(summary)
+        else:
+            # Primitives/mixed array
+            types = sorted({type(x).__name__ for x in data})
+            parts.append(f"[JSON Array of primitives/mixed] Length: {len(data)}")
+            parts.append(f"Element types: {types}")
+            sample_vals = [x for x in data[:min(len(data), 25)]]
+            # Coerce to printable and trim
+            sample_strs = []
+            for v in sample_vals:
+                if isinstance(v, (dict, list)):
+                    s = _safe_str_len(json.dumps(v, ensure_ascii=False), sample_preview_len)
+                else:
+                    s = _safe_str_len(str(v), sample_preview_len)
+                sample_strs.append(s)
+            parts.append("Sample values:")
+            parts.append(json.dumps(sample_strs, ensure_ascii=False, indent=2))
+        return "\n".join(parts).strip()
+
+    if isinstance(data, dict):
+        keys = list(data.keys())
+        parts.append("[JSON Object]")
+        parts.append(f"Top-level keys ({len(keys)}): {json.dumps(keys, ensure_ascii=False)}")
+
+        # Key types summary
+        type_map = {k: type(data[k]).__name__ for k in keys}
+        parts.append("Key types:")
+        parts.append(json.dumps(type_map, ensure_ascii=False, indent=2))
+
+        # For array-of-objects fields, produce dataset blocks
+        for k in keys:
+            v = data.get(k)
+            if isinstance(v, list) and v:
+                dict_count = sum(1 for x in v if isinstance(x, dict))
+                if dict_count >= max(1, len(v) // 2):
+                    parts.append(f"[Dataset: {k}]")
+                    parts.append(_json_array_of_objects_summary(v, title=f"[Array of objects: {k}]"))
+                else:
+                    # Primitive array
+                    types = sorted({type(x).__name__ for x in v})
+                    parts.append(f"[Array field: {k}] Length: {len(v)}; element types: {types}")
+                    sample_vals = [x for x in v[:min(len(v), 25)]]
+                    sample_strs = []
+                    for sv in sample_vals:
+                        if isinstance(sv, (dict, list)):
+                            s = _safe_str_len(json.dumps(sv, ensure_ascii=False), sample_preview_len)
+                        else:
+                            s = _safe_str_len(str(sv), sample_preview_len)
+                        sample_strs.append(s)
+                    parts.append("Sample values:")
+                    parts.append(json.dumps(sample_strs, ensure_ascii=False, indent=2))
+            elif isinstance(v, dict):
+                # Provide flattened nested keys (up to depth 2)
+                nested_keys = _flatten_keys(v, parent=k, max_depth=2)
+                if nested_keys:
+                    parts.append(f"[Nested object keys under '{k}'] count={len(nested_keys)}")
+                    parts.append(json.dumps(sorted(nested_keys), ensure_ascii=False, indent=2))
+
+        # Include a compact JSON sample of the root object
+        parts.append("JSON sample (object):")
+        try:
+            parts.append(_safe_str_len(json.dumps(data, ensure_ascii=False, indent=2), 6000))
+        except Exception:
+            parts.append(_safe_str_len(str(data), 6000))
+
+        return "\n".join(parts).strip()
+
+    # Fallback for unusual JSON types (e.g., str/number at root)
+    return f"[JSON Scalar] {type(data).__name__}: {_safe_str_len(str(data), 1000)}"
+    
 
 def _row_to_record(headers: List[str], row_vals: List[Any]) -> Dict[str, Any]:
     """
