@@ -9,7 +9,7 @@
 # Without this, Gemini responses will be unavailable and fallback messaging will appear.
 # ==============================================================================
 
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, EmailStr
@@ -557,7 +557,7 @@ def health_check():
     summary="Chat with bot",
     description="Submit a chat query. Backend retrieves only top-k relevant segments via vector search from uploaded files (if any) and passes them to Gemini. Returns only Gemini's final answer."
 )
-def chat(request: ChatRequest):
+def chat(request: ChatRequest, response: Response):
     """
     PUBLIC_INTERFACE
     Handles user's chat request. All answers come directly from Gemini.
@@ -587,20 +587,26 @@ def chat(request: ChatRequest):
         # If Excel JSON rows exist for this session, use ONLY the JSON array as context.
         MAX_CONTEXT_CHARS = 12000
 
-        def _rows_to_json_str(rows: List[Dict[str, Any]], max_chars: int = MAX_CONTEXT_CHARS) -> str:
+        def _rows_to_json_str(rows: List[Dict[str, Any]], max_chars: int = MAX_CONTEXT_CHARS) -> tuple[str, int]:
+            """
+            Build a compact JSON array string within the character budget.
+            Returns:
+                tuple[str, int]: (json_array_string, included_count)
+            """
             if not rows:
-                return ""
-            # Pack as many rows as fit into max_chars while preserving valid JSON array syntax.
+                return "[]", 0
             out_parts: List[str] = []
             current = 2  # for [ ]
+            included = 0
             for r in rows:
-                s = json.dumps(r, ensure_ascii=False)
+                s = json.dumps(r, ensure_ascii=False, separators=(",", ":"))
                 sep = ", " if out_parts else ""
                 if current + len(sep) + len(s) > max_chars:
                     break
                 out_parts.append(s)
                 current += len(sep) + len(s)
-            return "[" + ", ".join(out_parts) + "]"
+                included += 1
+            return "[" + ", ".join(out_parts) + "]", included
 
         session_ctx = CONTEXT_STORE.get(session_id, {})
         raw_json_docs = session_ctx.get("raw_json_docs", []) or []
@@ -608,16 +614,21 @@ def chat(request: ChatRequest):
         used_table_snippets = False  # retained for debug metadata compatibility
         top_chunks: List[str] = []  # ensure defined for telemetry
 
-        def _pack_json_docs_for_prompt(docs: List[Dict[str, Any]], max_chars: int = MAX_CONTEXT_CHARS) -> str:
+        def _pack_json_docs_for_prompt(docs: List[Dict[str, Any]], max_chars: int = MAX_CONTEXT_CHARS) -> tuple[str, bool, int, int]:
             """
             Build a valid JSON array string like:
               [{"source":"file.json","data": <JSON>}, ...]
             honoring a character cap. If a single doc cannot fit, include a truncated
             string sample to keep JSON valid:
               {"source":"file.json","data_truncated":true,"data_sample":"..."}
+            Returns:
+              (json_array_string, truncated_flag, included_docs, total_docs)
             """
             parts: List[str] = []
             current = 2  # for [ ]
+            truncated = False
+            included_docs = 0
+            total_docs = len(docs)
             for d in docs:
                 fn = d.get("filename") or "json"
                 js = d.get("json") or ""
@@ -626,6 +637,7 @@ def chat(request: ChatRequest):
                 if current + len(sep) + len(entry) <= max_chars:
                     parts.append(entry)
                     current += len(sep) + len(entry)
+                    included_docs += 1
                     continue
                 # Fallback: truncated sample as a JSON string to keep overall structure valid
                 budget = max_chars - current - len(sep) - len(fn) - 60  # room for keys and punctuation
@@ -638,14 +650,34 @@ def chat(request: ChatRequest):
                 if current + len(sep) + len(fallback_entry) <= max_chars:
                     parts.append(fallback_entry)
                     current += len(sep) + len(fallback_entry)
+                    truncated = True
+                    included_docs += 1  # count as represented (sample)
+                # We break after attempting fallback; remaining docs omitted
+                truncated = True
                 break
-            return "[" + ", ".join(parts) + "]"
+            # If not all docs could be included, mark truncated
+            if included_docs < total_docs:
+                truncated = True
+            return "[" + ", ".join(parts) + "]", truncated, included_docs, total_docs
+
+        # Track truncation state and human-readable detail
+        truncated_flag = False
+        trunc_detail = ""
 
         if raw_json_docs:
             # Bypass RAG and directly provide raw JSON content to Gemini
-            retrieved_context = _pack_json_docs_for_prompt(raw_json_docs, max_chars=MAX_CONTEXT_CHARS)
+            packed, truncated, included_docs, total_docs = _pack_json_docs_for_prompt(raw_json_docs, max_chars=MAX_CONTEXT_CHARS)
+            retrieved_context = packed
+            if truncated:
+                truncated_flag = True
+                trunc_detail = f"Included {included_docs} of {total_docs} JSON document(s) from uploaded files."
         elif json_rows:
-            retrieved_context = _rows_to_json_str(json_rows, max_chars=MAX_CONTEXT_CHARS)
+            packed_rows, included_count = _rows_to_json_str(json_rows, max_chars=MAX_CONTEXT_CHARS)
+            retrieved_context = packed_rows
+            total_rows = len(json_rows)
+            if included_count < total_rows:
+                truncated_flag = True
+                trunc_detail = f"Included {included_count} of {total_rows} row(s) from spreadsheet/JSON data."
         else:
             # No JSON docs or Excel rows: fall back to vector search over any uploaded text
             top_chunks = _vector_search(session_id, request.query, top_k=3)
@@ -653,7 +685,19 @@ def chat(request: ChatRequest):
             # If retrieval is extremely weak and we have combined text, include a small portion as last resort
             combined = session_ctx.get("combined", "")
             if (not retrieved_context or len(retrieved_context) < 100) and combined:
+                # Keep explicit trim so we can signal truncation
+                if len(combined) > MAX_CONTEXT_CHARS:
+                    truncated_flag = True
+                    trunc_detail = f"Included a truncated portion (~{MAX_CONTEXT_CHARS} chars) of uploaded text to fit the prompt."
                 retrieved_context = combined[:MAX_CONTEXT_CHARS]
+
+        # Ensure final context respects prompt budget; detect if this trimming causes truncation
+        if retrieved_context:
+            if len(retrieved_context) > MAX_CONTEXT_CHARS:
+                truncated_flag = True
+                if not trunc_detail:
+                    trunc_detail = f"Context trimmed to ~{MAX_CONTEXT_CHARS} characters to fit the model prompt."
+                retrieved_context = retrieved_context[:MAX_CONTEXT_CHARS]
 
         # Debug/logging: store what reached Gemini for traceability
         try:
@@ -662,12 +706,12 @@ def chat(request: ChatRequest):
             ctx["last_query"] = request.query
             ctx["last_top_chunks_count"] = len(top_chunks)
             ctx["last_used_table_snippets"] = used_table_snippets
-            ctx["last_context_chars"] = len(retrieved_context)
+            ctx["last_context_chars"] = len(retrieved_context or "")
             ctx["last_retrieved_context"] = (retrieved_context or "")[:4000]
             CONTEXT_STORE[session_id] = ctx
             _debug_log(
                 f"session={session_id} top_chunks={len(top_chunks)} used_table_snips={used_table_snippets} "
-                f"extra_len={len(retrieved_context)} "
+                f"extra_len={len(retrieved_context or '')} "
                 f"context_sample={(retrieved_context or '')[:300].replace('\\n',' ')[:300]}"
             )
         except Exception:
@@ -676,18 +720,36 @@ def chat(request: ChatRequest):
 
         # Compose Gemini answer with retrieved context (if any)
         try:
-            gemini_answer = get_gemini_response(request.query, memory, extra_context=retrieved_context)
+            gemini_answer = get_gemini_response(request.query, memory, extra_context=retrieved_context or "")
         except Exception as e:
             gemini_answer = "[Gemini unavailable: {}]".format(e)
 
+        # If context was truncated, prepend a clear notice and set response headers to inform the UI
+        if truncated_flag:
+            # Limit detail header length to avoid excessively large headers
+            detail_header = trunc_detail[:400] if trunc_detail else "Context truncated due to prompt size limits."
+            response.headers["X-Context-Truncated"] = "true"
+            response.headers["X-Context-Truncation-Detail"] = detail_header
+            notice_lines = [
+                "Notice: The uploaded file content was too large to include fully in the AI prompt.",
+                "The answer below is based on a truncated subset of your files and may be incomplete.",
+            ]
+            if trunc_detail:
+                notice_lines.append(f"Details: {trunc_detail}")
+            notice = "\n".join(notice_lines).strip()
+        else:
+            response.headers["X-Context-Truncated"] = "false"
+            notice = ""
+
         # Final output cleaning and save in memory
         gemini_answer = _clean_gemini_output(_safe_str_output(gemini_answer))
+        final_answer = (notice + "\n\n" + gemini_answer).strip() if notice else gemini_answer
         try:
-            memory.save_context({"input": request.query}, {"output": _safe_str_output(gemini_answer)})
+            memory.save_context({"input": request.query}, {"output": _safe_str_output(final_answer)})
         except Exception:
             pass  # Do not raise for failed memory update
 
-        return ChatAnswerResponse(answer=gemini_answer)
+        return ChatAnswerResponse(answer=final_answer)
 
     except HTTPException:
         raise  # Allow FastAPI HTTPExceptions to propagate
