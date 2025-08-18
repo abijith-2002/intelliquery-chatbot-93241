@@ -603,14 +603,51 @@ def chat(request: ChatRequest):
             return "[" + ", ".join(out_parts) + "]"
 
         session_ctx = CONTEXT_STORE.get(session_id, {})
+        raw_json_docs = session_ctx.get("raw_json_docs", []) or []
         json_rows: List[Dict[str, Any]] = session_ctx.get("xlsx_json_rows", []) or []
         used_table_snippets = False  # retained for debug metadata compatibility
         top_chunks: List[str] = []  # ensure defined for telemetry
 
-        if json_rows:
+        def _pack_json_docs_for_prompt(docs: List[Dict[str, Any]], max_chars: int = MAX_CONTEXT_CHARS) -> str:
+            """
+            Build a valid JSON array string like:
+              [{"source":"file.json","data": <JSON>}, ...]
+            honoring a character cap. If a single doc cannot fit, include a truncated
+            string sample to keep JSON valid:
+              {"source":"file.json","data_truncated":true,"data_sample":"..."}
+            """
+            parts: List[str] = []
+            current = 2  # for [ ]
+            for d in docs:
+                fn = d.get("filename") or "json"
+                js = d.get("json") or ""
+                entry = f'{{"source":{json.dumps(fn)}, "data": {js}}}'
+                sep = ", " if parts else ""
+                if current + len(sep) + len(entry) <= max_chars:
+                    parts.append(entry)
+                    current += len(sep) + len(entry)
+                    continue
+                # Fallback: truncated sample as a JSON string to keep overall structure valid
+                budget = max_chars - current - len(sep) - len(fn) - 60  # room for keys and punctuation
+                if budget > 0 and js:
+                    sample = js[: max(0, budget)] + ("..." if budget < len(js) else "")
+                else:
+                    sample = ""
+                safe_sample = json.dumps(sample, ensure_ascii=False)
+                fallback_entry = f'{{"source":{json.dumps(fn)}, "data_truncated": true, "data_sample": {safe_sample}}}'
+                if current + len(sep) + len(fallback_entry) <= max_chars:
+                    parts.append(fallback_entry)
+                    current += len(sep) + len(fallback_entry)
+                break
+            return "[" + ", ".join(parts) + "]"
+
+        if raw_json_docs:
+            # Bypass RAG and directly provide raw JSON content to Gemini
+            retrieved_context = _pack_json_docs_for_prompt(raw_json_docs, max_chars=MAX_CONTEXT_CHARS)
+        elif json_rows:
             retrieved_context = _rows_to_json_str(json_rows, max_chars=MAX_CONTEXT_CHARS)
         else:
-            # No Excel rows present: fall back to vector search over any uploaded text
+            # No JSON docs or Excel rows: fall back to vector search over any uploaded text
             top_chunks = _vector_search(session_id, request.query, top_k=3)
             retrieved_context = "\n---\n".join(top_chunks).strip()
             # If retrieval is extremely weak and we have combined text, include a small portion as last resort
@@ -796,6 +833,7 @@ async def upload_chat_context(
     combined_text_parts: List[str] = []
     total_chars = 0
     excel_rows_accumulator: List[Dict[str, Any]] = []
+    json_docs_accumulator: List[Dict[str, Any]] = []
 
     # Helper to index text after response is returned
     def _background_indexer(sid: str, fname: str, txt: str):
@@ -845,6 +883,18 @@ async def upload_chat_context(
                 # Non-fatal: keep text extraction result
                 preview = (preview + f" [XLSX rows extraction error: {e}]").strip()
         elif (filename or "").lower().endswith(".json"):
+            # Capture raw JSON content (compact) for direct prompt injection
+            try:
+                raw_str = (data or b"").decode("utf-8", errors="ignore").strip()
+                if raw_str:
+                    parsed = json.loads(raw_str)
+                    compact = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+                    json_docs_accumulator.append(
+                        {"filename": filename, "json": compact, "chars": len(compact)}
+                    )
+            except Exception as e:
+                preview = (preview + f" [JSON raw capture error: {e}]").strip()
+            # Also extract row-wise records for RAG fallback (existing behavior)
             try:
                 json_rows, rows_err = await run_in_threadpool(
                     extract_json_as_rowwise_records, filename, data or b""
@@ -879,6 +929,7 @@ async def upload_chat_context(
     prev_combined = prev_ctx.get("combined", "")
     prev_files = prev_ctx.get("files", [])
     prev_rows: List[Dict[str, Any]] = prev_ctx.get("xlsx_json_rows", []) or []
+    prev_raw_docs: List[Dict[str, Any]] = prev_ctx.get("raw_json_docs", []) or []
 
     # Merge textual combined content if we have any extracted text
     if total_chars > 0:
@@ -889,11 +940,13 @@ async def upload_chat_context(
 
     # Merge Excel JSON rows regardless of text extraction result (JSON may be primary)
     merged_rows = prev_rows + excel_rows_accumulator if excel_rows_accumulator else prev_rows
+    merged_raw_docs = prev_raw_docs + json_docs_accumulator if json_docs_accumulator else prev_raw_docs
 
     CONTEXT_STORE[session_id] = {
         "files": prev_files + [r.model_dump() for r in results],
         "combined": merged_combined,
         "xlsx_json_rows": merged_rows,
+        "raw_json_docs": merged_raw_docs,
     }
 
     message = (
