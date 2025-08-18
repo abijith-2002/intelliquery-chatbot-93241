@@ -629,3 +629,83 @@ def extract_xlsx_as_rowwise_json(
         return rows, None
     except Exception as e:
         return [], f"Failed to parse XLSX rows for '{filename}': {e}"
+
+
+# PUBLIC_INTERFACE
+def extract_json_as_rowwise_records(
+    filename: str,
+    content: bytes,
+    row_limit_env: str = "FILE_EXTRACT_JSON_ROWS_MAX",
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """
+    PUBLIC_INTERFACE
+    Parse a JSON file into row-wise records suitable for RAG.
+
+    Behavior:
+      - If the JSON root is an array:
+          * For each element that is an object, flatten up to depth 2 and include as a record.
+          * Mixed arrays are supported; non-object elements are skipped.
+      - If the JSON root is an object:
+          * Search for the largest array-of-objects field and flatten those objects into records.
+          * If no array-of-objects field exists, returns [] with an explanatory error.
+
+    Limits:
+      - FILE_EXTRACT_JSON_ROWS_MAX controls the maximum number of records (default: 15000).
+
+    Args:
+        filename (str): The file name (for error context).
+        content (bytes): Raw JSON bytes.
+        row_limit_env (str): Environment variable name that caps number of records.
+
+    Returns:
+        Tuple[List[Dict[str, Any]], Optional[str]]:
+            - rows: List of flattened record dicts.
+            - error: None on success, else an explanatory message.
+    """
+    try:
+        max_total_rows = _safe_int_env(row_limit_env, 15000)
+        raw = content.decode("utf-8", errors="ignore").strip()
+        if raw == "":
+            return [], "Empty JSON content."
+
+        data = json.loads(raw)
+
+        def _take_from_array(arr: List[Any]) -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            for item in arr:
+                if isinstance(item, dict):
+                    out.append(_flatten_to_record(item, max_depth=2))
+                    if len(out) >= max_total_rows:
+                        break
+            return out
+
+        # Root array
+        if isinstance(data, list):
+            rows = _take_from_array(data)
+            if rows:
+                return rows, None
+            return [], "JSON array does not contain object items to extract."
+
+        # Root object: find largest array-of-objects
+        if isinstance(data, dict):
+            best_key: Optional[str] = None
+            best_len = 0
+            for k, v in data.items():
+                if isinstance(v, list) and v:
+                    dict_count = sum(1 for x in v if isinstance(x, dict))
+                    if dict_count > 0 and len(v) > best_len:
+                        best_key = k
+                        best_len = len(v)
+            if best_key is not None:
+                rows = _take_from_array(data[best_key])
+                if rows:
+                    return rows, None
+                return [], f"Array field '{best_key}' does not contain extractable object items."
+            return [], "JSON object does not contain an array of objects to extract."
+
+        return [], "Unsupported JSON structure for row-wise extraction."
+
+    except json.JSONDecodeError as e:
+        return [], f"Invalid JSON: {e.msg} at line {e.lineno} column {e.colno}"
+    except Exception as e:
+        return [], f"Failed to parse JSON rows for '{filename}': {e}"

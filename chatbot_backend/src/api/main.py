@@ -605,6 +605,7 @@ def chat(request: ChatRequest):
         session_ctx = CONTEXT_STORE.get(session_id, {})
         json_rows: List[Dict[str, Any]] = session_ctx.get("xlsx_json_rows", []) or []
         used_table_snippets = False  # retained for debug metadata compatibility
+        top_chunks: List[str] = []  # ensure defined for telemetry
 
         if json_rows:
             retrieved_context = _rows_to_json_str(json_rows, max_chars=MAX_CONTEXT_CHARS)
@@ -779,7 +780,12 @@ async def upload_chat_context(
     Returns:
         UploadContextResponse: Processing results and acknowledgment.
     """
-    from .file_utils import extract_text_from_bytes, summarize_text_preview, extract_xlsx_as_rowwise_json
+    from .file_utils import (
+        extract_text_from_bytes,
+        summarize_text_preview,
+        extract_xlsx_as_rowwise_json,
+        extract_json_as_rowwise_records,
+    )
 
     if not session_id or not isinstance(session_id, str):
         raise HTTPException(status_code=400, detail="session_id must be provided as a non-empty string.")
@@ -822,11 +828,13 @@ async def upload_chat_context(
         preview = summarize_text_preview(text, max_chars=500) if text else ""
         chars = len(text)
 
-        # For Excel files, also extract JSON rows as primary structured context
+        # For structured files, also extract row-wise records as primary structured context
         xlsx_rows: List[Dict[str, Any]] = []
         if (filename or "").lower().endswith(".xlsx"):
             try:
-                xlsx_rows, rows_err = await run_in_threadpool(extract_xlsx_as_rowwise_json, filename, data or b"", True)
+                xlsx_rows, rows_err = await run_in_threadpool(
+                    extract_xlsx_as_rowwise_json, filename, data or b"", True
+                )
                 if rows_err:
                     # Do not fail processing; just log in preview/error if needed
                     preview = (preview + f" [XLSX rows warn: {rows_err}]").strip()
@@ -836,6 +844,17 @@ async def upload_chat_context(
             except Exception as e:
                 # Non-fatal: keep text extraction result
                 preview = (preview + f" [XLSX rows extraction error: {e}]").strip()
+        elif (filename or "").lower().endswith(".json"):
+            try:
+                json_rows, rows_err = await run_in_threadpool(
+                    extract_json_as_rowwise_records, filename, data or b""
+                )
+                if rows_err:
+                    preview = (preview + f" [JSON rows warn: {rows_err}]").strip()
+                else:
+                    excel_rows_accumulator.extend(json_rows)
+            except Exception as e:
+                preview = (preview + f" [JSON rows extraction error: {e}]").strip()
 
         # Append to combined only if successful and non-empty
         if text and not err:
