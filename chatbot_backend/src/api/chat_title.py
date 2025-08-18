@@ -1,9 +1,9 @@
-import os
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 import google.generativeai as genai
 
 from dotenv import load_dotenv
+from .config_utils import get_gemini_api_key
 
 load_dotenv()
 
@@ -43,7 +43,7 @@ async def generate_title(request: TitleRequest) -> str:
     prompt = (request.prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt is required and cannot be blank.")
-    gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+    gemini_api_key = get_gemini_api_key()
     if not gemini_api_key:
         raise HTTPException(status_code=500, detail="Gemini API key not set in environment.")
 

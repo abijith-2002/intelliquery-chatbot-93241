@@ -1,11 +1,14 @@
 # ==============================================================================
-# IMPORTANT: This backend requires the following environment variable to function:
-#   - GEMINI_API_KEY : Your Google Gemini API key
-# Make sure to create a `.env` file or provide GEMINI_API_KEY at deployment.
-# Without this, POST /chat will return a 500 Internal Server Error.
+# IMPORTANT: This backend requires a Google Gemini API key to function.
+# Supported environment variable names (checked in this order):
+#   - GEMINI_API_KEY
+#   - REACT_APP_GEMINI_API_KEY
+#   - GOOGLE_API_KEY
+#   - GOOGLE_GEMINI_API_KEY
+# Make sure to create a `.env` file or provide one of the above at deployment.
+# Without this, Gemini responses will be unavailable and fallback messaging will appear.
 # ==============================================================================
 
-import os
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
@@ -24,6 +27,8 @@ from .auth_utils import (
 )
 # Import the chat title router
 from .chat_title import router as chat_title_router
+# Config utilities
+from .config_utils import get_gemini_api_key
 
 # Load environment variables
 load_dotenv()
@@ -244,7 +249,7 @@ def get_gemini_response(
         f"Please answer the user's latest question. Be concise and clear."
     )
 
-    gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+    gemini_api_key = get_gemini_api_key()
     if not gemini_api_key:
         raise HTTPException(status_code=500, detail="Gemini API key is not set in environment variables.")
     try:
