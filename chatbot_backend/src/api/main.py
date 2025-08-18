@@ -9,8 +9,9 @@
 # Without this, Gemini responses will be unavailable and fallback messaging will appear.
 # ==============================================================================
 
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Dict, Any
 import google.generativeai as genai
@@ -548,6 +549,7 @@ def chat_wsinfo():
         "Accepts one or more files via multipart/form-data and extracts readable text from supported types "
         "(.docx, .xlsx, .pdf, .txt). The extracted content is stored per session and used as additional context "
         "when answering subsequent chat queries. Builds a vector index (Gemini embeddings) for semantic retrieval. "
+        "To improve reliability and avoid timeouts on large files, heavy indexing is performed in the background. "
         "Returns an acknowledgment with per-file processing results and a preview."
     ),
     responses={
@@ -555,23 +557,24 @@ def chat_wsinfo():
         415: {"description": "Unsupported media type"},
     },
 )
-def upload_chat_context(
+async def upload_chat_context(
     session_id: str = Form(..., description="Session ID to associate uploaded context with"),
     files: List[UploadFile] = File(..., description="One or more files (.docx, .xlsx, .pdf, .txt)"),
+    background_tasks: BackgroundTasks = None,
 ):
     """
     PUBLIC_INTERFACE
     Upload and process files to add user-provided context for a given chat session.
 
     Process:
-        - Extract readable text.
-        - Split into overlapping chunks.
-        - Embed each chunk using Gemini embeddings (if API key available).
-        - Store chunks and embeddings in a per-session in-memory index for retrieval.
+        - Extract readable text (offloaded to a threadpool to avoid blocking the event loop).
+        - Store a combined text preview.
+        - Build a semantic index (chunk + embed + store) in a background task to avoid request timeouts.
 
     Args:
         session_id (str): The chat session ID.
         files (List[UploadFile]): Uploaded files (multipart/form-data).
+        background_tasks (BackgroundTasks): FastAPI background task handler used to run indexing.
 
     Returns:
         UploadContextResponse: Processing results and acknowledgment.
@@ -587,11 +590,19 @@ def upload_chat_context(
     combined_text_parts: List[str] = []
     total_chars = 0
 
+    # Helper to index text after response is returned
+    def _background_indexer(sid: str, fname: str, txt: str):
+        try:
+            _index_text_for_session(sid, fname, txt)
+        except Exception:
+            # Swallow exceptions to prevent background task from crashing the server
+            pass
+
     for f in files:
         filename = f.filename or "unnamed"
-        # Read file bytes
+        # Read file bytes asynchronously
         try:
-            data = f.file.read()
+            data = await f.read()
         except Exception as e:
             results.append(
                 UploadedFileResult(
@@ -601,8 +612,12 @@ def upload_chat_context(
             continue
 
         size = len(data or b"")
-        # Extract
-        text, err = extract_text_from_bytes(filename, data or b"")
+        # Extract in a worker thread (openpyxl/pdfminer/docx are CPU/IO heavy)
+        try:
+            text, err = await run_in_threadpool(extract_text_from_bytes, filename, data or b"")
+        except Exception as e:
+            text, err = "", f"Extraction failed: {e}"
+
         preview = summarize_text_preview(text, max_chars=500) if text else ""
         chars = len(text)
 
@@ -610,13 +625,9 @@ def upload_chat_context(
         if text and not err:
             combined_text_parts.append(f"[{filename}]\n{text}\n")
             total_chars += chars
-
-            # Build semantic index: chunk + embed + store
-            try:
-                _index_text_for_session(session_id, filename, text)
-            except Exception:
-                # Do not fail upload on indexing failure; retrieval will fall back gracefully.
-                pass
+            # Offload indexing and embeddings to a background task to avoid request timeouts
+            if background_tasks is not None:
+                background_tasks.add_task(_background_indexer, session_id, filename, text)
 
         results.append(
             UploadedFileResult(
@@ -643,7 +654,7 @@ def upload_chat_context(
         }
 
     message = (
-        "Processed files successfully. Session context updated and indexed."
+        "Processed files successfully. Session context updated. Background indexing in progress."
         if total_chars > 0
         else "Processed files, but no readable content was extracted."
     )

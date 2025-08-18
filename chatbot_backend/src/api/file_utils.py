@@ -1,4 +1,5 @@
 import io
+import os
 from typing import List, Tuple, Optional
 
 # Libraries for file parsing
@@ -81,23 +82,65 @@ def _extract_docx(content: bytes) -> str:
 
 
 def _extract_xlsx(content: bytes) -> str:
-    """Extract text from XLSX using openpyxl (sheet by sheet, TSV rows)."""
+    """Extract text from XLSX using openpyxl (sheet by sheet, TSV rows).
+
+    Performance safeguards:
+    - Uses read_only=True to stream rows.
+    - Respects environment-configurable limits to prevent timeouts on very large files:
+        FILE_EXTRACT_MAX_XLSX_CELLS (int): total maximum cells to process across the workbook (default: 200000)
+        FILE_EXTRACT_MAX_XLSX_ROWS_PER_SHEET (int): per-sheet row cap (default: 20000)
+    When limits are hit, extraction stops gracefully for speed and reliability.
+    """
+    # Read limits from environment with sensible defaults
+    try:
+        max_cells_total = int(os.getenv("FILE_EXTRACT_MAX_XLSX_CELLS", "200000"))
+    except Exception:
+        max_cells_total = 200000
+    try:
+        max_rows_per_sheet = int(os.getenv("FILE_EXTRACT_MAX_XLSX_ROWS_PER_SHEET", "20000"))
+    except Exception:
+        max_rows_per_sheet = 20000
+
     bio = io.BytesIO(content)
     wb = load_workbook(bio, data_only=True, read_only=True)
     parts: List[str] = []
+    processed_cells = 0
+
     for ws in wb.worksheets:
         parts.append(f"[Sheet: {ws.title}]")
+        row_count = 0
         for row in ws.iter_rows(values_only=True):
+            row_count += 1
+            if row_count > max_rows_per_sheet:
+                parts.append("[...]")
+                break
+
             vals = []
             for cell in row:
+                processed_cells += 1
+                if processed_cells > max_cells_total:
+                    # Stop processing further to avoid excessive CPU time
+                    vals.append("...")
+                    parts.append("\t".join(vals))
+                    parts.append("[...]")
+                    break
                 if cell is None:
                     vals.append("")
                 else:
                     vals.append(str(cell))
+
+            # If we exceeded the global cap during cell iteration, stop entire workbook processing
+            if processed_cells > max_cells_total:
+                break
+
             # Skip completely empty rows
-            if any(v.strip() for v in vals):
+            if any((v.strip() if isinstance(v, str) else str(v).strip()) for v in vals):
                 parts.append("\t".join(vals))
+
         parts.append("")  # blank line between sheets
+        if processed_cells > max_cells_total:
+            break
+
     return "\n".join(parts).strip()
 
 
