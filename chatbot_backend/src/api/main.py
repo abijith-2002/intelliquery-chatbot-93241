@@ -506,13 +506,11 @@ def get_gemini_response(
     # Important: instruct Gemini to parse JSON arrays of objects (from Excel) precisely for data-based questions.
     guidance = (
         "If the provided context contains a JSON array of objects representing spreadsheet rows, treat each object as a "
-        "row and each key as a column name. Prefer this JSON array over any TSV or human-readable summaries when answering. "
-        "When the context includes 'Columns', 'Unique values by column', 'JSON sample', or 'TSV preview' sections from a "
-        "spreadsheet, interpret them as tabular data, but prioritize the JSON if both are present. For listing-type questions "
-        "(e.g., 'what are the customer names?' or 'list all model names'), derive the unique values directly from the JSON "
-        "array (or from the 'Unique values' section if JSON is unavailable). Use exact cell values, avoid fabricating values, "
-        "and present results clearly as a list or concise sentence. For calculation/lookup questions, compute answers from "
-        "the JSON data precisely. Do not add disclaimers."
+        "row and each key as a column name. Use ONLY this JSON array for answering questions derived from spreadsheets; "
+        "ignore any TSV or human-readable summaries if present. For listing-type questions (e.g., 'what are the customer "
+        "names?' or 'list all model names'), derive the unique values directly from the JSON array. Use exact cell values, "
+        "avoid fabricating values, and present results clearly. For calculation/lookup questions, compute answers precisely "
+        "from the JSON data. Do not add disclaimers."
     )
     prompt = (
         f"You are an expert software assistant.\n"
@@ -585,12 +583,10 @@ def chat(request: ChatRequest):
                 return fallback
             return str(val)
 
-        # Retrieve top-k relevant chunks from vector index
-        top_chunks = _vector_search(session_id, request.query, top_k=3)
-        retrieved_context = "\n---\n".join(top_chunks).strip()
-
-        # Prefer JSON rows derived from Excel as primary context if available.
+        # Build context for Gemini:
+        # If Excel JSON rows exist for this session, use ONLY the JSON array as context.
         MAX_CONTEXT_CHARS = 12000
+
         def _rows_to_json_str(rows: List[Dict[str, Any]], max_chars: int = MAX_CONTEXT_CHARS) -> str:
             if not rows:
                 return ""
@@ -608,42 +604,18 @@ def chat(request: ChatRequest):
 
         session_ctx = CONTEXT_STORE.get(session_id, {})
         json_rows: List[Dict[str, Any]] = session_ctx.get("xlsx_json_rows", []) or []
-        json_rows_context = _rows_to_json_str(json_rows, max_chars=MAX_CONTEXT_CHARS) if json_rows else ""
+        used_table_snippets = False  # retained for debug metadata compatibility
 
-        # If JSON rows exist, make them the primary context and supplement with retrieved chunks.
-        if json_rows_context:
-            if retrieved_context:
-                retrieved_context = f"{json_rows_context}\n\n---\n{retrieved_context}"
-            else:
-                retrieved_context = json_rows_context
-
-        # Fallback and forcing strategy for spreadsheet context:
-        # If we didn't have JSON rows and retrieval is weak OR query is schema/listing,
-        # extract table-focused snippets (Columns/Unique/JSON/TSV) from the combined textual context.
-        combined = session_ctx.get("combined", "")
-        should_force_table = _is_schema_or_list_query(request.query) and not json_rows_context
-        used_table_snippets = False
-
-        # Determine if vector search seems weak (short or lacks key table markers)
-        retrieval_is_weak = (
-            not retrieved_context
-            or len(retrieved_context) < 200
-            or ("Columns (" not in retrieved_context and "TSV preview" not in retrieved_context and "Unique values by column" not in retrieved_context)
-        )
-
-        if (should_force_table or retrieval_is_weak) and not json_rows_context:
-            table_snips = _extract_table_snippets_from_combined(combined)
-            if table_snips:
-                if retrieved_context:
-                    # Prepend table snippets to ensure schema is visible
-                    retrieved_context = f"{table_snips}\n\n{retrieved_context}"
-                else:
-                    retrieved_context = table_snips
-                used_table_snippets = True
-            elif combined:
-                # ultimate fallback: include a truncated combined context
+        if json_rows:
+            retrieved_context = _rows_to_json_str(json_rows, max_chars=MAX_CONTEXT_CHARS)
+        else:
+            # No Excel rows present: fall back to vector search over any uploaded text
+            top_chunks = _vector_search(session_id, request.query, top_k=3)
+            retrieved_context = "\n---\n".join(top_chunks).strip()
+            # If retrieval is extremely weak and we have combined text, include a small portion as last resort
+            combined = session_ctx.get("combined", "")
+            if (not retrieved_context or len(retrieved_context) < 100) and combined:
                 retrieved_context = combined[:MAX_CONTEXT_CHARS]
-                used_table_snippets = True
 
         # Debug/logging: store what reached Gemini for traceability
         try:

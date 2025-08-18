@@ -23,8 +23,7 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
         - .txt  : UTF-8 decode with errors ignored
         - .pdf  : pdfminer.six text extraction
         - .docx : python-docx extraction (paragraphs and table cells)
-        - .xlsx : openpyxl extraction (sheet-by-sheet parsing, table detection with headers,
-                  JSON sample, TSV preview, and per-column unique values for robust, structured context)
+        - .xlsx : openpyxl parsing into a JSON array of row objects (keys are column headers). The returned text for .xlsx is the JSON array string.
         - .json : JSON parsing with structure discovery, array-of-objects tabular summary,
                   unique values per key, JSON sample, and TSV preview
 
@@ -171,188 +170,25 @@ def _safe_int_env(name: str, default: int) -> int:
 
 def _extract_xlsx(content: bytes) -> str:
     """
-    Extract text from XLSX using openpyxl with robust, structured context.
+    Extract XLSX content as a JSON array of row objects.
 
-    Enhancements vs. basic TSV:
-    - Detect header row and map subsequent rows to column names.
-    - Produce a JSON sample (first N rows per sheet) with clean types.
-    - Include a TSV preview for readability.
-    - Include per-column Unique values (first M values) to support listing queries.
-    - Annotate with sheet name, columns, and approximate row counts.
+    This implementation converts every data row into a dict keyed by column headers
+    and returns a single JSON array string. Headers are detected heuristically and
+    sanitized for uniqueness. Sheet name is included per row via the "sheet" key.
 
-    Performance safeguards:
-    - Uses read_only=True and data_only=True to stream rows.
-    - Respects environment-configurable limits to prevent timeouts on very large files:
-        FILE_EXTRACT_MAX_XLSX_CELLS (int): total maximum cells to process across the workbook (default: 200000)
-        FILE_EXTRACT_MAX_XLSX_ROWS_PER_SHEET (int): per-sheet row cap (default: 20000)
-        FILE_EXTRACT_XLSX_JSON_SAMPLE_ROWS (int): number of records to include in JSON sample per sheet (default: 50)
-        FILE_EXTRACT_XLSX_TSV_PREVIEW_ROWS (int): number of TSV rows to preview per sheet (default: 20)
-        FILE_EXTRACT_XLSX_UNIQUE_LIMIT (int): number of distinct values to collect per column (default: 50)
-    When limits are hit, extraction stops gracefully for speed and reliability.
+    Limits and safeguards are controlled by:
+      - FILE_EXTRACT_MAX_XLSX_CELLS
+      - FILE_EXTRACT_MAX_XLSX_ROWS_PER_SHEET
+      - FILE_EXTRACT_XLSX_JSON_ROWS_MAX
+
+    On failure, an exception is raised so the caller can surface the error.
     """
-    # Read limits from environment with sensible defaults
-    max_cells_total = _safe_int_env("FILE_EXTRACT_MAX_XLSX_CELLS", 200000)
-    max_rows_per_sheet = _safe_int_env("FILE_EXTRACT_MAX_XLSX_ROWS_PER_SHEET", 20000)
-    json_sample_rows = _safe_int_env("FILE_EXTRACT_XLSX_JSON_SAMPLE_ROWS", 50)
-    tsv_preview_rows = _safe_int_env("FILE_EXTRACT_XLSX_TSV_PREVIEW_ROWS", 20)
-    unique_limit = _safe_int_env("FILE_EXTRACT_XLSX_UNIQUE_LIMIT", 50)
-
-    bio = io.BytesIO(content)
-    wb = load_workbook(bio, data_only=True, read_only=True)
-    parts: List[str] = []
-    processed_cells = 0
-
-    for ws in wb.worksheets:
-        try:
-            parts.append(f"[Sheet: {ws.title}]")
-            header_found = False
-            headers: List[str] = []
-            row_index = 0
-            # To process potential header + preceding buffer elegantly
-            buffered_rows: List[List[Any]] = []
-            sample_records: List[Dict[str, Any]] = []
-            tsv_lines: List[str] = []
-            parsed_data_rows = 0
-            truncated_notice_added = False
-
-            # Track unique values per column (strings for consistency)
-            uniques: Dict[str, set] = {}
-
-            for row in ws.iter_rows(values_only=True):
-                row_index += 1
-                if row_index > max_rows_per_sheet:
-                    parts.append("[...] (Row limit reached for this sheet)")
-                    break
-
-                # Convert the row to a standard list
-                row_vals = list(row) if row is not None else []
-                # Update global cell counter
-                processed_cells += len(row_vals)
-                if processed_cells > max_cells_total and not truncated_notice_added:
-                    parts.append("[...] (Global cell limit reached; workbook parsing truncated)")
-                    truncated_notice_added = True
-                    # Exit entire workbook parsing
-                    break
-
-                # Buffer rows until header is found
-                buffered_rows.append(row_vals)
-
-                if not header_found:
-                    if _is_potential_header(row_vals):
-                        # Treat current buffered row as header
-                        headers = _sanitize_headers(row_vals)
-                        header_found = True
-
-                        # Initialize uniques dictionary for columns
-                        uniques = {h: set() for h in headers}
-
-                        # TSV header line for preview
-                        tsv_lines.append("\t".join(headers))
-
-                        # Process buffered rows after header row as data
-                        start_index = buffered_rows.index(row_vals) + 1
-                        for data_row in buffered_rows[start_index:]:
-                            # Skip entirely empty rows
-                            if not any(v is not None and str(v).strip() != "" for v in data_row):
-                                continue
-                            record = _row_to_record(headers, data_row)
-                            parsed_data_rows += 1
-
-                            # Update uniques
-                            _update_uniques(uniques, headers, record, unique_limit)
-
-                            # JSON sample
-                            if len(sample_records) < json_sample_rows:
-                                sample_records.append(record)
-                            # TSV preview
-                            if len(tsv_lines) < tsv_preview_rows + 1:  # +1 for header
-                                tsv_lines.append(_record_to_tsv(headers, record))
-
-                        # clear buffer to conserve memory
-                        buffered_rows = []
-                    else:
-                        # Continue scanning for header
-                        continue
-                else:
-                    # Header already found; process current row as data
-                    if not any(v is not None and str(v).strip() != "" for v in row_vals):
-                        continue
-                    record = _row_to_record(headers, row_vals)
-                    parsed_data_rows += 1
-
-                    # Update uniques
-                    _update_uniques(uniques, headers, record, unique_limit)
-
-                    if len(sample_records) < json_sample_rows:
-                        sample_records.append(record)
-                    if len(tsv_lines) < tsv_preview_rows + 1:  # +1 for header
-                        tsv_lines.append(_record_to_tsv(headers, record))
-
-                if processed_cells > max_cells_total:
-                    # Global cap reached; stop processing this sheet
-                    break
-
-            # If we never found a header but we have some non-empty row, fallback: use first non-empty row as header
-            if not header_found:
-                # Find first non-empty buffered row
-                first_non_empty_idx = None
-                for i, r in enumerate(buffered_rows):
-                    if any(v is not None and str(v).strip() != "" for v in r):
-                        first_non_empty_idx = i
-                        break
-                if first_non_empty_idx is not None:
-                    raw_headers = buffered_rows[first_non_empty_idx]
-                    headers = _sanitize_headers(raw_headers)
-                    header_found = True
-                    tsv_lines.append("\t".join(headers))
-                    # Initialize uniques dictionary for columns
-                    uniques = {h: set() for h in headers}
-                    # Process remaining as data
-                    for data_row in buffered_rows[first_non_empty_idx + 1:]:
-                        if not any(v is not None and str(v).strip() != "" for v in data_row):
-                            continue
-                        record = _row_to_record(headers, data_row)
-                        parsed_data_rows += 1
-                        _update_uniques(uniques, headers, record, unique_limit)
-                        if len(sample_records) < json_sample_rows:
-                            sample_records.append(record)
-                        if len(tsv_lines) < tsv_preview_rows + 1:
-                            tsv_lines.append(_record_to_tsv(headers, record))
-
-            # Build sheet summary
-            if header_found:
-                parts.append(f"Columns ({len(headers)}): {json.dumps(headers, ensure_ascii=False)}")
-                parts.append(f"Parsed data rows (approx): {parsed_data_rows}")
-                # Unique values by column
-                unique_map = {
-                    col: sorted([v for v in vals if isinstance(v, str) and v.strip() != ""])[: unique_limit]
-                    for col, vals in uniques.items()
-                    if any((isinstance(v, str) and v.strip() != "") for v in vals)
-                } if uniques else {}
-                if unique_map:
-                    parts.append(f"Unique values by column (first {unique_limit}):")
-                    parts.append(json.dumps(unique_map, ensure_ascii=False, indent=2))
-                # JSON sample
-                parts.append("JSON sample (first rows):")
-                parts.append(json.dumps(sample_records, ensure_ascii=False, indent=2))
-                # TSV preview
-                parts.append("TSV preview:")
-                parts.append("\n".join(tsv_lines))
-            else:
-                parts.append("No tabular data detected (sheet appears empty or formatting not recognized).")
-
-            parts.append("")  # blank line between sheets
-
-            if processed_cells > max_cells_total:
-                break
-
-        except Exception as sheet_error:
-            # Do not fail the entire extraction if one sheet has issues
-            parts.append(f"[Sheet: {ws.title}]")
-            parts.append(f"Error parsing sheet: {sheet_error}")
-            parts.append("")
-
-    return "\n".join(parts).strip()
+    # Reuse the dedicated row-wise JSON converter
+    rows, err = extract_xlsx_as_rowwise_json("uploaded.xlsx", content, include_sheet_name=True)
+    if err:
+        raise Exception(err)
+    # Serialize to JSON string; the row-wise converter already enforces safe caps
+    return json.dumps(rows, ensure_ascii=False)
 
 
 def _safe_str_len(s: str, max_len: int) -> str:
