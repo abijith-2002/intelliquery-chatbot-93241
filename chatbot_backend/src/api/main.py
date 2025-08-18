@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Dict, Any
+import json
 import google.generativeai as genai
 
 from dotenv import load_dotenv
@@ -38,8 +39,20 @@ load_dotenv()
 # Memory store for chat contexts (keyed by session_id).
 CONVERSATION_MEMORY: Dict[str, ConversationBufferMemory] = {}
 
-# Per-session uploaded context store (legacy tracking for previews).
-# Structure: { session_id: { "files": [ {filename, size, chars, preview, error?} ], "combined": str } }
+# Per-session uploaded context store.
+# Structure:
+# {
+#   session_id: {
+#       "files": [ {filename, size, chars, preview, error?} ],
+#       "combined": str,                          # legacy textual context
+#       "xlsx_json_rows": [ {row}, {row}, ... ],  # primary JSON rows derived from Excel
+#       "last_query": str,
+#       "last_top_chunks_count": int,
+#       "last_used_table_snippets": bool,
+#       "last_context_chars": int,
+#       "last_retrieved_context": str,
+#   }
+# }
 CONTEXT_STORE: Dict[str, Dict[str, Any]] = {}
 
 # Per-session in-memory vector index for RAG.
@@ -167,7 +180,6 @@ def _clean_gemini_output(text: str) -> str:
 
 
 # --- CONTEXT + RAG UTILITIES ---
-
 def _tokenize(s: str) -> List[str]:
     import re
     return [t for t in re.findall(r"[A-Za-z0-9]+", (s or "").lower()) if t]
@@ -491,15 +503,16 @@ def get_gemini_response(
         trimmed_extra = trimmed_extra[: MAX_CONTEXT_CHARS]
 
     # Compose prompt with uploaded/retrieved context primarily.
-    # Important: instruct Gemini to parse TSV/JSON table previews precisely to answer data-based questions.
+    # Important: instruct Gemini to parse JSON arrays of objects (from Excel) precisely for data-based questions.
     guidance = (
-        "If the provided context contains 'Columns', 'Unique values by column', 'JSON sample', or 'TSV preview' "
-        "sections from a spreadsheet, interpret them as tabular data with the given 'Columns'. For listing-type "
-        "questions (e.g., 'what are the customer names?' or 'list all model names'), use the 'Unique values by column' "
-        "section directly if available. If it is not available for the requested column, derive the unique values "
-        "from the TSV/JSON sample provided. Use exact cell values, avoid fabricating values, and present the result "
-        "clearly as a list or concise sentence. For calculation/lookup questions, use the TSV/JSON data to compute the "
-        "answer precisely. Do not add disclaimers."
+        "If the provided context contains a JSON array of objects representing spreadsheet rows, treat each object as a "
+        "row and each key as a column name. Prefer this JSON array over any TSV or human-readable summaries when answering. "
+        "When the context includes 'Columns', 'Unique values by column', 'JSON sample', or 'TSV preview' sections from a "
+        "spreadsheet, interpret them as tabular data, but prioritize the JSON if both are present. For listing-type questions "
+        "(e.g., 'what are the customer names?' or 'list all model names'), derive the unique values directly from the JSON "
+        "array (or from the 'Unique values' section if JSON is unavailable). Use exact cell values, avoid fabricating values, "
+        "and present results clearly as a list or concise sentence. For calculation/lookup questions, compute answers from "
+        "the JSON data precisely. Do not add disclaimers."
     )
     prompt = (
         f"You are an expert software assistant.\n"
@@ -572,17 +585,43 @@ def chat(request: ChatRequest):
                 return fallback
             return str(val)
 
-        # Do not pre-save placeholder; save only final answer to memory after generation
-
         # Retrieve top-k relevant chunks from vector index
         top_chunks = _vector_search(session_id, request.query, top_k=3)
         retrieved_context = "\n---\n".join(top_chunks).strip()
 
+        # Prefer JSON rows derived from Excel as primary context if available.
+        MAX_CONTEXT_CHARS = 12000
+        def _rows_to_json_str(rows: List[Dict[str, Any]], max_chars: int = MAX_CONTEXT_CHARS) -> str:
+            if not rows:
+                return ""
+            # Pack as many rows as fit into max_chars while preserving valid JSON array syntax.
+            out_parts: List[str] = []
+            current = 2  # for [ ]
+            for r in rows:
+                s = json.dumps(r, ensure_ascii=False)
+                sep = ", " if out_parts else ""
+                if current + len(sep) + len(s) > max_chars:
+                    break
+                out_parts.append(s)
+                current += len(sep) + len(s)
+            return "[" + ", ".join(out_parts) + "]"
+
+        session_ctx = CONTEXT_STORE.get(session_id, {})
+        json_rows: List[Dict[str, Any]] = session_ctx.get("xlsx_json_rows", []) or []
+        json_rows_context = _rows_to_json_str(json_rows, max_chars=MAX_CONTEXT_CHARS) if json_rows else ""
+
+        # If JSON rows exist, make them the primary context and supplement with retrieved chunks.
+        if json_rows_context:
+            if retrieved_context:
+                retrieved_context = f"{json_rows_context}\n\n---\n{retrieved_context}"
+            else:
+                retrieved_context = json_rows_context
+
         # Fallback and forcing strategy for spreadsheet context:
-        # - If retrieval is empty/weak, extract table-focused snippets (Columns/Unique values/JSON/TSV)
-        # - If the query asks for schema/columns/unique values, force-include table snippets
-        combined = CONTEXT_STORE.get(session_id, {}).get("combined", "")
-        should_force_table = _is_schema_or_list_query(request.query)
+        # If we didn't have JSON rows and retrieval is weak OR query is schema/listing,
+        # extract table-focused snippets (Columns/Unique/JSON/TSV) from the combined textual context.
+        combined = session_ctx.get("combined", "")
+        should_force_table = _is_schema_or_list_query(request.query) and not json_rows_context
         used_table_snippets = False
 
         # Determine if vector search seems weak (short or lacks key table markers)
@@ -592,7 +631,7 @@ def chat(request: ChatRequest):
             or ("Columns (" not in retrieved_context and "TSV preview" not in retrieved_context and "Unique values by column" not in retrieved_context)
         )
 
-        if should_force_table or retrieval_is_weak:
+        if (should_force_table or retrieval_is_weak) and not json_rows_context:
             table_snips = _extract_table_snippets_from_combined(combined)
             if table_snips:
                 if retrieved_context:
@@ -603,7 +642,7 @@ def chat(request: ChatRequest):
                 used_table_snippets = True
             elif combined:
                 # ultimate fallback: include a truncated combined context
-                retrieved_context = combined[:12000]
+                retrieved_context = combined[:MAX_CONTEXT_CHARS]
                 used_table_snippets = True
 
         # Debug/logging: store what reached Gemini for traceability
@@ -758,6 +797,7 @@ async def upload_chat_context(
         - Extract readable text (offloaded to a threadpool to avoid blocking the event loop).
         - Store a combined text preview.
         - Build a semantic index (chunk + embed + store) in a background task to avoid request timeouts.
+        - For Excel files, also extract a row-wise JSON array and store it as the primary structured context for queries.
 
     Args:
         session_id (str): The chat session ID.
@@ -767,7 +807,7 @@ async def upload_chat_context(
     Returns:
         UploadContextResponse: Processing results and acknowledgment.
     """
-    from .file_utils import extract_text_from_bytes, summarize_text_preview
+    from .file_utils import extract_text_from_bytes, summarize_text_preview, extract_xlsx_as_rowwise_json
 
     if not session_id or not isinstance(session_id, str):
         raise HTTPException(status_code=400, detail="session_id must be provided as a non-empty string.")
@@ -777,6 +817,7 @@ async def upload_chat_context(
     results: List[UploadedFileResult] = []
     combined_text_parts: List[str] = []
     total_chars = 0
+    excel_rows_accumulator: List[Dict[str, Any]] = []
 
     # Helper to index text after response is returned
     def _background_indexer(sid: str, fname: str, txt: str):
@@ -809,6 +850,21 @@ async def upload_chat_context(
         preview = summarize_text_preview(text, max_chars=500) if text else ""
         chars = len(text)
 
+        # For Excel files, also extract JSON rows as primary structured context
+        xlsx_rows: List[Dict[str, Any]] = []
+        if (filename or "").lower().endswith(".xlsx"):
+            try:
+                xlsx_rows, rows_err = await run_in_threadpool(extract_xlsx_as_rowwise_json, filename, data or b"", True)
+                if rows_err:
+                    # Do not fail processing; just log in preview/error if needed
+                    preview = (preview + f" [XLSX rows warn: {rows_err}]").strip()
+                else:
+                    # Accumulate for the session
+                    excel_rows_accumulator.extend(xlsx_rows)
+            except Exception as e:
+                # Non-fatal: keep text extraction result
+                preview = (preview + f" [XLSX rows extraction error: {e}]").strip()
+
         # Append to combined only if successful and non-empty
         if text and not err:
             combined_text_parts.append(f"[{filename}]\n{text}\n")
@@ -827,23 +883,31 @@ async def upload_chat_context(
             )
         )
 
-    # If at least one file produced content, update the legacy session context store (for optional previews)
+    # Update the session context store with both combined textual context and structured JSON rows.
+    prev_ctx = CONTEXT_STORE.get(session_id, {})
+    prev_combined = prev_ctx.get("combined", "")
+    prev_files = prev_ctx.get("files", [])
+    prev_rows: List[Dict[str, Any]] = prev_ctx.get("xlsx_json_rows", []) or []
+
+    # Merge textual combined content if we have any extracted text
     if total_chars > 0:
         combined_text = "\n".join(combined_text_parts).strip()
-        prev_ctx = CONTEXT_STORE.get(session_id, {})
-        prev_combined = prev_ctx.get("combined", "")
-        prev_files = prev_ctx.get("files", [])
-
-        # Merge with previous context if any
         merged_combined = (prev_combined + "\n\n" + combined_text).strip() if prev_combined else combined_text
-        CONTEXT_STORE[session_id] = {
-            "files": prev_files + [r.model_dump() for r in results],
-            "combined": merged_combined,
-        }
+    else:
+        merged_combined = prev_combined
+
+    # Merge Excel JSON rows regardless of text extraction result (JSON may be primary)
+    merged_rows = prev_rows + excel_rows_accumulator if excel_rows_accumulator else prev_rows
+
+    CONTEXT_STORE[session_id] = {
+        "files": prev_files + [r.model_dump() for r in results],
+        "combined": merged_combined,
+        "xlsx_json_rows": merged_rows,
+    }
 
     message = (
         "Processed files successfully. Session context updated. Background indexing in progress."
-        if total_chars > 0
+        if total_chars > 0 or excel_rows_accumulator
         else "Processed files, but no readable content was extracted."
     )
 

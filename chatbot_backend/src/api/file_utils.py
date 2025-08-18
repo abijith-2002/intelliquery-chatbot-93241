@@ -250,7 +250,8 @@ def _extract_xlsx(content: bytes) -> str:
                         tsv_lines.append("\t".join(headers))
 
                         # Process buffered rows after header row as data
-                        for data_row in buffered_rows[buffered_rows.index(row_vals) + 1 :]:
+                        start_index = buffered_rows.index(row_vals) + 1
+                        for data_row in buffered_rows[start_index:]:
                             # Skip entirely empty rows
                             if not any(v is not None and str(v).strip() != "" for v in data_row):
                                 continue
@@ -307,7 +308,7 @@ def _extract_xlsx(content: bytes) -> str:
                     # Initialize uniques dictionary for columns
                     uniques = {h: set() for h in headers}
                     # Process remaining as data
-                    for data_row in buffered_rows[first_non_empty_idx + 1 :]:
+                    for data_row in buffered_rows[first_non_empty_idx + 1:]:
                         if not any(v is not None and str(v).strip() != "" for v in data_row):
                             continue
                         record = _row_to_record(headers, data_row)
@@ -324,7 +325,7 @@ def _extract_xlsx(content: bytes) -> str:
                 parts.append(f"Parsed data rows (approx): {parsed_data_rows}")
                 # Unique values by column
                 unique_map = {
-                    col: sorted([v for v in vals if isinstance(v, str) and v.strip() != ""])[ : unique_limit]
+                    col: sorted([v for v in vals if isinstance(v, str) and v.strip() != ""])[: unique_limit]
                     for col, vals in uniques.items()
                     if any((isinstance(v, str) and v.strip() != "") for v in vals)
                 } if uniques else {}
@@ -589,7 +590,6 @@ def _extract_json(content: bytes) -> str:
     # Fallback for unusual JSON types (e.g., str/number at root)
     return f"[JSON Scalar] {type(data).__name__}: {_safe_str_len(str(data), 1000)}"
     
-
 def _row_to_record(headers: List[str], row_vals: List[Any]) -> Dict[str, Any]:
     """
     Map a row list to a dict using the provided headers. Pads/truncates safely.
@@ -669,3 +669,127 @@ def summarize_text_preview(text: str, max_chars: int = 500) -> str:
     if len(collapsed) <= max_chars:
         return collapsed
     return collapsed[: max_chars - 3] + "..."
+
+
+# PUBLIC_INTERFACE
+def extract_xlsx_as_rowwise_json(
+    filename: str,
+    content: bytes,
+    include_sheet_name: bool = True,
+    row_limit_env: str = "FILE_EXTRACT_XLSX_JSON_ROWS_MAX",
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """
+    PUBLIC_INTERFACE
+    Parse an Excel (.xlsx) workbook and convert it into a JSON array where each object corresponds
+    to a row in the spreadsheet, using the detected column headers as keys.
+
+    Notes:
+    - This function processes all worksheets.
+    - The header row is detected heuristically (first row with at least 2 non-empty cells and not mostly numeric).
+    - Header names are sanitized to be non-empty and unique.
+    - If include_sheet_name is True, a 'sheet' key is added to each row object with the worksheet title.
+    - Empty rows are skipped.
+    - Performance safeguards via environment variables:
+        * FILE_EXTRACT_MAX_XLSX_CELLS: Max total cells processed across workbook (default: 200000)
+        * FILE_EXTRACT_MAX_XLSX_ROWS_PER_SHEET: Max rows per sheet (default: 20000)
+        * FILE_EXTRACT_XLSX_JSON_ROWS_MAX (row_limit_env): Max total row objects returned across workbook (default: 15000)
+
+    Args:
+        filename (str): The original filename (unused except for context; kept for parity).
+        content (bytes): Raw XLSX file bytes.
+        include_sheet_name (bool): Whether to add a 'sheet' field per row object.
+        row_limit_env (str): Environment variable name that controls the total row cap.
+
+    Returns:
+        Tuple[List[Dict[str, Any]], Optional[str]]:
+            - rows (List[Dict[str, Any]]): The row-wise JSON array (may be truncated to limit).
+            - error (Optional[str]): Error message if parsing failed, otherwise None.
+    """
+    try:
+        max_cells_total = _safe_int_env("FILE_EXTRACT_MAX_XLSX_CELLS", 200000)
+        max_rows_per_sheet = _safe_int_env("FILE_EXTRACT_MAX_XLSX_ROWS_PER_SHEET", 20000)
+        max_total_rows = _safe_int_env(row_limit_env, 15000)
+
+        bio = io.BytesIO(content)
+        wb = load_workbook(bio, data_only=True, read_only=True)
+
+        rows: List[Dict[str, Any]] = []
+        processed_cells = 0
+        total_rows_accumulated = 0
+
+        for ws in wb.worksheets:
+            header_found = False
+            headers: List[str] = []
+            row_index = 0
+            buffered_rows: List[List[Any]] = []
+
+            for row in ws.iter_rows(values_only=True):
+                row_index += 1
+                if row_index > max_rows_per_sheet or total_rows_accumulated >= max_total_rows:
+                    break
+
+                row_vals = list(row) if row is not None else []
+                processed_cells += len(row_vals)
+                if processed_cells > max_cells_total:
+                    break
+
+                buffered_rows.append(row_vals)
+
+                if not header_found:
+                    if _is_potential_header(row_vals):
+                        headers = _sanitize_headers(row_vals)
+                        header_found = True
+                        # process buffered data rows after header
+                        start_index = buffered_rows.index(row_vals) + 1
+                        for data_row in buffered_rows[start_index:]:
+                            if total_rows_accumulated >= max_total_rows:
+                                break
+                            if not any(v is not None and str(v).strip() != "" for v in data_row):
+                                continue
+                            record = _row_to_record(headers, data_row)
+                            if include_sheet_name:
+                                record = {"sheet": ws.title, **record}
+                            rows.append(record)
+                            total_rows_accumulated += 1
+                        buffered_rows = []
+                    else:
+                        continue
+                else:
+                    if total_rows_accumulated >= max_total_rows:
+                        break
+                    if not any(v is not None and str(v).strip() != "" for v in row_vals):
+                        continue
+                    record = _row_to_record(headers, row_vals)
+                    if include_sheet_name:
+                        record = {"sheet": ws.title, **record}
+                    rows.append(record)
+                    total_rows_accumulated += 1
+
+            # Fallback: if header never found but non-empty rows exist, take first non-empty as header.
+            if not header_found and total_rows_accumulated < max_total_rows:
+                first_non_empty_idx = None
+                for i, r in enumerate(buffered_rows):
+                    if any(v is not None and str(v).strip() != "" for v in r):
+                        first_non_empty_idx = i
+                        break
+                if first_non_empty_idx is not None:
+                    raw_headers = buffered_rows[first_non_empty_idx]
+                    headers = _sanitize_headers(raw_headers)
+                    header_found = True
+                    for data_row in buffered_rows[first_non_empty_idx + 1:]:
+                        if total_rows_accumulated >= max_total_rows:
+                            break
+                        if not any(v is not None and str(v).strip() != "" for v in data_row):
+                            continue
+                        record = _row_to_record(headers, data_row)
+                        if include_sheet_name:
+                            record = {"sheet": ws.title, **record}
+                        rows.append(record)
+                        total_rows_accumulated += 1
+
+            if processed_cells > max_cells_total or total_rows_accumulated >= max_total_rows:
+                break
+
+        return rows, None
+    except Exception as e:
+        return [], f"Failed to parse XLSX rows for '{filename}': {e}"
