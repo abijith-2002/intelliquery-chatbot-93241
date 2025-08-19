@@ -8,9 +8,10 @@ fastapi==0.115.12
 fastapi-cli==0.0.7
 flake8==7.2.0
 h11==0.14.0
-httpcore==1.0.7
+# httpcore is managed by httpx; avoid pinning here to prevent conflicts
 httptools==0.6.4
-httpx==0.28.1
+# httpx 0.28.x conflicts with supabase 2.6.0 dependency set; 0.27.2 is compatible.
+httpx==0.27.2
 idna==3.10
 iniconfig==2.1.0
 Jinja2==3.1.6
@@ -42,7 +43,9 @@ typing_extensions==4.13.1
 uvicorn==0.34.0
 uvloop==0.21.0
 watchfiles==1.0.5
-websockets==15.0.1
+# websockets 15.x conflicts with supabase/gotrue; use 12.0 which is widely compatible.
+websockets==12.0
+
 # For authentication and ORM
 passlib[bcrypt]==1.7.4
 SQLAlchemy==2.0.29
