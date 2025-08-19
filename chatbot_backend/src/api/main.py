@@ -44,8 +44,8 @@ CONTEXT_STORE: Dict[str, Dict[str, Any]] = {}
 # Per-session in-memory vector index for RAG.
 # Structure:
 #   RAG_INDEX_STORE[session_id] = {
-#       "chunks": [ {"text": str, "filename": str} , ...],
-#       "embeddings": [ [float, ...], ...],
+#       "chunks": [ {"text": str, "filename": str, "metadata": dict} , ...],
+#       "embeddings": [ [float, ...] | None, ...],  # Embedding vectors or None if embedding not available
 #       "embedding_model": str
 #   }
 RAG_INDEX_STORE: Dict[str, Dict[str, Any]] = {}
@@ -279,21 +279,82 @@ def _ensure_session_index(session_id: str):
         }
 
 
+def _detect_file_type(filename: str) -> str:
+    """Detect file type based on extension (lowercased, without dot)."""
+    name = (filename or "").lower()
+    for ext in (".json", ".txt", ".pdf", ".docx", ".xlsx"):
+        if name.endswith(ext):
+            return ext.lstrip(".")
+    # Fallback: last suffix after dot
+    if "." in name:
+        return name.rsplit(".", 1)[-1]
+    return "unknown"
+
+
+def _index_documents_for_session(session_id: str, documents: List[Dict[str, Any]]):
+    """
+    Index a list of documents, each with 'text' and optional 'metadata' dict.
+    Embeds texts when possible and stores alongside metadata for retrieval.
+    """
+    _ensure_session_index(session_id)
+    # Normalize docs
+    docs = []
+    for d in documents:
+        if not d:
+            continue
+        txt = (d.get("text") or "").strip()
+        if not txt:
+            continue
+        meta = d.get("metadata") or {}
+        # Ensure minimal metadata
+        if "source_filename" not in meta and "filename" in d:
+            meta["source_filename"] = d.get("filename")
+        docs.append({"text": txt, "metadata": meta})
+
+    if not docs:
+        return
+
+    texts = [d["text"] for d in docs]
+    vectors = _embed_texts(texts)
+
+    store = RAG_INDEX_STORE[session_id]
+    for d, vec in zip(docs, vectors):
+        source_filename = d["metadata"].get("source_filename", "")
+        store["chunks"].append({
+            "text": d["text"],
+            "filename": source_filename,
+            "metadata": d["metadata"],
+        })
+        store["embeddings"].append(vec)  # Could be None
+
+
 def _index_text_for_session(session_id: str, filename: str, text: str):
     """
     Chunk, embed, and store vectors and their source chunks for a session.
+    Attaches basic metadata per chunk (source filename, file type, chunk indices).
     Falls back to storing chunks without embeddings if embeddings are unavailable.
     """
     _ensure_session_index(session_id)
     chunks = _split_into_chunks(text, chunk_size_words=180, overlap_words=40)
     if not chunks:
         return
-    vectors = _embed_texts(chunks)
 
-    store = RAG_INDEX_STORE[session_id]
-    for chunk, vec in zip(chunks, vectors):
-        store["chunks"].append({"text": chunk, "filename": filename})
-        store["embeddings"].append(vec)  # vec could be None; retrieval handles fallback
+    file_type = _detect_file_type(filename)
+    documents: List[Dict[str, Any]] = []
+    total = len(chunks)
+    for i, chunk in enumerate(chunks):
+        documents.append({
+            "text": chunk,
+            "metadata": {
+                "source_filename": filename,
+                "file_type": file_type,
+                "chunk_index": i,
+                "total_chunks": total,
+                "origin": "file",
+            }
+        })
+
+    _index_documents_for_session(session_id, documents)
 
 
 def _vector_search(session_id: str, query: str, top_k: int = 3) -> List[str]:
@@ -546,7 +607,10 @@ def chat_wsinfo():
     summary="Upload context files for a chat session",
     description=(
         "Accepts one or more files via multipart/form-data and extracts readable text from supported types "
-        "(.docx, .xlsx, .pdf, .txt). The extracted content is stored per session and used as additional context "
+        "(.docx, .xlsx, .pdf, .txt, .json). "
+        "For JSON, the backend parses and flattens into semantically meaningful documents with rich metadata "
+        "and stores them in the RAG index. "
+        "The extracted content is stored per session and used as additional context "
         "when answering subsequent chat queries. Builds a vector index (Gemini embeddings) for semantic retrieval. "
         "Returns an acknowledgment with per-file processing results and a preview."
     ),
@@ -557,16 +621,17 @@ def chat_wsinfo():
 )
 def upload_chat_context(
     session_id: str = Form(..., description="Session ID to associate uploaded context with"),
-    files: List[UploadFile] = File(..., description="One or more files (.docx, .xlsx, .pdf, .txt)"),
+    files: List[UploadFile] = File(..., description="One or more files (.docx, .xlsx, .pdf, .txt, .json)"),
 ):
     """
     PUBLIC_INTERFACE
     Upload and process files to add user-provided context for a given chat session.
 
     Process:
-        - Extract readable text.
-        - Split into overlapping chunks.
-        - Embed each chunk using Gemini embeddings (if API key available).
+        - For .json: parse JSON (object/array/NDJSON) into semantic documents with metadata (json_path, record_id, etc.).
+          Index each document text with its metadata preserved.
+        - For other supported types: extract readable text, split into overlapping chunks, and index with basic metadata.
+        - Embed each chunk/document using Gemini embeddings (if API key available).
         - Store chunks and embeddings in a per-session in-memory index for retrieval.
 
     Args:
@@ -576,7 +641,7 @@ def upload_chat_context(
     Returns:
         UploadContextResponse: Processing results and acknowledgment.
     """
-    from .file_utils import extract_text_from_bytes, summarize_text_preview
+    from .file_utils import extract_text_from_bytes, summarize_text_preview, parse_json_documents
 
     if not session_id or not isinstance(session_id, str):
         raise HTTPException(status_code=400, detail="session_id must be provided as a non-empty string.")
@@ -601,32 +666,105 @@ def upload_chat_context(
             continue
 
         size = len(data or b"")
-        # Extract
-        text, err = extract_text_from_bytes(filename, data or b"")
-        preview = summarize_text_preview(text, max_chars=500) if text else ""
-        chars = len(text)
+        name_lower = (filename or "").lower()
 
-        # Append to combined only if successful and non-empty
-        if text and not err:
-            combined_text_parts.append(f"[{filename}]\n{text}\n")
-            total_chars += chars
-
-            # Build semantic index: chunk + embed + store
+        # Branch for JSON with semantic parsing
+        if name_lower.endswith(".json"):
             try:
-                _index_text_for_session(session_id, filename, text)
-            except Exception:
-                # Do not fail upload on indexing failure; retrieval will fall back gracefully.
-                pass
+                docs = parse_json_documents(filename, data or b"")
+            except Exception as e:
+                docs = []
+                parse_err = f"Failed to parse JSON: {e}"
+            else:
+                parse_err = None
 
-        results.append(
-            UploadedFileResult(
-                filename=filename,
-                size=size,
-                content_chars=chars,
-                preview=preview,
-                error=err,
+            if docs:
+                # Compute preview and char counts from document texts
+                all_texts = [d.get("text", "") for d in docs if d.get("text")]
+                joined_for_preview = "\n\n".join(all_texts[:3]).strip()
+                preview = summarize_text_preview(joined_for_preview, max_chars=500) if joined_for_preview else ""
+                chars = sum(len(t) for t in all_texts)
+
+                # Add to combined text (for legacy preview store)
+                if all_texts:
+                    combined_text_parts.append(f"[{filename}]\n" + "\n---\n".join(all_texts[:3]) + ("\n..." if len(all_texts) > 3 else ""))
+                    total_chars += chars
+
+                # Ensure each doc has at least basic filename metadata and mark origin as json
+                enriched_docs = []
+                for d in docs:
+                    text = (d.get("text") or "").strip()
+                    if not text:
+                        continue
+                    meta = d.get("metadata") or {}
+                    meta.setdefault("source_filename", filename)
+                    meta.setdefault("origin", "json")
+                    enriched_docs.append({"text": text, "metadata": meta})
+
+                try:
+                    _index_documents_for_session(session_id, enriched_docs)
+                except Exception:
+                    # Indexing failure shouldn't abort the entire request
+                    pass
+
+                results.append(
+                    UploadedFileResult(
+                        filename=filename,
+                        size=size,
+                        content_chars=chars,
+                        preview=preview,
+                        error=None,
+                    )
+                )
+            else:
+                # Fallback: try plain text extraction if JSON parsing produced nothing
+                text, err = extract_text_from_bytes(filename, data or b"")
+                preview = summarize_text_preview(text, max_chars=500) if text else ""
+                chars = len(text)
+                if text and not err:
+                    combined_text_parts.append(f"[{filename}]\n{text}\n")
+                    total_chars += chars
+                    try:
+                        _index_text_for_session(session_id, filename, text)
+                    except Exception:
+                        pass
+                results.append(
+                    UploadedFileResult(
+                        filename=filename,
+                        size=size,
+                        content_chars=chars,
+                        preview=preview,
+                        error=parse_err or err or "No parsable JSON content found",
+                    )
+                )
+
+        else:
+            # Non-JSON: existing extraction flow
+            text, err = extract_text_from_bytes(filename, data or b"")
+            preview = summarize_text_preview(text, max_chars=500) if text else ""
+            chars = len(text)
+
+            # Append to combined only if successful and non-empty
+            if text and not err:
+                combined_text_parts.append(f"[{filename}]\n{text}\n")
+                total_chars += chars
+
+                # Build semantic index: chunk + embed + store with basic metadata
+                try:
+                    _index_text_for_session(session_id, filename, text)
+                except Exception:
+                    # Do not fail upload on indexing failure; retrieval will fall back gracefully.
+                    pass
+
+            results.append(
+                UploadedFileResult(
+                    filename=filename,
+                    size=size,
+                    content_chars=chars,
+                    preview=preview,
+                    error=err,
+                )
             )
-        )
 
     # If at least one file produced content, update the legacy session context store (for optional previews)
     if total_chars > 0:
