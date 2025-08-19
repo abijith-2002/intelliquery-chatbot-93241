@@ -15,6 +15,8 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Dict, Any
 import json
+import os
+import uuid
 import google.generativeai as genai
 
 from dotenv import load_dotenv
@@ -797,10 +799,10 @@ def chat(request: ChatRequest, response: Response):
 
         def _pack_json_docs_for_prompt(docs: List[Dict[str, Any]], max_chars: int = MAX_CONTEXT_CHARS) -> tuple[str, bool, int, int]:
             """
-            Build a valid JSON array string like:
+            Build a valid JSON array string containing compact JSON docs or safe samples:
               [{"source":"file.json","data": <JSON>}, ...]
-            honoring a character cap. If a single doc cannot fit, include a truncated
-            string sample to keep JSON valid:
+            If the input is too large or is stored server-side (file_ref), include a safe
+            sample and mark it as truncated to keep the JSON valid:
               {"source":"file.json","data_truncated":true,"data_sample":"..."}
             Returns:
               (json_array_string, truncated_flag, included_docs, total_docs)
@@ -810,32 +812,70 @@ def chat(request: ChatRequest, response: Response):
             truncated = False
             included_docs = 0
             total_docs = len(docs)
+
+            def _read_file_sample(path: str, budget: int) -> str:
+                """Read up to 'budget' bytes from file for a safe sample string."""
+                if budget <= 0:
+                    return ""
+                try:
+                    with open(path, "rb") as fh:
+                        chunk = fh.read(max(0, budget))
+                        # Decode as utf-8 safely
+                        return (chunk or b"").decode("utf-8", errors="ignore")
+                except Exception:
+                    return ""
+
             for d in docs:
                 fn = d.get("filename") or "json"
                 js = d.get("json") or ""
-                entry = f'{{"source":{json.dumps(fn)}, "data": {js}}}'
+                file_ref = d.get("file_ref") or ""
+
                 sep = ", " if parts else ""
-                if current + len(sep) + len(entry) <= max_chars:
-                    parts.append(entry)
-                    current += len(sep) + len(entry)
-                    included_docs += 1
-                    continue
-                # Fallback: truncated sample as a JSON string to keep overall structure valid
-                budget = max_chars - current - len(sep) - len(fn) - 60  # room for keys and punctuation
-                if budget > 0 and js:
-                    sample = js[: max(0, budget)] + ("..." if budget < len(js) else "")
-                else:
-                    sample = ""
-                safe_sample = json.dumps(sample, ensure_ascii=False)
-                fallback_entry = f'{{"source":{json.dumps(fn)}, "data_truncated": true, "data_sample": {safe_sample}}}'
-                if current + len(sep) + len(fallback_entry) <= max_chars:
-                    parts.append(fallback_entry)
-                    current += len(sep) + len(fallback_entry)
+
+                if js:
+                    # Try to include full compact JSON entry if fits
+                    entry = f'{{"source":{json.dumps(fn)}, "data": {js}}}'
+                    if current + len(sep) + len(entry) <= max_chars:
+                        parts.append(entry)
+                        current += len(sep) + len(entry)
+                        included_docs += 1
+                        continue
+                    # Otherwise include a truncated sample string
+                    budget = max_chars - current - len(sep) - len(fn) - 80
+                    sample = js[: max(0, budget)] + ("..." if budget > 0 and budget < len(js) else "")
+                    safe_sample = json.dumps(sample, ensure_ascii=False)
+                    fallback_entry = f'{{"source":{json.dumps(fn)}, "data_truncated": true, "data_sample": {safe_sample}}}'
+                    if current + len(sep) + len(fallback_entry) <= max_chars:
+                        parts.append(fallback_entry)
+                        current += len(sep) + len(fallback_entry)
+                        truncated = True
+                        included_docs += 1
+                    else:
+                        truncated = True
+                    break
+
+                elif file_ref:
+                    # Read only a small, safe sample from file
+                    per_doc_budget = max(512, (max_chars - current) // max(1, (total_docs - included_docs)))
+                    # Leave space for JSON keys and punctuation
+                    effective_budget = max(0, per_doc_budget - (len(fn) + 80))
+                    sample = _read_file_sample(file_ref, effective_budget)
+                    sample = sample[:effective_budget] + ("..." if sample and len(sample) >= effective_budget else "")
+                    safe_sample = json.dumps(sample, ensure_ascii=False)
+                    entry = f'{{"source":{json.dumps(fn)}, "data_truncated": true, "data_sample": {safe_sample}}}'
+                    if current + len(sep) + len(entry) <= max_chars:
+                        parts.append(entry)
+                        current += len(sep) + len(entry)
+                        truncated = True
+                        included_docs += 1
+                        continue
                     truncated = True
-                    included_docs += 1  # count as represented (sample)
-                # We break after attempting fallback; remaining docs omitted
-                truncated = True
-                break
+                    break
+                else:
+                    # Unknown representation - skip but count as truncated
+                    truncated = True
+                    continue
+
             # If not all docs could be included, mark truncated
             if included_docs < total_docs:
                 truncated = True
@@ -1221,5 +1261,146 @@ async def upload_chat_context(
         session_id=session_id,
         files_processed=results,
         total_chars=total_chars,
+        message=message,
+    )
+
+# PUBLIC_INTERFACE
+@app.post(
+    "/chat/upload-context/stream",
+    response_model=UploadContextResponse,
+    tags=["Chat"],
+    summary="Stream upload a large JSON file",
+    description=(
+        "Accept a single large JSON file via multipart/form-data, store it server-side without loading it fully into memory, "
+        "and build a schema-aware summary using a streaming parser (ijson). The summary and small samples are indexed "
+        "for retrieval, while the full file remains referenced server-side. This avoids timeouts and memory pressure."
+    ),
+    responses={
+        400: {"description": "Validation error or no file provided"},
+        415: {"description": "Unsupported media type (only .json)"},
+    },
+)
+async def upload_chat_context_stream(
+    session_id: str = Form(..., description="Session ID to associate uploaded context with"),
+    file: UploadFile = File(..., description="Single large JSON file"),
+    background_tasks: BackgroundTasks = None,
+):
+    """
+    PUBLIC_INTERFACE
+    Stream a large JSON file to disk, summarize it via streaming, and index schema-aware chunks.
+
+    Behavior:
+      - Validates .json extension or application/json content type.
+      - Saves the upload to disk under a per-session directory.
+      - Uses streaming JSON parsing to compute schema/columns, per-field unique samples, and sample rows.
+      - Stores a server-side reference to the file in session context (raw_json_docs), so chat can include safe samples.
+      - Indexes the schema/field/sample chunks in the background for retrieval-augmented answering.
+
+    Returns:
+        UploadContextResponse: Processing results and acknowledgment. The `total_chars` reflects only text extracted
+        for previews (not full file size). The original file is referenced server-side and not inlined.
+    """
+    from .file_utils import (
+        summarize_text_preview,
+        stream_json_sample_and_uniques,
+        generate_streamed_json_chunks_from_file,
+    )
+
+    if not session_id or not isinstance(session_id, str):
+        raise HTTPException(status_code=400, detail="session_id must be provided as a non-empty string.")
+    if file is None:
+        raise HTTPException(status_code=400, detail="A file must be provided.")
+
+    # Validate it is JSON by extension or content-type
+    fname = file.filename or "upload.json"
+    lower = (fname or "").lower()
+    ctype = file.content_type or ""
+    if not (lower.endswith(".json") or "json" in ctype):
+        raise HTTPException(status_code=415, detail="Only JSON files are supported by the streaming endpoint.")
+
+    # Determine upload directory from env
+    base_dir = os.getenv("CHATBOT_UPLOAD_DIR", "chat_uploads")
+    session_dir = os.path.join(base_dir, session_id)
+    os.makedirs(session_dir, exist_ok=True)
+    saved_name = f"{uuid.uuid4().hex}_{os.path.basename(fname)}"
+    dest_path = os.path.join(session_dir, saved_name)
+
+    # Stream save to disk
+    size_bytes = 0
+    try:
+        with open(dest_path, "wb") as out:
+            # 1MB chunks by default; configurable via UPLOAD_STREAM_CHUNK_SIZE
+            sz = int(os.getenv("UPLOAD_STREAM_CHUNK_SIZE", "1048576"))
+            while True:
+                chunk = await file.read(sz)
+                if not chunk:
+                    break
+                out.write(chunk)
+                size_bytes += len(chunk)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {e}")
+
+    # Streaming summary (schema, uniques, samples)
+    summary, sum_err = await run_in_threadpool(stream_json_sample_and_uniques, dest_path)
+    if sum_err:
+        preview_text = f"[Streaming JSON summary error: {sum_err}]"
+        chunks = []
+        chunks_err = sum_err
+    else:
+        # Render a human-readable preview and generate schema-aware chunks
+        preview_text = summarize_text_preview(summary.get("preview_text", ""), max_chars=500) if summary else ""
+        chunks, chunks_err = await run_in_threadpool(generate_streamed_json_chunks_from_file, dest_path, fname)
+
+    # Prepare result entry
+    preview = (preview_text or "").strip()
+    if chunks_err:
+        preview = (preview + f" [Chunking warn: {chunks_err}]").strip()
+
+    result = UploadedFileResult(
+        filename=fname,
+        size=size_bytes,
+        content_chars=len(preview),
+        preview=preview,
+        error=None if not sum_err else sum_err,
+    )
+
+    # Update session context: store file reference and index chunks in background
+    prev_ctx = CONTEXT_STORE.get(session_id, {}) or {}
+    prev_files = prev_ctx.get("files", [])
+    prev_combined = prev_ctx.get("combined", "")
+    prev_rows = prev_ctx.get("xlsx_json_rows", []) or []
+    prev_raw_docs = prev_ctx.get("raw_json_docs", []) or []
+
+    # Store reference entry for chat-time packing
+    ref_entry = {"filename": fname, "file_ref": dest_path, "size_bytes": size_bytes, "is_streamed": True}
+    merged_raw_docs = prev_raw_docs + [ref_entry]
+
+    CONTEXT_STORE[session_id] = {
+        "files": prev_files + [result.model_dump()],
+        "combined": prev_combined,
+        "xlsx_json_rows": prev_rows,
+        "raw_json_docs": merged_raw_docs,
+    }
+
+    # Index chunks in background (if any)
+    def _background_index_structured(sid: str, chunk_list: List[Dict[str, Any]]):
+        try:
+            _index_structured_chunks_for_session(sid, chunk_list or [])
+        except Exception:
+            pass
+
+    if background_tasks is not None and chunks:
+        background_tasks.add_task(_background_index_structured, session_id, chunks)
+
+    message = (
+        "Streamed JSON saved server-side. Summary generated and indexing in progress."
+        if not sum_err
+        else "Streamed JSON saved server-side. Summary unavailable."
+    )
+
+    return UploadContextResponse(
+        session_id=session_id,
+        files_processed=[result],
+        total_chars=len(preview),
         message=message,
     )

@@ -51,3 +51,4 @@ SQLAlchemy==2.0.29
 python-docx==1.1.2
 openpyxl==3.1.5
 pdfminer.six==20231228
+ijson==3.3.0

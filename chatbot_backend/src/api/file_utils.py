@@ -1052,3 +1052,171 @@ def generate_json_rag_chunks(
         )
 
     return chunks, None
+
+
+# PUBLIC_INTERFACE
+def stream_json_sample_and_uniques(
+    file_path: str,
+    scan_rows_env: str = "STREAM_JSON_SCAN_ROWS",
+    sample_rows_env: str = "STREAM_JSON_SAMPLE_ROWS",
+    unique_limit_env: str = "STREAM_JSON_UNIQUE_LIMIT",
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """
+    PUBLIC_INTERFACE
+    Stream-parse a large JSON file (expecting a root array of objects) to compute:
+      - Columns (union of flattened keys up to depth 2)
+      - Per-field type (inferred from sample)
+      - Unique value samples per field (first M)
+      - Sample rows (first N, flattened)
+    Does not load the entire file into memory.
+
+    Args:
+        file_path (str): Path to the JSON file on disk.
+        scan_rows_env (str): Env var name for how many rows to scan for schema inference (default 1000).
+        sample_rows_env (str): Env var name for sample rows count (default 50).
+        unique_limit_env (str): Env var for uniques limit per field (default 50).
+
+    Returns:
+        Tuple[Dict[str, Any], Optional[str]]:
+            summary dict with keys: columns, types, uniques, sample, approx_count, preview_text
+            error string if streaming parse failed
+    """
+    try:
+        import ijson  # imported lazily
+    except Exception as e:
+        return {}, f"ijson not available for streaming parse: {e}"
+
+    scan_rows = _safe_int_env(scan_rows_env, 1000)
+    sample_rows = _safe_int_env(sample_rows_env, 50)
+    unique_limit = _safe_int_env(unique_limit_env, 50)
+
+    flattened_records: List[Dict[str, Any]] = []
+    approx_count = 0
+
+    try:
+        with open(file_path, "rb") as f:
+            # Expect a root array of objects
+            for obj in ijson.items(f, "item"):
+                if isinstance(obj, dict):
+                    rec = _flatten_to_record(obj, max_depth=2)
+                    flattened_records.append(rec)
+                    approx_count += 1
+                    if approx_count >= scan_rows:
+                        break
+                else:
+                    approx_count += 1
+                    if approx_count >= scan_rows:
+                        break
+    except Exception as e:
+        return {}, f"Failed to stream-parse JSON: {e}"
+
+    if not flattened_records:
+        return {
+            "columns": [],
+            "types": {},
+            "uniques": {},
+            "sample": [],
+            "approx_count": 0,
+            "preview_text": "[Streaming JSON] No object records found in root array or file is empty.",
+        }, None
+
+    # Columns and type map
+    columns_set = set()
+    for rec in flattened_records:
+        for k in rec.keys():
+            columns_set.add(k)
+    columns = sorted(list(columns_set))
+    types = _collect_types_for_fields(flattened_records)
+
+    # Uniques
+    uniques_map = _build_uniques_map(flattened_records, columns, unique_limit)
+
+    # Sample rows
+    sample = flattened_records[: sample_rows]
+
+    lines = [
+        "[Streaming JSON Array of objects]",
+        f"Columns ({len(columns)}): {json.dumps(columns, ensure_ascii=False)}",
+        "Field types:",
+        json.dumps(types, ensure_ascii=False, indent=2),
+        f"Approximate objects scanned: {approx_count}",
+        "Sample rows:",
+        json.dumps(sample, ensure_ascii=False, indent=2),
+        "Unique values (first per field):",
+        json.dumps(uniques_map, ensure_ascii=False, indent=2),
+    ]
+    preview_text = "\n".join(lines)
+
+    return {
+        "columns": columns,
+        "types": types,
+        "uniques": uniques_map,
+        "sample": sample,
+        "approx_count": approx_count,
+        "preview_text": preview_text,
+    }, None
+
+
+# PUBLIC_INTERFACE
+def generate_streamed_json_chunks_from_file(
+    file_path: str,
+    filename: str = "",
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """
+    PUBLIC_INTERFACE
+    Create schema-aware chunks from a large JSON file using streaming summary,
+    without loading the full file into memory.
+
+    Returns:
+        (chunks, error): where chunks is a list of {"text": str, "meta": {...}}
+    """
+    summary, err = stream_json_sample_and_uniques(file_path)
+    if err:
+        return [], err
+
+    filename = filename or ""
+    chunks: List[Dict[str, Any]] = []
+
+    def add_chunk(text: str, meta: Dict[str, Any]):
+        if not text or not text.strip():
+            return
+        chunks.append({"text": text.strip(), "meta": {"filename": filename, **meta}})
+
+    # Schema overview chunk
+    schema_lines = [
+        "JSON Schema Overview (streamed)",
+        f"Columns ({len(summary.get('columns', []))}): {json.dumps(summary.get('columns', []), ensure_ascii=False)}",
+        "Field types:",
+        json.dumps(summary.get("types", {}), ensure_ascii=False, indent=2),
+        f"Approximate objects scanned: {summary.get('approx_count', 0)}",
+    ]
+    add_chunk("\n".join(schema_lines), {"type": "json_schema", "dataset": "root", "approx_count": int(summary.get("approx_count", 0))})
+
+    # Per-field uniques chunks
+    uniques = summary.get("uniques", {}) or {}
+    types_map = summary.get("types", {}) or {}
+    for fld, vals in uniques.items():
+        field_lines = [
+            f"Field: {fld}",
+            f"Type: {types_map.get(fld, 'unknown')}",
+            "Unique values sample:",
+            json.dumps(vals, ensure_ascii=False, indent=2),
+        ]
+        add_chunk("\n".join(field_lines), {"type": "json_field", "dataset": "root", "path": fld, "field_type": types_map.get(fld, "unknown"), "approx_count": int(summary.get("approx_count", 0))})
+
+    # Sample rows chunk
+    sample = summary.get("sample", []) or []
+    if sample:
+        add_chunk(
+            "JSON Sample Rows (streamed)\n" + json.dumps(sample, ensure_ascii=False, indent=2),
+            {"type": "json_rows", "dataset": "root", "approx_count": int(summary.get("approx_count", 0))},
+        )
+
+    # A compact array summary chunk
+    add_chunk(
+        "JSON Array Summary (streamed)\n"
+        + json.dumps({"approx_objects_scanned": summary.get("approx_count", 0)}, ensure_ascii=False, indent=2),
+        {"type": "json_array_summary", "dataset": "root", "approx_count": int(summary.get("approx_count", 0))},
+    )
+
+    return chunks, None
