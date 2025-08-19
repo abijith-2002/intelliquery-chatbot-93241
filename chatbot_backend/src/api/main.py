@@ -510,6 +510,141 @@ def _extract_table_snippets_from_combined(combined: str, max_chars: int = 12000)
     return result
 
 
+def _try_answer_trains_between_query(query: str, raw_json_docs: List[Dict[str, Any]]) -> Optional[str]:
+    """
+    Attempt a deterministic answer for queries like "which trains go from TVC to TCR"
+    using uploaded raw JSON documents that contain train objects with 'route' arrays.
+
+    Returns:
+        A concise natural language answer string if a confident match is found; otherwise None.
+    """
+    import re
+
+    if not query or not raw_json_docs:
+        return None
+
+    # Parse JSON docs into a list of train dicts
+    trains: List[Dict[str, Any]] = []
+    for d in raw_json_docs:
+        try:
+            js = d.get("json") or ""
+            if not js:
+                continue
+            data = json.loads(js)
+        except Exception:
+            continue
+        # Root array of trains
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict) and isinstance(item.get("route"), list):
+                    trains.append(item)
+        # Root object with a list of trains under some key
+        elif isinstance(data, dict):
+            for v in data.values():
+                if isinstance(v, list):
+                    for item in v:
+                        if isinstance(item, dict) and isinstance(item.get("route"), list):
+                            trains.append(item)
+
+    if not trains:
+        return None
+
+    q = (query or "").strip()
+
+    # 1) Try to extract explicit station codes like "TVC->TCR", "TVC to TCR", "from TVC to TCR"
+    code_pair_patterns = [
+        r"\bfrom\s+([A-Z]{2,5})\s+to\s+([A-Z]{2,5})\b",
+        r"\b([A-Z]{2,5})\s*(?:-|->|—|–|>|to)\s*([A-Z]{2,5})\b",
+    ]
+    src_code: Optional[str] = None
+    dst_code: Optional[str] = None
+    for pat in code_pair_patterns:
+        m = re.search(pat, q, flags=re.IGNORECASE)
+        if m:
+            src_code = m.group(1).upper()
+            dst_code = m.group(2).upper()
+            break
+
+    # 2) Fallback: try to capture station names "from A to B" and map them to codes
+    if not (src_code and dst_code):
+        # Build a mapping of station name (lower) -> code from the uploaded trains
+        name_to_code: Dict[str, str] = {}
+        for t in trains:
+            for stop in (t.get("route") or []):
+                if not isinstance(stop, dict):
+                    continue
+                sname = (stop.get("station_name") or "").strip().lower()
+                scode = (stop.get("station_code") or "").strip().upper()
+                if sname and scode and sname not in name_to_code:
+                    name_to_code[sname] = scode
+
+        name_pair_patterns = [
+            r"\bfrom\s+([A-Za-z][A-Za-z\s]+?)\s+to\s+([A-Za-z][A-Za-z\s]+?)\b",
+        ]
+        for pat in name_pair_patterns:
+            m = re.search(pat, q, flags=re.IGNORECASE)
+            if m:
+                n1 = m.group(1).strip().lower()
+                n2 = m.group(2).strip().lower()
+                # Exact match first; fallback to substring contains if not found
+                def _resolve_name(n: str) -> Optional[str]:
+                    if n in name_to_code:
+                        return name_to_code[n]
+                    # substring heuristic
+                    for k, v in name_to_code.items():
+                        if n in k:
+                            return v
+                    return None
+                src_code = src_code or _resolve_name(n1)
+                dst_code = dst_code or _resolve_name(n2)
+                break
+
+    if not (src_code and dst_code):
+        return None
+
+    # Find trains that contain both stations in order
+    matches: List[Dict[str, Any]] = []
+    for t in trains:
+        route = t.get("route")
+        if not isinstance(route, list) or not route:
+            continue
+        codes = [str((stop or {}).get("station_code") or "").upper() for stop in route if isinstance(stop, dict)]
+        if src_code in codes and dst_code in codes:
+            i = codes.index(src_code)
+            j = codes.index(dst_code)
+            if i < j:
+                # Collect times (if available)
+                dep = ""
+                arr = ""
+                try:
+                    src_stop = route[i] if i < len(route) else {}
+                    dst_stop = route[j] if j < len(route) else {}
+                    src_dep = (src_stop or {}).get("departure_time") or (src_stop or {}).get("dep_time") or ""
+                    dst_arr = (dst_stop or {}).get("arrival_time") or (dst_stop or {}).get("arr_time") or ""
+                    dep = f", dep {src_code} {src_dep}" if src_dep else ""
+                    arr = f", arr {dst_code} {dst_arr}" if dst_arr else ""
+                except Exception:
+                    pass
+                matches.append({
+                    "name": (t.get("name") or t.get("train_name") or t.get("title") or "").strip(),
+                    "number": (t.get("number") or t.get("train_number") or "").strip(),
+                    "dep": dep,
+                    "arr": arr,
+                })
+
+    if not matches:
+        return f"No trains found from {src_code} to {dst_code} in the uploaded data."
+
+    # Format a concise answer
+    parts: List[str] = []
+    for m in matches:
+        label = f"{m['name']} ({m['number']})".strip()
+        timing = f"{m['dep']}{m['arr']}".strip()
+        parts.append(f"- {label}{(' ' + timing) if timing else ''}")
+    header = f"Trains from {src_code} to {dst_code}:"
+    return header + "\n" + "\n".join(parts)
+
+
 # PUBLIC_INTERFACE
 def get_gemini_response(
     query: str,
@@ -648,6 +783,17 @@ def chat(request: ChatRequest, response: Response):
         json_rows: List[Dict[str, Any]] = session_ctx.get("xlsx_json_rows", []) or []
         used_table_snippets = False  # retained for debug metadata compatibility
         top_chunks: List[str] = []  # ensure defined for telemetry
+
+        # Route query fast-path: If the user asks for trains between two stations and we have raw JSON,
+        # compute the answer deterministically and return immediately.
+        fast_answer = _try_answer_trains_between_query(request.query, raw_json_docs)
+        if fast_answer:
+            try:
+                # Save to memory for chat continuity
+                memory.save_context({"input": request.query}, {"output": fast_answer})
+            except Exception:
+                pass
+            return ChatAnswerResponse(answer=fast_answer)
 
         def _pack_json_docs_for_prompt(docs: List[Dict[str, Any]], max_chars: int = MAX_CONTEXT_CHARS) -> tuple[str, bool, int, int]:
             """

@@ -899,6 +899,81 @@ def generate_json_rag_chunks(
                 {"type": "json_rows", "dataset": dataset_name, "approx_count": approx_count},
             )
 
+        # Special indexing for train routes: generate directed station-pair keys to support "SRC to DST" queries.
+        try:
+            # Detect if items look like trains with a 'route' array of station dicts
+            route_like_count = 0
+            for it in arr:
+                if isinstance(it, dict) and isinstance(it.get("route"), list):
+                    route_like_count += 1
+            if route_like_count > 0:
+                for it in arr:
+                    if not isinstance(it, dict):
+                        continue
+                    route = it.get("route")
+                    if not isinstance(route, list) or not route:
+                        continue
+                    # Collect station codes and names in order
+                    codes: List[str] = []
+                    names: List[str] = []
+                    for stop in route:
+                        if not isinstance(stop, dict):
+                            continue
+                        code = (stop.get("station_code") or "").strip().upper()
+                        name = (stop.get("station_name") or "").strip()
+                        if code or name:
+                            codes.append(code)
+                            names.append(name)
+                    if not codes:
+                        continue
+                    train_name = str(it.get("name") or it.get("train_name") or it.get("title") or "").strip()
+                    train_num = str(it.get("number") or it.get("train_number") or "").strip()
+
+                    # Build adjacent pairs and a capped set of all directed pairs (i<j)
+                    pairs_adj: List[str] = []
+                    for i in range(len(codes) - 1):
+                        a, b = codes[i], codes[i + 1]
+                        if a and b:
+                            pairs_adj.append(f"{a}->{b}")
+                    pairs_all: List[str] = []
+                    cap_all = 120  # cap to avoid explosion per train
+                    for i in range(len(codes)):
+                        for j in range(i + 1, len(codes)):
+                            a, b = codes[i], codes[j]
+                            if a and b:
+                                pairs_all.append(f"{a}->{b}")
+                                if len(pairs_all) >= cap_all:
+                                    break
+                        if len(pairs_all) >= cap_all:
+                            break
+
+                    # Prepare lexical variants to improve matching for "to" or "-" phrasing
+                    pairs_all_to = [p.replace("->", " to ") for p in pairs_all]
+                    pairs_all_dash = [p.replace("->", "-") for p in pairs_all]
+
+                    seq_display = " -> ".join([c if c else (names[idx] if idx < len(names) else "") for idx, c in enumerate(codes)])
+                    lines = [
+                        "Train Route Segment Index",
+                        f"Train: {train_name} ({train_num})".strip(),
+                        f"Route sequence (codes): {seq_display}",
+                    ]
+                    if pairs_adj:
+                        lines.append(f"Adjacent segments: {'; '.join(pairs_adj)}")
+                    if pairs_all:
+                        # Include a subset of all directed pairs and lexical variants
+                        lines.append(f"Directed pairs (subset): {'; '.join(pairs_all)}")
+                        lines.append(f"Pairs (to-phrase): {'; '.join(pairs_all_to)}")
+                        lines.append(f"Pairs (dash): {'; '.join(pairs_all_dash)}")
+                    add_chunk(
+                        _chunk_text_block("Train Route Pairs", lines),
+                        {"type": "route_pairs", "dataset": dataset_name, "path": "route", "approx_count": len(route)},
+                    )
+                    if len(chunks) >= chunks_cap:
+                        break
+        except Exception:
+            # Do not fail chunking on any route indexing error
+            pass
+
     def from_primitive_or_mixed_array(arr: List[Any], dataset_name: str):
         types = sorted({ _value_type_name(x) for x in arr })
         sample_vals = []
