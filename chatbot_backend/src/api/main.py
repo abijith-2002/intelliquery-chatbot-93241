@@ -12,7 +12,7 @@
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 import google.generativeai as genai
 
 from dotenv import load_dotenv
@@ -30,6 +30,9 @@ from .auth_utils import (
 from .chat_title import router as chat_title_router
 # Config utilities
 from .config_utils import get_gemini_api_key
+# JSON flattening and Supabase helpers
+from .json_utils import flatten_json, format_entry_for_embedding
+from .supabase_utils import get_supabase_client, insert_json_embeddings
 
 # Load environment variables
 load_dotenv()
@@ -41,7 +44,7 @@ CONVERSATION_MEMORY: Dict[str, ConversationBufferMemory] = {}
 # Structure: { session_id: { "files": [ {filename, size, chars, preview, error?} ], "combined": str } }
 CONTEXT_STORE: Dict[str, Dict[str, Any]] = {}
 
-# Per-session in-memory vector index for RAG.
+# Per-session in-memory vector index for RAG (documents).
 # Structure:
 #   RAG_INDEX_STORE[session_id] = {
 #       "chunks": [ {"text": str, "filename": str} , ...],
@@ -49,6 +52,15 @@ CONTEXT_STORE: Dict[str, Dict[str, Any]] = {}
 #       "embedding_model": str
 #   }
 RAG_INDEX_STORE: Dict[str, Dict[str, Any]] = {}
+
+# Per-session in-memory vector index for JSON facts.
+# Structure:
+#   JSON_INDEX_STORE[session_id] = {
+#       "entries": [ {"text": "path = value", "path": str, "value": str, "filename": str}, ...],
+#       "embeddings": [ [float, ...] or None, ...],
+#       "embedding_model": str
+#   }
+JSON_INDEX_STORE: Dict[str, Dict[str, Any]] = {}
 
 app = FastAPI(
     title="IntelliQuery Chatbot API",
@@ -129,6 +141,23 @@ class UploadContextResponse(BaseModel):
     session_id: str = Field(..., description="Session ID associated with the uploaded context")
     files_processed: List[UploadedFileResult] = Field(..., description="Per-file processing results")
     total_chars: int = Field(..., description="Total number of characters added to session context")
+    message: str = Field(..., description="Status message/acknowledgment")
+
+
+class JSONUploadedFileResult(BaseModel):
+    """Processing result for a single uploaded JSON file."""
+    filename: str = Field(..., description="Original file name")
+    size: int = Field(..., description="File size in bytes")
+    entries_indexed: int = Field(..., description="Number of flattened JSON entries indexed")
+    preview: str = Field(..., description="Preview lines of indexed facts")
+    error: Optional[str] = Field(default=None, description="Error message if parsing/indexing failed")
+
+
+class JSONUploadResponse(BaseModel):
+    """Response schema for JSON upload and indexing."""
+    session_id: str = Field(..., description="Session ID associated with the uploaded JSON")
+    files_processed: List[JSONUploadedFileResult] = Field(..., description="Per-file processing results")
+    total_entries: int = Field(..., description="Total number of JSON entries indexed")
     message: str = Field(..., description="Status message/acknowledgment")
 
 
@@ -278,6 +307,40 @@ def _ensure_session_index(session_id: str):
             "embedding_model": _get_embedding_model_name(),
         }
 
+def _ensure_json_index(session_id: str):
+    """
+    Ensure JSON index structure exists for the session.
+    """
+    if session_id not in JSON_INDEX_STORE:
+        JSON_INDEX_STORE[session_id] = {
+            "entries": [],
+            "embeddings": [],
+            "embedding_model": _get_embedding_model_name(),
+        }
+
+def _index_json_entries_for_session(
+    session_id: str,
+    filename: str,
+    entries: List[Tuple[str, str]],
+):
+    """
+    Index flattened JSON entries for a session:
+        - Build "path = value" text for each entry
+        - Embed with Gemini if available
+        - Store in per-session JSON index
+    """
+    if not entries:
+        return
+    _ensure_json_index(session_id)
+    texts: List[str] = [f"{p} = {v}" for p, v in entries]
+    vectors = _embed_texts(texts)
+    store = JSON_INDEX_STORE[session_id]
+    for (p, v), text, vec in zip(entries, texts, vectors):
+        store["entries"].append(
+            {"text": text, "path": p, "value": v, "filename": filename}
+        )
+        store["embeddings"].append(vec)
+
 
 def _index_text_for_session(session_id: str, filename: str, text: str):
     """
@@ -324,6 +387,33 @@ def _vector_search(session_id: str, query: str, top_k: int = 3) -> List[str]:
 
     # Fallback: lexical similarity if no query embedding
     scored_lex = [(_simple_similarity(query, item["text"]), item["text"]) for item in index["chunks"]]
+    scored_lex.sort(key=lambda x: x[0], reverse=True)
+    return [text for _, text in scored_lex[:top_k]]
+
+def _vector_search_json(session_id: str, query: str, top_k: int = 5) -> List[str]:
+    """
+    Perform semantic search across JSON entries ("path = value" facts).
+    Prefers embeddings; falls back to lexical overlap if unavailable.
+
+    Returns:
+        List[str]: Top-k JSON fact lines.
+    """
+    index = JSON_INDEX_STORE.get(session_id)
+    if not index or not index.get("entries"):
+        return []
+    query_vec = _embed_one(query)
+    if query_vec:
+        scored = []
+        for item, vec in zip(index["entries"], index["embeddings"]):
+            if vec:
+                score = _cosine_similarity(query_vec, vec)
+            else:
+                score = _simple_similarity(query, item["text"])
+            scored.append((score, item["text"]))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [text for _, text in scored[:top_k]]
+    # Lexical fallback
+    scored_lex = [(_simple_similarity(query, item["text"]), item["text"]) for item in index["entries"]]
     scored_lex.sort(key=lambda x: x[0], reverse=True)
     return [text for _, text in scored_lex[:top_k]]
 
@@ -432,9 +522,22 @@ def chat(request: ChatRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
 
-        # Retrieve top-k relevant chunks from vector index
-        top_chunks = _vector_search(session_id, request.query, top_k=3)
-        retrieved_context = "\n---\n".join(top_chunks).strip()
+        # Retrieve top-k relevant JSON facts and document chunks
+        top_json_facts = _vector_search_json(session_id, request.query, top_k=5)
+        top_doc_chunks = _vector_search(session_id, request.query, top_k=3)
+
+        # Compose retrieved context prioritizing JSON facts as primary answer source
+        parts: List[str] = []
+        if top_json_facts:
+            parts.append("JSON Facts:")
+            for line in top_json_facts:
+                parts.append(f"- {line}")
+        if top_doc_chunks:
+            parts.append("")
+            parts.append("Document Context:")
+            for chunk in top_doc_chunks:
+                parts.append(f"- {chunk}")
+        retrieved_context = "\n".join(parts).strip()
 
         # Compose Gemini answer with retrieved context (if any)
         try:
@@ -652,5 +755,162 @@ def upload_chat_context(
         session_id=session_id,
         files_processed=results,
         total_chars=total_chars,
+        message=message,
+    )
+
+
+# PUBLIC_INTERFACE
+@app.post(
+    "/chat/upload-json",
+    response_model=JSONUploadResponse,
+    tags=["Chat"],
+    summary="Upload JSON files and semantically index their facts",
+    description=(
+        "Accepts one or more .json files via multipart/form-data. "
+        "Parses each JSON, flattens it into dot-notation leaf entries (arrays supported using numeric indices), "
+        "builds text facts like 'path = value', embeds each fact (Gemini embeddings), and stores them "
+        "in a vector database (Supabase, if configured). Also stores an in-memory index for retrieval. "
+        "These JSON facts are prioritized during RAG for subsequent chats in the same session."
+    ),
+    responses={
+        400: {"description": "Validation error or no files provided"},
+        415: {"description": "Unsupported media type"},
+        500: {"description": "Unexpected processing error"},
+    },
+)
+def upload_json_context(
+    session_id: str = Form(..., description="Session ID to associate uploaded JSON context with"),
+    files: List[UploadFile] = File(..., description="One or more files (.json)"),
+):
+    """
+    PUBLIC_INTERFACE
+    Upload and process JSON files to add structured facts for a given chat session.
+
+    Process:
+        - Parse JSON.
+        - Flatten into dot-notation leaf entries; arrays use numeric indices in the path.
+        - For each entry, build 'path = value' text for embedding.
+        - Embed entries using Gemini embeddings (if API key available).
+        - Store entries + embeddings in Supabase if configured, and always in-memory for retrieval.
+
+    Args:
+        session_id (str): The chat session ID.
+        files (List[UploadFile]): Uploaded JSON files.
+
+    Returns:
+        JSONUploadResponse: Processing results and acknowledgment.
+    """
+    if not session_id or not isinstance(session_id, str):
+        raise HTTPException(status_code=400, detail="session_id must be provided as a non-empty string.")
+    if not files or len(files) == 0:
+        raise HTTPException(status_code=400, detail="At least one file must be provided.")
+    # Attempt Supabase client (optional)
+    sb = get_supabase_client()
+
+    results: List[JSONUploadedFileResult] = []
+    total_entries = 0
+
+    for f in files:
+        filename = f.filename or "unnamed.json"
+        name_lower = filename.lower()
+        if not name_lower.endswith(".json"):
+            results.append(
+                JSONUploadedFileResult(
+                    filename=filename,
+                    size=0,
+                    entries_indexed=0,
+                    preview="",
+                    error="Unsupported file type. Only .json is accepted.",
+                )
+            )
+            continue
+
+        # Read file bytes
+        try:
+            data_bytes = f.file.read()
+        except Exception as e:
+            results.append(
+                JSONUploadedFileResult(
+                    filename=filename, size=0, entries_indexed=0, preview="", error=f"Failed to read file: {e}"
+                )
+            )
+            continue
+
+        size = len(data_bytes or b"")
+        # Parse JSON
+        try:
+            import json as _json
+            parsed = _json.loads((data_bytes or b"").decode("utf-8", errors="ignore"))
+        except Exception as e:
+            results.append(
+                JSONUploadedFileResult(
+                    filename=filename, size=size, entries_indexed=0, preview="", error=f"Invalid JSON: {e}"
+                )
+            )
+            continue
+
+        # Flatten
+        try:
+            flattened = flatten_json(parsed)
+        except Exception as e:
+            results.append(
+                JSONUploadedFileResult(
+                    filename=filename, size=size, entries_indexed=0, preview="", error=f"Flattening error: {e}"
+                )
+            )
+            continue
+
+        # Index in-memory (JSON store) with embeddings
+        try:
+            _index_json_entries_for_session(session_id, filename, flattened)
+        except Exception:
+            # Continue even if in-memory indexing fails
+            pass
+
+        # Optional: Supabase storage
+        if sb is not None:
+            try:
+                rows = []
+                for p, v in flattened:
+                    text_line = format_entry_for_embedding(p, v)
+                    vec = _embed_one(text_line)  # compute once more for storage to ensure consistency
+                    rows.append(
+                        {
+                            "session_id": session_id,
+                            "filename": filename,
+                            "path": p,
+                            "value": v,
+                            "embedding": vec,
+                        }
+                    )
+                insert_json_embeddings(sb, "json_embeddings", rows)
+            except Exception:
+                # Best-effort; do not fail the request if Supabase insertion fails
+                pass
+
+        total_entries += len(flattened)
+        preview_lines = []
+        for i, (p, v) in enumerate(flattened[:8]):  # cap preview lines
+            preview_lines.append(f"{p} = {v}")
+        results.append(
+            JSONUploadedFileResult(
+                filename=filename,
+                size=size,
+                entries_indexed=len(flattened),
+                preview="\n".join(preview_lines),
+                error=None,
+            )
+        )
+
+    message = (
+        "Processed JSON successfully. Session JSON facts indexed."
+        if total_entries > 0
+        else "Processed JSON files, but no entries were indexed."
+    )
+
+    return JSONUploadResponse(
+        session_id=session_id,
+        files_processed=results,
+        total_entries=total_entries,
         message=message,
     )
