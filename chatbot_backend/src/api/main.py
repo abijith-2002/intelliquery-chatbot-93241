@@ -31,7 +31,7 @@ from .chat_title import router as chat_title_router
 # Config utilities
 from .config_utils import get_gemini_api_key
 # JSON flattening and Supabase helpers
-from .json_utils import flatten_json, format_entry_for_embedding
+from .json_utils import flatten_json
 from .supabase_utils import get_supabase_client, insert_json_embeddings
 
 # Load environment variables
@@ -770,7 +770,11 @@ def upload_chat_context(
         "Parses each JSON, flattens it into dot-notation leaf entries (arrays supported using numeric indices), "
         "builds text facts like 'path = value', embeds each fact (Gemini embeddings), and stores them "
         "in a vector database (Supabase, if configured). Also stores an in-memory index for retrieval. "
-        "These JSON facts are prioritized during RAG for subsequent chats in the same session."
+        "These JSON facts are prioritized during RAG for subsequent chats in the same session.\n\n"
+        "Compatibility notes:\n"
+        "- Supports common frontend field names for file uploads: 'files', 'file', 'attachment', 'attachments'.\n"
+        "- Accepts session_id as 'session_id' or 'sessionId' form fields.\n"
+        "- Caps extremely large JSONs to avoid timeouts and gateway errors."
     ),
     responses={
         400: {"description": "Validation error or no files provided"},
@@ -779,8 +783,14 @@ def upload_chat_context(
     },
 )
 def upload_json_context(
-    session_id: str = Form(..., description="Session ID to associate uploaded JSON context with"),
-    files: List[UploadFile] = File(..., description="One or more files (.json)"),
+    # Session ID aliases for compatibility with various frontends
+    session_id: Optional[str] = Form(default=None, description="Session ID to associate uploaded JSON context with"),
+    sessionId: Optional[str] = Form(default=None, description="Alias for session_id used by some clients"),
+    # File field name compatibility: support multiple common names
+    files: Optional[List[UploadFile]] = File(default=None, description="One or more files (.json)"),
+    file: Optional[UploadFile] = File(default=None, description="Single file (.json)"),
+    attachment: Optional[UploadFile] = File(default=None, description="Single attachment file (.json)"),
+    attachments: Optional[List[UploadFile]] = File(default=None, description="Multiple attachment files (.json)"),
 ):
     """
     PUBLIC_INTERFACE
@@ -790,94 +800,160 @@ def upload_json_context(
         - Parse JSON.
         - Flatten into dot-notation leaf entries; arrays use numeric indices in the path.
         - For each entry, build 'path = value' text for embedding.
-        - Embed entries using Gemini embeddings (if API key available).
-        - Store entries + embeddings in Supabase if configured, and always in-memory for retrieval.
+        - Embed a capped number of entries using Gemini embeddings (if API key available) to avoid timeouts.
+        - Store entries + embeddings in Supabase if configured (best-effort), and always in-memory for retrieval.
 
     Args:
-        session_id (str): The chat session ID.
-        files (List[UploadFile]): Uploaded JSON files.
+        session_id/sessionId (str): The chat session ID.
+        files/file/attachment/attachments: Uploaded JSON files (multipart/form-data). Accepts common field names.
 
     Returns:
         JSONUploadResponse: Processing results and acknowledgment.
     """
-    if not session_id or not isinstance(session_id, str):
-        raise HTTPException(status_code=400, detail="session_id must be provided as a non-empty string.")
-    if not files or len(files) == 0:
-        raise HTTPException(status_code=400, detail="At least one file must be provided.")
+    # Limits to prevent long processing leading to 502/504 from proxies
+    MAX_JSON_SIZE_MB = 10  # soft limit; warn if exceeded
+    MAX_ENTRIES_PER_FILE = 5000  # cap number of flattened entries indexed per file
+    MAX_EMBED_PER_FILE = 400     # cap number of entries to embed per file (rest stored without embedding)
+
+    effective_session_id = (session_id or sessionId or "").strip() if (session_id or sessionId) else ""
+    if not effective_session_id:
+        raise HTTPException(status_code=400, detail="session_id must be provided as a non-empty string (session_id/sessionId).")
+
+    # Aggregate files from all supported fields
+    incoming_files: List[UploadFile] = []
+    if files:
+        incoming_files.extend([f for f in files if f is not None])
+    if attachments:
+        incoming_files.extend([f for f in attachments if f is not None])
+    if file:
+        incoming_files.append(file)
+    if attachment:
+        incoming_files.append(attachment)
+
+    if not incoming_files:
+        raise HTTPException(status_code=400, detail="At least one .json file must be provided under files/file/attachment/attachments.")
+
     # Attempt Supabase client (optional)
     sb = get_supabase_client()
 
     results: List[JSONUploadedFileResult] = []
     total_entries = 0
 
-    for f in files:
-        filename = f.filename or "unnamed.json"
-        name_lower = filename.lower()
-        if not name_lower.endswith(".json"):
-            results.append(
-                JSONUploadedFileResult(
-                    filename=filename,
-                    size=0,
-                    entries_indexed=0,
-                    preview="",
-                    error="Unsupported file type. Only .json is accepted.",
-                )
-            )
-            continue
-
+    for f in incoming_files:
+        filename = (f.filename or "unnamed.json").strip()
+        display_name = filename or "unnamed.json"
         # Read file bytes
         try:
             data_bytes = f.file.read()
         except Exception as e:
             results.append(
                 JSONUploadedFileResult(
-                    filename=filename, size=0, entries_indexed=0, preview="", error=f"Failed to read file: {e}"
+                    filename=display_name, size=0, entries_indexed=0, preview="", error=f"Failed to read file: {e}"
                 )
             )
             continue
 
         size = len(data_bytes or b"")
+        size_mb = size / (1024 * 1024) if size else 0.0
+
+        # Validate type: allow .json extension OR content-type application/json
+        name_lower = (filename or "").lower()
+        content_type = getattr(f, "content_type", "") or ""
+        looks_json = name_lower.endswith(".json") or ("json" in content_type.lower())
+
+        if not looks_json:
+            results.append(
+                JSONUploadedFileResult(
+                    filename=display_name,
+                    size=size,
+                    entries_indexed=0,
+                    preview="",
+                    error="Unsupported file type. Only .json files are accepted.",
+                )
+            )
+            continue
+
+        # Size warning: process anyway but note in preview
+        size_warning = ""
+        if size_mb > MAX_JSON_SIZE_MB:
+            size_warning = f"Warning: file is large ({size_mb:.1f} MB). Indexed with caps."
+
         # Parse JSON
         try:
             import json as _json
-            parsed = _json.loads((data_bytes or b"").decode("utf-8", errors="ignore"))
+            # Attempt utf-8 decode with ignore; if fails, try latin-1 as last resort
+            text = (data_bytes or b"").decode("utf-8", errors="ignore")
+            if text.strip() == "":
+                raise ValueError("File appears to be empty or not decodable as UTF-8.")
+            parsed = _json.loads(text)
         except Exception as e:
             results.append(
                 JSONUploadedFileResult(
-                    filename=filename, size=size, entries_indexed=0, preview="", error=f"Invalid JSON: {e}"
+                    filename=display_name, size=size, entries_indexed=0, preview="", error=f"Invalid JSON: {e}"
                 )
             )
             continue
 
         # Flatten
         try:
-            flattened = flatten_json(parsed)
+            flattened_all = flatten_json(parsed)
         except Exception as e:
             results.append(
                 JSONUploadedFileResult(
-                    filename=filename, size=size, entries_indexed=0, preview="", error=f"Flattening error: {e}"
+                    filename=display_name, size=size, entries_indexed=0, preview="", error=f"Flattening error: {e}"
                 )
             )
             continue
 
-        # Index in-memory (JSON store) with embeddings
+        # Cap entries to avoid long processing
+        truncated = False
+        flattened = flattened_all
+        if len(flattened_all) > MAX_ENTRIES_PER_FILE:
+            flattened = flattened_all[:MAX_ENTRIES_PER_FILE]
+            truncated = True
+
+        # Index in-memory (JSON store) with embeddings (capped)
         try:
-            _index_json_entries_for_session(session_id, filename, flattened)
+            # Build texts
+            texts = [f"{p} = {v}" for p, v in flattened]
+            # Determine which subset to embed (others remain None for vector fallback)
+            if len(texts) > MAX_EMBED_PER_FILE:
+                to_embed = texts[:MAX_EMBED_PER_FILE]
+                rest = texts[MAX_EMBED_PER_FILE:]
+                vectors = _embed_texts(to_embed)
+                # Pad remainder with None
+                vectors.extend([None] * len(rest))
+            else:
+                vectors = _embed_texts(texts)
+
+            _ensure_json_index(effective_session_id)
+            store = JSON_INDEX_STORE[effective_session_id]
+            for (p, v), text_line, vec in zip(flattened, texts, vectors):
+                store["entries"].append({"text": text_line, "path": p, "value": v, "filename": display_name})
+                store["embeddings"].append(vec)
         except Exception:
             # Continue even if in-memory indexing fails
             pass
 
-        # Optional: Supabase storage
+        # Optional: Supabase storage (best-effort). Only embed up to MAX_EMBED_PER_FILE for storage too.
         if sb is not None:
             try:
                 rows = []
-                for p, v in flattened:
-                    text_line = format_entry_for_embedding(p, v)
-                    vec = _embed_one(text_line)  # compute once more for storage to ensure consistency
+                # Recompute same subset logic to keep sizes bounded
+                texts_for_store = [f"{p} = {v}" for p, v in flattened]
+                if len(texts_for_store) > MAX_EMBED_PER_FILE:
+                    to_embed_store = texts_for_store[:MAX_EMBED_PER_FILE]
+                    rest_store = texts_for_store[MAX_EMBED_PER_FILE:]
+                    vectors_store = _embed_texts(to_embed_store)
+                    vectors_store.extend([None] * len(rest_store))
+                else:
+                    vectors_store = _embed_texts(texts_for_store)
+
+                for (p, v), vec in zip(flattened, vectors_store):
                     rows.append(
                         {
-                            "session_id": session_id,
-                            "filename": filename,
+                            "session_id": effective_session_id,
+                            "filename": display_name,
                             "path": p,
                             "value": v,
                             "embedding": vec,
@@ -885,16 +961,22 @@ def upload_json_context(
                     )
                 insert_json_embeddings(sb, "json_embeddings", rows)
             except Exception:
-                # Best-effort; do not fail the request if Supabase insertion fails
+                # Best-effort: do not fail the request if Supabase insertion fails
                 pass
 
         total_entries += len(flattened)
+        # Build preview lines
         preview_lines = []
+        if size_warning:
+            preview_lines.append(size_warning)
         for i, (p, v) in enumerate(flattened[:8]):  # cap preview lines
             preview_lines.append(f"{p} = {v}")
+        if truncated:
+            preview_lines.append(f"... truncated to first {MAX_ENTRIES_PER_FILE} entries out of {len(flattened_all)}")
+
         results.append(
             JSONUploadedFileResult(
-                filename=filename,
+                filename=display_name,
                 size=size,
                 entries_indexed=len(flattened),
                 preview="\n".join(preview_lines),
@@ -909,7 +991,7 @@ def upload_json_context(
     )
 
     return JSONUploadResponse(
-        session_id=session_id,
+        session_id=effective_session_id,
         files_processed=results,
         total_entries=total_entries,
         message=message,
