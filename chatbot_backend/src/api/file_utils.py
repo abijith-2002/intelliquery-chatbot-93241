@@ -709,3 +709,271 @@ def extract_json_as_rowwise_records(
         return [], f"Invalid JSON: {e.msg} at line {e.lineno} column {e.colno}"
     except Exception as e:
         return [], f"Failed to parse JSON rows for '{filename}': {e}"
+
+
+def _value_type_name(v: Any) -> str:
+    """Return a concise JSON type name for value v."""
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "boolean"
+    if isinstance(v, (int, float)):
+        return "number"
+    if isinstance(v, str):
+        return "string"
+    if isinstance(v, list):
+        return "array"
+    if isinstance(v, dict):
+        return "object"
+    return type(v).__name__
+
+
+def _detect_array_is_objects(arr: List[Any]) -> bool:
+    """True if majority of elements are dicts."""
+    if not arr:
+        return False
+    dict_count = sum(1 for x in arr if isinstance(x, dict))
+    return dict_count >= max(1, len(arr) // 2)
+
+
+def _collect_types_for_fields(records: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Infer a primary type per field from sample records."""
+    type_map: Dict[str, str] = {}
+    for rec in records:
+        for k, v in rec.items():
+            t = _value_type_name(v)
+            # Prefer a stable type, but if multiple seen, mark as 'mixed'
+            if k not in type_map:
+                type_map[k] = t
+            elif type_map[k] != t:
+                type_map[k] = "mixed"
+    return type_map
+
+
+def _build_uniques_map(records: List[Dict[str, Any]], columns: List[str], limit: int) -> Dict[str, List[str]]:
+    """Collect up to 'limit' unique non-empty string representations per column."""
+    uniques: Dict[str, set] = {c: set() for c in columns}
+    for rec in records:
+        _update_uniques(uniques, columns, rec, limit)
+    # Convert to sorted lists
+    return {
+        col: sorted([v for v in vals if isinstance(v, str) and v.strip() != ""])[: limit]
+        for col, vals in uniques.items()
+        if any((isinstance(v, str) and v.strip() != "") for v in vals)
+    }
+
+
+def _chunk_text_block(title: str, body_lines: List[str]) -> str:
+    """Construct a readable chunk text with a title header and body lines."""
+    lines = [title]
+    lines.extend(body_lines)
+    return "\n".join(lines).strip()
+
+
+def _cap_list(items: List[Any], limit: int) -> List[Any]:
+    return items[:limit] if len(items) > limit else items
+
+
+# PUBLIC_INTERFACE
+def generate_json_rag_chunks(
+    filename: str,
+    content: bytes,
+    *,
+    record_sample_limit: int = None,
+    unique_values_limit: int = None,
+    chunks_max: int = None,
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """
+    PUBLIC_INTERFACE
+    Generate embeddable chunks from a JSON file with adaptive, schema-aware strategy.
+
+    Produces:
+      - Schema overview chunks for array-of-objects datasets (root or nested)
+      - Per-field chunks containing type and unique/sample values
+      - Sample rows chunks, grouped to keep examples compact
+      - For nested objects/arrays under a root object, creates path-prefixed chunks
+      - For primitive/mixed arrays, produces an element-types summary with sample values
+
+    Each chunk is a dict:
+      {
+        "text": "<embeddable text>",
+        "meta": {
+            "type": "json_schema" | "json_field" | "json_rows" | "json_array_summary" | "json_nested_keys",
+            "filename": "<filename>",
+            "dataset": "<root or object key path>",
+            "path": "<field dot path>" (for json_field),
+            "field_type": "<string|number|boolean|null|object|array|mixed>",
+            "approx_count": <int> (rows or elements),
+        }
+      }
+
+    Limits (overridable via env or parameters):
+      - FILE_EXTRACT_JSON_SCAN_ROWS (default 1000): Rows scanned to infer columns
+      - FILE_EXTRACT_JSON_SAMPLE_ROWS (default 50): Sample rows count per dataset
+      - FILE_EXTRACT_JSON_UNIQUE_LIMIT (default 50): Max unique values per field
+      - FILE_JSON_CHUNKS_MAX (default 200): Cap on total chunks returned
+
+    Returns:
+      Tuple[List[Dict[str, Any]], Optional[str]]: (chunks, error)
+    """
+    try:
+        raw = (content or b"").decode("utf-8", errors="ignore").strip()
+        if raw == "":
+            return [], "Empty JSON content."
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return [], f"Invalid JSON: {e.msg} at line {e.lineno} column {e.colno}"
+    except Exception as e:
+        return [], f"Failed to parse JSON: {e}"
+
+    scan_rows = _safe_int_env("FILE_EXTRACT_JSON_SCAN_ROWS", 1000)
+    sample_rows = record_sample_limit if record_sample_limit is not None else _safe_int_env("FILE_EXTRACT_JSON_SAMPLE_ROWS", 50)
+    unique_limit = unique_values_limit if unique_values_limit is not None else _safe_int_env("FILE_EXTRACT_JSON_UNIQUE_LIMIT", 50)
+    chunks_cap = chunks_max if chunks_max is not None else _safe_int_env("FILE_JSON_CHUNKS_MAX", 200)
+
+    chunks: List[Dict[str, Any]] = []
+
+    def add_chunk(text: str, meta: Dict[str, Any]):
+        if not text or not text.strip():
+            return
+        if len(chunks) >= chunks_cap:
+            return
+        chunks.append({"text": text.strip(), "meta": {"filename": filename, **meta}})
+
+    def from_array_of_objects(arr: List[Any], dataset_name: str):
+        # Flatten sample records
+        flattened: List[Dict[str, Any]] = []
+        for item in arr:
+            if isinstance(item, dict):
+                flattened.append(_flatten_to_record(item, max_depth=2))
+                if len(flattened) >= scan_rows:
+                    break
+        # Columns and types
+        columns_set = set()
+        for rec in flattened:
+            for k in rec.keys():
+                columns_set.add(k)
+        columns = sorted(list(columns_set))
+        type_map = _collect_types_for_fields(flattened)
+        approx_count = len([x for x in arr if isinstance(x, dict)])
+
+        # Schema overview chunk
+        schema_lines = [
+            f"Dataset: {dataset_name}",
+            f"Columns ({len(columns)}): {json.dumps(columns, ensure_ascii=False)}",
+            "Field types:",
+            json.dumps(type_map, ensure_ascii=False, indent=2),
+            f"Approximate row count (objects): {approx_count}",
+        ]
+        add_chunk(
+            _chunk_text_block("JSON Schema Overview", schema_lines),
+            {"type": "json_schema", "dataset": dataset_name, "approx_count": approx_count},
+        )
+
+        # Per-field unique values chunks
+        uniques_map = _build_uniques_map(flattened, columns, unique_limit)
+        for fld in columns:
+            # Per-field type and uniques
+            ftype = type_map.get(fld, "unknown")
+            uniques = uniques_map.get(fld, [])
+            field_lines = [
+                f"Field: {fld}",
+                f"Type: {ftype}",
+            ]
+            if uniques:
+                field_lines.append(f"Unique values (first {len(uniques)}):")
+                field_lines.append(json.dumps(uniques, ensure_ascii=False, indent=2))
+            add_chunk(
+                _chunk_text_block("JSON Field Details", field_lines),
+                {"type": "json_field", "dataset": dataset_name, "path": fld, "field_type": ftype, "approx_count": approx_count},
+            )
+
+            if len(chunks) >= chunks_cap:
+                break
+        # Sample rows chunk(s)
+        if flattened:
+            sample = _cap_list(flattened, sample_rows)
+            rows_text = json.dumps(sample, ensure_ascii=False, indent=2)
+            add_chunk(
+                _chunk_text_block("JSON Sample Rows", [f"Dataset: {dataset_name}", rows_text]),
+                {"type": "json_rows", "dataset": dataset_name, "approx_count": approx_count},
+            )
+
+    def from_primitive_or_mixed_array(arr: List[Any], dataset_name: str):
+        types = sorted({ _value_type_name(x) for x in arr })
+        sample_vals = []
+        for v in arr[:min(len(arr), 50)]:
+            if isinstance(v, (dict, list)):
+                try:
+                    sample_vals.append(json.dumps(v, ensure_ascii=False))
+                except Exception:
+                    sample_vals.append(str(v))
+            else:
+                sample_vals.append(str(v))
+        lines = [
+            f"Array: {dataset_name}",
+            f"Length: {len(arr)}",
+            f"Element types: {types}",
+            "Sample values:",
+            json.dumps(sample_vals, ensure_ascii=False, indent=2),
+        ]
+        add_chunk(
+            _chunk_text_block("JSON Array Summary", lines),
+            {"type": "json_array_summary", "dataset": dataset_name, "approx_count": len(arr)},
+        )
+
+    def process_node(node: Any, dataset_name: str):
+        # Adaptive behavior per node type
+        if isinstance(node, list):
+            if _detect_array_is_objects(node):
+                from_array_of_objects(node, dataset_name)
+            else:
+                from_primitive_or_mixed_array(node, dataset_name)
+        elif isinstance(node, dict):
+            # Nested keys overview
+            nested_keys = _flatten_keys(node, parent="", max_depth=2)
+            if nested_keys:
+                add_chunk(
+                    _chunk_text_block(
+                        "JSON Nested Keys",
+                        [f"Under: {dataset_name}", f"Keys ({len(nested_keys)}):", json.dumps(sorted(nested_keys), ensure_ascii=False, indent=2)],
+                    ),
+                    {"type": "json_nested_keys", "dataset": dataset_name, "approx_count": len(nested_keys)},
+                )
+            # Explore child arrays/objects
+            for k, v in node.items():
+                ds = f"{dataset_name}.{k}" if dataset_name else k
+                if isinstance(v, (list, dict)):
+                    process_node(v, ds)
+
+    # Root handling
+    if isinstance(data, list):
+        if _detect_array_is_objects(data):
+            process_node(data, dataset_name="root")
+        else:
+            from_primitive_or_mixed_array(data, dataset_name="root")
+    elif isinstance(data, dict):
+        # High-level summary for root keys/types
+        keys = list(data.keys())
+        type_map = {k: _value_type_name(data[k]) for k in keys}
+        add_chunk(
+            _chunk_text_block(
+                "JSON Object Overview",
+                [
+                    f"Top-level keys ({len(keys)}): {json.dumps(keys, ensure_ascii=False)}",
+                    "Key types:",
+                    json.dumps(type_map, ensure_ascii=False, indent=2),
+                ],
+            ),
+            {"type": "json_schema", "dataset": "root", "approx_count": len(keys)},
+        )
+        # Visit children
+        process_node(data, dataset_name="root")
+    else:
+        # Scalar root
+        add_chunk(
+            f"JSON Scalar root of type { _value_type_name(data) }: {str(data)[:500]}",
+            {"type": "json_array_summary", "dataset": "root", "approx_count": 1},
+        )
+
+    return chunks, None

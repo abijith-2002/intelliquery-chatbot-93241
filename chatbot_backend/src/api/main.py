@@ -364,6 +364,35 @@ def _index_text_for_session(session_id: str, filename: str, text: str):
         store["embeddings"].append(vec)  # vec could be None; retrieval handles fallback
 
 
+def _index_structured_chunks_for_session(session_id: str, chunks: List[Dict[str, Any]]):
+    """
+    Index pre-built structured chunks with metadata.
+
+    Each item in 'chunks' should be of the form:
+      {"text": "<chunk text>", "meta": {...}}
+
+    This function embeds per chunk text and stores meta for downstream retrieval.
+    """
+    _ensure_session_index(session_id)
+    texts: List[str] = []
+    metas: List[Dict[str, Any]] = []
+    for ch in (chunks or []):
+        t = (ch.get("text") or "").strip()
+        if not t:
+            continue
+        texts.append(t)
+        metas.append(ch.get("meta") or {})
+
+    if not texts:
+        return
+
+    vectors = _embed_texts(texts)
+    store = RAG_INDEX_STORE[session_id]
+    for t, vec, meta in zip(texts, vectors, metas):
+        store["chunks"].append({"text": t, "filename": meta.get("filename") or "", "meta": meta})
+        store["embeddings"].append(vec)
+
+
 def _vector_search(session_id: str, query: str, top_k: int = 3) -> List[str]:
     """
     Perform semantic vector search for the top_k relevant chunks using cosine similarity
@@ -380,12 +409,18 @@ def _vector_search(session_id: str, query: str, top_k: int = 3) -> List[str]:
     query_vec = _embed_one(query)
     if query_vec:
         scored = []
+        schema_list_query = _is_schema_or_list_query(query)
         for item, vec in zip(index["chunks"], index["embeddings"]):
             if vec:
                 score = _cosine_similarity(query_vec, vec)
             else:
                 # If a particular chunk lacks embedding, degrade to lexical fallback for that item
                 score = _simple_similarity(query, item["text"])
+            # Boost schema/field chunks when query appears schema-oriented
+            if schema_list_query:
+                m = item.get("meta") or {}
+                if m.get("type") in {"json_field", "json_schema"}:
+                    score *= 1.15
             scored.append((score, item["text"]))
         scored.sort(key=lambda x: x[0], reverse=True)
         return [text for _, text in scored[:top_k]]
@@ -884,6 +919,7 @@ async def upload_chat_context(
         summarize_text_preview,
         extract_xlsx_as_rowwise_json,
         extract_json_as_rowwise_records,
+        generate_json_rag_chunks,
     )
 
     if not session_id or not isinstance(session_id, str):
@@ -903,6 +939,12 @@ async def upload_chat_context(
             _index_text_for_session(sid, fname, txt)
         except Exception:
             # Swallow exceptions to prevent background task from crashing the server
+            pass
+
+    def _background_index_structured(sid: str, chunk_list: List[Dict[str, Any]]):
+        try:
+            _index_structured_chunks_for_session(sid, chunk_list or [])
+        except Exception:
             pass
 
     for f in files:
@@ -967,6 +1009,18 @@ async def upload_chat_context(
                     excel_rows_accumulator.extend(json_rows)
             except Exception as e:
                 preview = (preview + f" [JSON rows extraction error: {e}]").strip()
+            # Generate schema-aware chunks for JSON and index them in the background
+            try:
+                json_chunks, json_chunks_err = await run_in_threadpool(
+                    generate_json_rag_chunks, filename, data or b""
+                )
+                if json_chunks_err:
+                    preview = (preview + f" [JSON chunking warn: {json_chunks_err}]").strip()
+                elif json_chunks:
+                    if background_tasks is not None:
+                        background_tasks.add_task(_background_index_structured, session_id, json_chunks)
+            except Exception as e:
+                preview = (preview + f" [JSON chunking error: {e}]").strip()
 
         # Append to combined only if successful and non-empty
         if text and not err:
