@@ -9,7 +9,7 @@
 # Without this, Gemini responses will be unavailable and fallback messaging will appear.
 # ==============================================================================
 
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Dict, Any, Tuple
@@ -772,9 +772,9 @@ def upload_chat_context(
         "in a vector database (Supabase, if configured). Also stores an in-memory index for retrieval. "
         "These JSON facts are prioritized during RAG for subsequent chats in the same session.\n\n"
         "Compatibility notes:\n"
-        "- Supports common frontend field names for file uploads: 'files', 'file', 'attachment', 'attachments'.\n"
+        "- Supports common frontend field names for file uploads: 'files', 'file', 'attachment', 'attachments'. Also detects any UploadFile in the multipart form (e.g., 'attachments[]').\n"
         "- Accepts session_id as 'session_id' or 'sessionId' form fields.\n"
-        "- Caps extremely large JSONs to avoid timeouts and gateway errors."
+        "- Caps extremely large JSONs and embedding counts to avoid timeouts and gateway errors."
     ),
     responses={
         400: {"description": "Validation error or no files provided"},
@@ -782,7 +782,8 @@ def upload_chat_context(
         500: {"description": "Unexpected processing error"},
     },
 )
-def upload_json_context(
+async def upload_json_context(
+    request: Request,
     # Session ID aliases for compatibility with various frontends
     session_id: Optional[str] = Form(default=None, description="Session ID to associate uploaded JSON context with"),
     sessionId: Optional[str] = Form(default=None, description="Alias for session_id used by some clients"),
@@ -806,20 +807,22 @@ def upload_json_context(
     Args:
         session_id/sessionId (str): The chat session ID.
         files/file/attachment/attachments: Uploaded JSON files (multipart/form-data). Accepts common field names.
+        Additionally, any UploadFile present in the multipart form (e.g., 'attachments[]') will be detected.
 
     Returns:
         JSONUploadResponse: Processing results and acknowledgment.
     """
     # Limits to prevent long processing leading to 502/504 from proxies
-    MAX_JSON_SIZE_MB = 10  # soft limit; warn if exceeded
+    MAX_JSON_SIZE_MB = 10    # soft limit; warn if exceeded
     MAX_ENTRIES_PER_FILE = 5000  # cap number of flattened entries indexed per file
-    MAX_EMBED_PER_FILE = 400     # cap number of entries to embed per file (rest stored without embedding)
+    # Reduce embedding cap to minimize latency and avoid gateway timeouts
+    MAX_EMBED_PER_FILE = 120
 
     effective_session_id = (session_id or sessionId or "").strip() if (session_id or sessionId) else ""
     if not effective_session_id:
         raise HTTPException(status_code=400, detail="session_id must be provided as a non-empty string (session_id/sessionId).")
 
-    # Aggregate files from all supported fields
+    # Aggregate files from explicitly-declared fields
     incoming_files: List[UploadFile] = []
     if files:
         incoming_files.extend([f for f in files if f is not None])
@@ -830,8 +833,22 @@ def upload_json_context(
     if attachment:
         incoming_files.append(attachment)
 
+    # Fallback: If none detected yet, inspect the raw multipart form for ANY UploadFile (e.g., 'attachments[]')
     if not incoming_files:
-        raise HTTPException(status_code=400, detail="At least one .json file must be provided under files/file/attachment/attachments.")
+        try:
+            form = await request.form()
+            for _, value in form.multi_items():
+                if isinstance(value, UploadFile):
+                    incoming_files.append(value)
+        except Exception:
+            # If form parsing fails, proceed to validation error below
+            pass
+
+    if not incoming_files:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one .json file must be provided. Supported fields: files, file, attachment, attachments (or array forms like attachments[]).",
+        )
 
     # Attempt Supabase client (optional)
     sb = get_supabase_client()
@@ -842,9 +859,10 @@ def upload_json_context(
     for f in incoming_files:
         filename = (f.filename or "unnamed.json").strip()
         display_name = filename or "unnamed.json"
-        # Read file bytes
+
+        # Read file bytes (async-friendly)
         try:
-            data_bytes = f.file.read()
+            data_bytes = await f.read()
         except Exception as e:
             results.append(
                 JSONUploadedFileResult(
@@ -856,40 +874,29 @@ def upload_json_context(
         size = len(data_bytes or b"")
         size_mb = size / (1024 * 1024) if size else 0.0
 
-        # Validate type: allow .json extension OR content-type application/json
+        # Extension/type hints (non-blocking)
         name_lower = (filename or "").lower()
         content_type = getattr(f, "content_type", "") or ""
         looks_json = name_lower.endswith(".json") or ("json" in content_type.lower())
-
-        if not looks_json:
-            results.append(
-                JSONUploadedFileResult(
-                    filename=display_name,
-                    size=size,
-                    entries_indexed=0,
-                    preview="",
-                    error="Unsupported file type. Only .json files are accepted.",
-                )
-            )
-            continue
 
         # Size warning: process anyway but note in preview
         size_warning = ""
         if size_mb > MAX_JSON_SIZE_MB:
             size_warning = f"Warning: file is large ({size_mb:.1f} MB). Indexed with caps."
 
-        # Parse JSON
+        # Parse JSON (be permissive even for octet-stream or missing .json)
         try:
             import json as _json
-            # Attempt utf-8 decode with ignore; if fails, try latin-1 as last resort
             text = (data_bytes or b"").decode("utf-8", errors="ignore")
             if text.strip() == "":
                 raise ValueError("File appears to be empty or not decodable as UTF-8.")
             parsed = _json.loads(text)
         except Exception as e:
+            # If it doesn't even look like JSON and parse failed, return a clearer message
+            msg = f"Invalid JSON: {e}" if looks_json else f"Unsupported type or invalid JSON: {e}"
             results.append(
                 JSONUploadedFileResult(
-                    filename=display_name, size=size, entries_indexed=0, preview="", error=f"Invalid JSON: {e}"
+                    filename=display_name, size=size, entries_indexed=0, preview="", error=msg
                 )
             )
             continue
@@ -914,15 +921,12 @@ def upload_json_context(
 
         # Index in-memory (JSON store) with embeddings (capped)
         try:
-            # Build texts
             texts = [f"{p} = {v}" for p, v in flattened]
-            # Determine which subset to embed (others remain None for vector fallback)
             if len(texts) > MAX_EMBED_PER_FILE:
                 to_embed = texts[:MAX_EMBED_PER_FILE]
                 rest = texts[MAX_EMBED_PER_FILE:]
                 vectors = _embed_texts(to_embed)
-                # Pad remainder with None
-                vectors.extend([None] * len(rest))
+                vectors.extend([None] * len(rest))  # pad remainder
             else:
                 vectors = _embed_texts(texts)
 
@@ -935,11 +939,10 @@ def upload_json_context(
             # Continue even if in-memory indexing fails
             pass
 
-        # Optional: Supabase storage (best-effort). Only embed up to MAX_EMBED_PER_FILE for storage too.
+        # Optional Supabase storage (best-effort)
         if sb is not None:
             try:
-                rows = []
-                # Recompute same subset logic to keep sizes bounded
+                rows: List[Dict[str, Any]] = []
                 texts_for_store = [f"{p} = {v}" for p, v in flattened]
                 if len(texts_for_store) > MAX_EMBED_PER_FILE:
                     to_embed_store = texts_for_store[:MAX_EMBED_PER_FILE]
@@ -966,7 +969,7 @@ def upload_json_context(
 
         total_entries += len(flattened)
         # Build preview lines
-        preview_lines = []
+        preview_lines: List[str] = []
         if size_warning:
             preview_lines.append(size_warning)
         for i, (p, v) in enumerate(flattened[:8]):  # cap preview lines
