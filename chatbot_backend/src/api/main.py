@@ -12,7 +12,7 @@
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 import google.generativeai as genai
 
 from dotenv import load_dotenv
@@ -166,7 +166,6 @@ def _clean_gemini_output(text: str) -> str:
 
 
 # --- CONTEXT + RAG UTILITIES ---
-
 def _tokenize(s: str) -> List[str]:
     import re
     return [t for t in re.findall(r"[A-Za-z0-9]+", (s or "").lower()) if t]
@@ -357,36 +356,81 @@ def _index_text_for_session(session_id: str, filename: str, text: str):
     _index_documents_for_session(session_id, documents)
 
 
-def _vector_search(session_id: str, query: str, top_k: int = 3) -> List[str]:
+def _score_items_with_query(session_id: str, query: str) -> List[Tuple[float, Dict[str, Any]]]:
     """
-    Perform semantic vector search for the top_k relevant chunks using cosine similarity
-    against Gemini embeddings. If embeddings are not available, falls back to lexical similarity.
-
-    Returns:
-        List[str]: The text of the top-k retrieved chunks.
+    Compute scores for each stored chunk/document against the query and return scored pairs.
+    Uses cosine similarity when embeddings exist; otherwise falls back to lexical similarity.
     """
     index = RAG_INDEX_STORE.get(session_id)
     if not index or not index.get("chunks"):
         return []
 
-    # Try vector search
     query_vec = _embed_one(query)
-    if query_vec:
-        scored = []
-        for item, vec in zip(index["chunks"], index["embeddings"]):
-            if vec:
-                score = _cosine_similarity(query_vec, vec)
-            else:
-                # If a particular chunk lacks embedding, degrade to lexical fallback for that item
-                score = _simple_similarity(query, item["text"])
-            scored.append((score, item["text"]))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [text for _, text in scored[:top_k]]
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    for item, vec in zip(index["chunks"], index["embeddings"]):
+        if query_vec and vec:
+            score = _cosine_similarity(query_vec, vec)
+        else:
+            score = _simple_similarity(query, item["text"])
+        scored.append((score, item))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored
 
-    # Fallback: lexical similarity if no query embedding
-    scored_lex = [(_simple_similarity(query, item["text"]), item["text"]) for item in index["chunks"]]
-    scored_lex.sort(key=lambda x: x[0], reverse=True)
-    return [text for _, text in scored_lex[:top_k]]
+
+def _retrieve_top_items(session_id: str, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    """
+    Retrieve the top_k metadata-rich items for a given session and query.
+    Each item includes: text, filename, metadata.
+
+    Returns:
+        List[Dict]: Top-k items sorted by relevance score (desc).
+    """
+    scored = _score_items_with_query(session_id, query)
+    return [item for _, item in scored[:top_k]]
+
+
+def _format_snippet(text: str, max_chars: int = 600) -> str:
+    """Return a compact, single-line snippet for display in Sources."""
+    if not text:
+        return ""
+    snippet = " ".join(text.split())
+    if len(snippet) > max_chars:
+        return snippet[: max_chars - 3] + "..."
+    return snippet
+
+
+def _build_sources_section(items: List[Dict[str, Any]]) -> str:
+    """
+    Build a 'Sources' section for the LLM prompt, enumerated with [n] markers.
+
+    Each entry includes:
+        - [n] filename (if any), record_id (if any), and json_path (if any)
+        - Snippet: a compact preview of the text
+
+    Returns a multi-line string safe to include in the prompt.
+    """
+    if not items:
+        return ""
+    lines: List[str] = ["Sources:"]
+    for idx, it in enumerate(items, start=1):
+        md = it.get("metadata") or {}
+        filename = md.get("source_filename") or it.get("filename") or "unknown"
+        record_id = md.get("record_id")
+        json_path = md.get("json_path")
+        # Build source header
+        header_parts = [filename]
+        if record_id:
+            header_parts.append(f"record_id={record_id}")
+        if json_path:
+            header_parts.append(f"path={json_path}")
+        header = " | ".join(header_parts)
+        snippet = _format_snippet(it.get("text", ""))
+        lines.append(f"[{idx}] {header}")
+        if snippet:
+            lines.append(f"Snippet: {snippet}")
+        # Add a blank line after each source for readability
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 # PUBLIC_INTERFACE
@@ -394,36 +438,59 @@ def get_gemini_response(
     query: str,
     memory: ConversationBufferMemory,
     extra_context: str = "",
+    retrieved_items: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """
     PUBLIC_INTERFACE
     Enhance the answer using Google Gemini API, considering the chat context and any user-uploaded context.
 
-    Never include statements about sources, knowledge base, RAG, or meta-assertions in the prompt or response.
+    This version builds a 'Sources' section for the LLM prompt from the metadata-rich retrieved items.
+    The model is instructed to include bracket-style citations [n] in the final answer corresponding to the
+    enumerated sources when facts are supported by them.
 
     Args:
         query (str): User query.
         memory (ConversationBufferMemory): Conversation memory buffer.
-        extra_context (str): Additional, retrieved context from uploaded files. May be empty.
+        extra_context (str): Legacy additional context; still used if provided.
+        retrieved_items (Optional[List[Dict[str, Any]]]): Metadata-rich retrieval results to form 'Sources'.
 
     Returns:
-        str: Model answer.
+        str: Model answer with [n] style citations grounded in provided sources where applicable.
     """
     mem_str = memory.buffer_as_str if hasattr(memory, "buffer_as_str") else ""
-    # Trim extra context to a reasonable size to avoid overwhelming the model
+    # Build Sources section (preferred) and a compact retrieved-context block (fallback/extra)
+    sources_section = _build_sources_section(retrieved_items or [])
     MAX_CONTEXT_CHARS = 12000
     trimmed_extra = (extra_context or "").strip()
     if len(trimmed_extra) > MAX_CONTEXT_CHARS:
         trimmed_extra = trimmed_extra[: MAX_CONTEXT_CHARS]
 
-    # Compose prompt with uploaded/retrieved context primarily.
-    prompt = (
-        f"You are an expert software assistant.\n"
-        f"User's question: '{query}'\n"
-        f"{f'Additional user-provided context (may be relevant):\n{trimmed_extra}\n' if trimmed_extra else ''}"
-        f"Conversation history:\n{mem_str}\n"
-        f"Please answer the user's latest question. Be concise and clear."
+    # Compose prompt
+    instructions = (
+        "You are an expert software assistant.\n"
+        "Use ONLY the information from the enumerated Sources if relevant to answer the user's latest question.\n"
+        "When you use any specific fact from a source, include a bracket citation matching the source number, e.g., [1].\n"
+        "If multiple sources support a statement, include multiple citations like [1][3].\n"
+        "Do not invent citations and do not reference sources that are not listed.\n"
+        "If the answer is not supported by the provided Sources, say you cannot find relevant information in the provided sources and answer based on general knowledge only if explicitly asked.\n"
+        "Be concise and clear.\n"
     )
+
+    parts = [
+        instructions,
+        f"User's question:\n{query}",
+    ]
+
+    if sources_section:
+        parts.append("\n" + sources_section)
+
+    if trimmed_extra:
+        parts.append("\nAdditional user-provided context (may be relevant):\n" + trimmed_extra)
+
+    if mem_str:
+        parts.append("\nConversation history:\n" + mem_str)
+
+    prompt = "\n\n".join(parts).strip()
 
     gemini_api_key = get_gemini_api_key()
     if not gemini_api_key:
@@ -467,6 +534,11 @@ def chat(request: ChatRequest):
     Handles user's chat request. All answers come directly from Gemini.
     If the user has uploaded files for this session, the most relevant snippets from those files are retrieved
     via semantic vector search and provided as additional context to Gemini. The API returns only Gemini's final answer.
+
+    This version:
+        - Retrieves metadata-rich chunks (with filename, json_path, record_id, etc.) for better grounding.
+        - Constructs a 'Sources' section for the prompt.
+        - Instructs the model to include [n] citations tied to the listed Sources.
     """
     import traceback
 
@@ -493,13 +565,19 @@ def chat(request: ChatRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
 
-        # Retrieve top-k relevant chunks from vector index
-        top_chunks = _vector_search(session_id, request.query, top_k=3)
-        retrieved_context = "\n---\n".join(top_chunks).strip()
+        # Retrieve top-k relevant metadata-rich items from vector index
+        retrieved_items = _retrieve_top_items(session_id, request.query, top_k=3)
+        # Keep backward-compatible aggregated raw context, in case the model benefits from it
+        retrieved_context = "\n---\n".join([item.get("text", "") for item in retrieved_items]).strip()
 
-        # Compose Gemini answer with retrieved context (if any)
+        # Compose Gemini answer with retrieved Sources
         try:
-            gemini_answer = get_gemini_response(request.query, memory, extra_context=retrieved_context)
+            gemini_answer = get_gemini_response(
+                request.query,
+                memory,
+                extra_context=retrieved_context,
+                retrieved_items=retrieved_items
+            )
         except Exception as e:
             gemini_answer = "[Gemini unavailable: {}]".format(e)
 
