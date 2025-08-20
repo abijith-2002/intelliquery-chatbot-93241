@@ -412,17 +412,20 @@ def _vector_search(session_id: str, query: str, top_k: int = 3) -> List[str]:
     return [it["text"] for it in items]
 
 
-def _vector_search_items(session_id: str, query: str, top_k: int = 6) -> List[Dict[str, Any]]:
+def _vector_search_items(
+    session_id: str,
+    query: str,
+    top_k: int = 6,
+    restrict_source_types: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
     """
     Retrieve the top-k items (with metadata) relevant to the user query.
 
     This function now combines:
       - In-memory session index items (built from current process uploads)
-      - Persisted items from the vector database, specifically Excel row documents,
-        so that row-level content is available even after restarts.
+      - Persisted items from the vector database (e.g., per-row Excel documents)
 
-    JSON facts receive a small boost to surface prominently. Excel row documents
-    are also boosted slightly to prioritize structured row-level context.
+    Optionally restricts candidate items by source_type via `restrict_source_types`.
 
     Returns:
         List[Dict[str, Any]]: Items with fields {text, filename, source_type, key?}
@@ -436,13 +439,15 @@ def _vector_search_items(session_id: str, query: str, top_k: int = 6) -> List[Di
     index = RAG_INDEX_STORE.get(session_id)
     if index and index.get("chunks"):
         for item, vec in zip(index["chunks"], index["embeddings"]):
+            if restrict_source_types and item.get("source_type") not in restrict_source_types:
+                continue
             combined_items.append((item, vec))
 
-    # 2) Persisted items from DB: focus on Excel row documents to satisfy task requirements
+    # 2) Persisted items from DB
     try:
         db_items = vector_store.get_session_embedding_items(
             session_id=session_id,
-            source_types=["xlsx_row"],  # specifically ensure row-level retrieval
+            source_types=restrict_source_types or None,
             max_records=5000,
         )
         # Deduplicate against in-memory by (text, source_type)
@@ -492,39 +497,50 @@ def _vector_search_items(session_id: str, query: str, top_k: int = 6) -> List[Di
 def get_gemini_response(
     query: str,
     memory: ConversationBufferMemory,
-    extra_context: str = "",
+    row_docs: List[str],
 ) -> str:
     """
     PUBLIC_INTERFACE
-    Enhance the answer using Google Gemini API, considering the chat context and any user-uploaded context.
+    Generate an answer using Google Gemini API strictly based on the provided Excel row
+    documents retrieved from the vector database.
 
-    Never include statements about sources, knowledge base, RAG, or meta-assertions in the prompt or response.
+    The model must NOT use external knowledge or assumptions; if the rows do not provide
+    sufficient information to answer, it should respond:
+        "I don't have sufficient information in the provided Excel rows to answer that."
 
     Args:
         query (str): User query.
-        memory (ConversationBufferMemory): Conversation memory buffer.
-        extra_context (str): Additional, retrieved context from uploaded files. May be empty.
-            Place any JSON 'Key facts' section first in this string to ensure primacy.
+        memory (ConversationBufferMemory): Conversation memory buffer. This is used only
+            for conversational phrasing/continuity, not as a source of facts.
+        row_docs (List[str]): The retrieved Excel row documents to use as the sole knowledge
+            context. Each string should already include sheet/row info when available.
 
     Returns:
-        str: Model answer.
+        str: Model answer derived only from the provided row documents.
     """
     mem_str = memory.buffer_as_str if hasattr(memory, "buffer_as_str") else ""
-    # Trim extra context to a reasonable size to avoid overwhelming the model
+    # Limit number and size of row docs to keep prompt manageable
+    MAX_ROWS = 10
     MAX_CONTEXT_CHARS = 12000
-    trimmed_extra = (extra_context or "").strip()
-    if len(trimmed_extra) > MAX_CONTEXT_CHARS:
-        trimmed_extra = trimmed_extra[: MAX_CONTEXT_CHARS]
 
-    # Compose prompt with JSON-derived facts as primary context when present.
+    selected_rows = (row_docs or [])[:MAX_ROWS]
+    rows_block = "\n".join(f"- {doc}" for doc in selected_rows).strip()
+    if len(rows_block) > MAX_CONTEXT_CHARS:
+        rows_block = rows_block[:MAX_CONTEXT_CHARS]
+
+    instruction = (
+        "You are an assistant that answers questions using ONLY the following Excel row documents.\n"
+        "Do not use any outside knowledge or assumptions. If the rows do not contain the answer,\n"
+        "reply exactly: \"I don't have sufficient information in the provided Excel rows to answer that.\""
+    )
+
     prompt = (
-        "You are an expert software assistant.\n"
-        f"User's question: '{query}'\n"
-        f"{f'Context for answering (use any Key facts first if present):\n{trimmed_extra}\n' if trimmed_extra else ''}"
-        f"Conversation history:\n{mem_str}\n"
-        "Answer the user's latest question. Be concise and clear. If a 'Key facts from uploaded JSON' section "
-        "is present in the context, rely on those facts first and treat them as authoritative; use additional "
-        "context only to elaborate or provide background."
+        f"{instruction}\n\n"
+        f"Excel row documents:\n{rows_block if rows_block else '(none)'}\n\n"
+        f"Conversation history (do not use as a source of facts):\n{mem_str}\n\n"
+        f"User's question:\n{query}\n\n"
+        "Now answer strictly using only the content of the Excel row documents. If needed, quote the relevant\n"
+        "values from the rows. If the documents are insufficient, use the required fallback sentence exactly."
     )
 
     gemini_api_key = get_gemini_api_key()
@@ -534,7 +550,7 @@ def get_gemini_response(
         genai.configure(api_key=gemini_api_key)
         model = genai.GenerativeModel("gemini-2.5-flash")
         response = model.generate_content([{"role": "user", "parts": [prompt]}])
-        raw_answer = response.text.strip()
+        raw_answer = (response.text or "").strip()
         return _clean_gemini_output(raw_answer)
     except Exception as e:
         # Fallback to minimal message if Gemini API fails
@@ -595,23 +611,22 @@ def chat(request: ChatRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
 
-        # Retrieve top-k relevant chunks from vector index, ensuring JSON facts are surfaced
-        top_items = _vector_search_items(session_id, request.query, top_k=6)
-        json_facts = [f"- {it['text']}" for it in top_items if it.get("source_type") == "json_kv"][:5]
-        other_ctx = [it["text"] for it in top_items if it.get("source_type") != "json_kv"][:3]
+        # Retrieve top-k relevant Excel row documents and force LLM to answer using only these rows
+        top_items = _vector_search_items(
+            session_id,
+            request.query,
+            top_k=8,
+            restrict_source_types=["xlsx_row"],
+        )
+        excel_rows = [it["text"] for it in top_items][:6]
 
-        context_parts: List[str] = []
-        if json_facts:
-            context_parts.append("Key facts from uploaded JSON:\n" + "\n".join(json_facts))
-        if other_ctx:
-            context_parts.append("Other relevant context:\n" + "\n---\n".join(other_ctx))
-        retrieved_context = "\n\n".join(context_parts).strip()
-
-        # Compose Gemini answer with retrieved context (if any)
-        try:
-            gemini_answer = get_gemini_response(request.query, memory, extra_context=retrieved_context)
-        except Exception as e:
-            gemini_answer = "[Gemini unavailable: {}]".format(e)
+        if not excel_rows:
+            gemini_answer = "I don't have sufficient information in the provided Excel rows to answer that."
+        else:
+            try:
+                gemini_answer = get_gemini_response(request.query, memory, row_docs=excel_rows)
+            except Exception as e:
+                gemini_answer = "[Gemini unavailable: {}]".format(e)
 
         # Final output cleaning and save in memory
         gemini_answer = _clean_gemini_output(_safe_str_output(gemini_answer))
