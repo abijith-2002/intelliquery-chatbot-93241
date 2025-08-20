@@ -1265,7 +1265,8 @@ def upload_chat_context(
                 import pandas as pd
                 from io import BytesIO
 
-                xls = pd.ExcelFile(BytesIO(data or b""))
+                # Explicitly specify openpyxl engine to avoid engine autodetect issues on some environments
+                xls = pd.ExcelFile(BytesIO(data or b""), engine="openpyxl")
                 sess_excel_map = EXCEL_RAW_STORE.get(session_id, {})
                 sheet_map: Dict[str, Any] = {}
                 for sname in xls.sheet_names:
@@ -1295,76 +1296,87 @@ def upload_chat_context(
                 pass
 
             # 2) Smart extractor: schema-only for large, full text for small
-            summary_or_text, schema, excel_err = extract_xlsx_schema_or_text(filename, data or b"")
-            if excel_err:
-                err = excel_err
+            try:
+                summary_or_text, schema, excel_err = extract_xlsx_schema_or_text(filename, data or b"")
+            except Exception as e:
+                # Hard fail in extractor; capture as error and continue to next file
+                err = f"Excel schema/text extraction failed: {e}"
                 preview_text = ""
                 content_chars = 0
             else:
-                if schema:
-                    # Large file path: index schema-driven column chunks only (no full sheet text)
-                    try:
-                        # Store schema for LLM context
-                        sess_map = EXCEL_SCHEMA_STORE.get(session_id, {})
-                        sess_map[filename] = {"schema": schema, "summary": summary_or_text}
-                        EXCEL_SCHEMA_STORE[session_id] = sess_map
-                    except Exception:
-                        pass
-
-                    # Build column group chunks and index them
-                    try:
-                        col_chunks = build_xlsx_column_chunks_from_schema(schema, group_size=100, prefer_theme_groups=True)
-                        for ch in col_chunks:
-                            chunk_text = render_xlsx_column_chunk_text(
-                                filename=filename,
-                                sheet=ch.get("sheet", "Sheet"),
-                                group_label=ch.get("group_label", ""),
-                                column_names=ch.get("column_names", []),
-                            )
-                            _index_text_for_session(
-                                session_id,
-                                f"{filename}:{ch.get('sheet')}:{ch.get('group_label')}",
-                                chunk_text,
-                            )
-                    except Exception:
-                        pass
-
-                    # Preview shows concise schema summary text; do not add to combined_text_parts to avoid full-sheet ingestion
-                    preview_text = summarize_text_preview(summary_or_text, max_chars=500) if summary_or_text else ""
-                    content_chars = len(summary_or_text or "")
-
+                if excel_err:
+                    err = excel_err
+                    preview_text = ""
+                    content_chars = 0
                 else:
-                    # Small/medium file path: we have full text from workbook; index selectively
-                    full_text = summary_or_text or ""
-                    # Hybrid/context-aware chunking: prefer row slices if rows are very wide
-                    try:
-                        row_slices = iter_xlsx_row_slices(
-                            filename=filename,
-                            content=data or b"",
-                            per_row_max_cols=200,
-                            group_size=100,
-                            max_rows=2000,  # guardrail
-                        )
-                        # Index each minimal slice as its own chunk
-                        for rs in row_slices:
-                            _index_text_for_session(
-                                session_id,
-                                f"{filename}:{rs.get('sheet')}:{rs.get('row_index')}:{rs.get('meta',{}).get('group_label','')}",
-                                rs.get("text", ""),
+                    if schema:
+                        # Large file path: index schema-driven column chunks only (no full sheet text)
+                        try:
+                            # Store schema for LLM context
+                            sess_map = EXCEL_SCHEMA_STORE.get(session_id, {})
+                            sess_map[filename] = {"schema": schema, "summary": summary_or_text}
+                            EXCEL_SCHEMA_STORE[session_id] = sess_map
+                        except Exception:
+                            pass
+
+                        # Build column group chunks and index them
+                        try:
+                            col_chunks = build_xlsx_column_chunks_from_schema(schema, group_size=100, prefer_theme_groups=True)
+                            for ch in col_chunks:
+                                chunk_text = render_xlsx_column_chunk_text(
+                                    filename=filename,
+                                    sheet=ch.get("sheet", "Sheet"),
+                                    group_label=ch.get("group_label", ""),
+                                    column_names=ch.get("column_names", []),
+                                )
+                                _index_text_for_session(
+                                    session_id,
+                                    f"{filename}:{ch.get('sheet')}:{ch.get('group_label')}",
+                                    chunk_text,
+                                )
+                        except Exception:
+                            # Indexing of schema chunks failed; mark error but continue
+                            err = (err or "") or "Failed to index Excel schema chunks."
+
+                        # Preview shows concise schema summary text; do not add to combined_text_parts to avoid full-sheet ingestion
+                        preview_text = summarize_text_preview(summary_or_text, max_chars=500) if summary_or_text else ""
+                        content_chars = len(summary_or_text or "")
+
+                    else:
+                        # Small/medium file path: we have full text from workbook; index selectively
+                        full_text = summary_or_text or ""
+                        # Hybrid/context-aware chunking: prefer row slices if rows are very wide
+                        try:
+                            row_slices = iter_xlsx_row_slices(
+                                filename=filename,
+                                content=data or b"",
+                                per_row_max_cols=200,
+                                group_size=100,
+                                max_rows=2000,  # guardrail
                             )
-                    except Exception:
-                        # If slicing fails, fall back to normal text chunking
-                        _index_text_for_session(session_id, filename, full_text)
+                            # Index each minimal slice as its own chunk
+                            for rs in row_slices:
+                                _index_text_for_session(
+                                    session_id,
+                                    f"{filename}:{rs.get('sheet')}:{rs.get('row_index')}:{rs.get('meta',{}).get('group_label','')}",
+                                    rs.get("text", ""),
+                                )
+                        except Exception:
+                            # If slicing fails, fall back to normal text chunking safely
+                            try:
+                                _index_text_for_session(session_id, filename, full_text)
+                            except Exception:
+                                err = (err or "") or "Failed to index Excel text."
 
-                    # For UI preview and backward compatibility, include a trimmed text view
-                    preview_text = summarize_text_preview(full_text, max_chars=500)
-                    content_chars = len(full_text or "")
+                        # For UI preview and backward compatibility, include a trimmed text view
+                        preview_text = summarize_text_preview(full_text, max_chars=500)
+                        content_chars = len(full_text or "")
 
-                    # Do not store or index entire sheet text in vector index beyond the minimal slices above.
-                    # However, we keep combined_text_parts for preview/history display only (not used by RAG).
-                    if full_text:
-                        combined_text_parts.append(f"[{filename}]\n{full_text[:4000]}\n")  # safety cap preview combine
-                        total_chars += min(len(full_text), 4000)
+                        # Do not store or index entire sheet text in vector index beyond the minimal slices above.
+                        # However, we keep combined_text_parts for preview/history display only (not used by RAG).
+                        if full_text:
+                            combined_text_parts.append(f"[{filename}]\n{full_text[:4000]}\n")  # safety cap preview combine
+                            total_chars += min(len(full_text), 4000)
         else:
             # Non-Excel: normal text extraction + chunking
             extracted_text, extr_err = extract_text_from_bytes(filename, data or b"")
