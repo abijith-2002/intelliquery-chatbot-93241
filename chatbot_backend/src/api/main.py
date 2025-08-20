@@ -30,6 +30,8 @@ from .auth_utils import (
 from .chat_title import router as chat_title_router
 # Config utilities
 from .config_utils import get_gemini_api_key
+# Ensure vector store models are registered before table creation.
+from . import vector_store
 
 # Load environment variables
 load_dotenv()
@@ -298,9 +300,24 @@ def _index_text_for_session(session_id: str, filename: str, text: str):
     vectors = _embed_texts(chunks)
 
     store = RAG_INDEX_STORE[session_id]
+    items_for_db = []
     for chunk, vec in zip(chunks, vectors):
         store["chunks"].append({"text": chunk, "filename": filename, "source_type": "file_text"})
         store["embeddings"].append(vec)  # vec could be None; retrieval handles fallback
+        items_for_db.append(
+            {"text": chunk, "filename": filename, "source_type": "file_text", "key": None}
+        )
+
+    # Persist to vector DB (best-effort; ignore failures)
+    try:
+        vector_store.add_embeddings(
+            session_id=session_id,
+            items=items_for_db,
+            vectors=vectors,
+            model=_get_embedding_model_name(),
+        )
+    except Exception:
+        pass
 
 
 def _index_json_kv_pairs_for_session(session_id: str, filename: str, pairs: List[Tuple[str, str]]):
@@ -313,13 +330,15 @@ def _index_json_kv_pairs_for_session(session_id: str, filename: str, pairs: List
         pairs: List of (dotted_key, value) pairs.
     """
     _ensure_session_index(session_id)
-    # Render each pair "key: value" as a chunk for embedding
-    texts = [f"{k}: {v}" for k, v in pairs if k]
+    # Filter pairs to those with a non-empty key and render "key: value"
+    filtered_pairs = [(k, v) for (k, v) in pairs if k]
+    texts = [f"{k}: {v}" for k, v in filtered_pairs]
     if not texts:
         return
     vectors = _embed_texts(texts)
     store = RAG_INDEX_STORE[session_id]
-    for (k, v), chunk_text, vec in zip(pairs, texts, vectors):
+    items_for_db = []
+    for (k, v), chunk_text, vec in zip(filtered_pairs, texts, vectors):
         store["chunks"].append({
             "text": chunk_text,
             "filename": filename,
@@ -327,6 +346,20 @@ def _index_json_kv_pairs_for_session(session_id: str, filename: str, pairs: List
             "key": k
         })
         store["embeddings"].append(vec)
+        items_for_db.append(
+            {"text": chunk_text, "filename": filename, "source_type": "json_kv", "key": k}
+        )
+
+    # Persist to vector DB (best-effort; ignore failures)
+    try:
+        vector_store.add_embeddings(
+            session_id=session_id,
+            items=items_for_db,
+            vectors=vectors,
+            model=_get_embedding_model_name(),
+        )
+    except Exception:
+        pass
 
 
 def _index_xlsx_documents_for_session(session_id: str, filename: str, docs: List[str]):
@@ -343,6 +376,7 @@ def _index_xlsx_documents_for_session(session_id: str, filename: str, docs: List
         return
     vectors = _embed_texts(docs)
     store = RAG_INDEX_STORE[session_id]
+    items_for_db = []
     for doc_text, vec in zip(docs, vectors):
         store["chunks"].append({
             "text": doc_text,
@@ -350,6 +384,20 @@ def _index_xlsx_documents_for_session(session_id: str, filename: str, docs: List
             "source_type": "xlsx_row",
         })
         store["embeddings"].append(vec)
+        items_for_db.append(
+            {"text": doc_text, "filename": filename, "source_type": "xlsx_row", "key": None}
+        )
+
+    # Persist to vector DB (best-effort; ignore failures)
+    try:
+        vector_store.add_embeddings(
+            session_id=session_id,
+            items=items_for_db,
+            vectors=vectors,
+            model=_get_embedding_model_name(),
+        )
+    except Exception:
+        pass
 
 
 def _vector_search(session_id: str, query: str, top_k: int = 3) -> List[str]:
