@@ -12,8 +12,9 @@
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 import google.generativeai as genai
+import re
 
 from dotenv import load_dotenv
 from langchain.memory import ConversationBufferMemory
@@ -60,6 +61,16 @@ EXCEL_SCHEMA_STORE: Dict[str, Dict[str, Any]] = {}
 #       "embedding_model": str
 #   }
 RAG_INDEX_STORE: Dict[str, Dict[str, Any]] = {}
+
+# Per-session Excel raw bytes and parsed DataFrames for analytics-on-demand.
+# Structure:
+#   EXCEL_RAW_STORE[session_id] = {
+#       "<filename>": {
+#           "bytes": b"...",                              # raw uploaded bytes
+#           "sheets": { "<sheet_name>": pandas.DataFrame }
+#       }
+#   }
+EXCEL_RAW_STORE: Dict[str, Dict[str, Any]] = {}
 
 app = FastAPI(
     title="IntelliQuery Chatbot API",
@@ -414,9 +425,8 @@ def health_check():
 def chat(request: ChatRequest):
     """
     PUBLIC_INTERFACE
-    Handles user's chat request. All answers come directly from Gemini.
-    If the user has uploaded files for this session, the most relevant snippets from those files are retrieved
-    via semantic vector search and provided as additional context to Gemini. The API returns only Gemini's final answer.
+    Handles user's chat request. Attempts to detect data analytics queries (sum, avg, count, unique, etc.)
+    over uploaded Excel data and compute those directly using pandas. Otherwise, falls back to Gemini with RAG.
     """
     import traceback
 
@@ -443,6 +453,17 @@ def chat(request: ChatRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
 
+        # 1) Try analytics detection + computation on uploaded Excel data first
+        analytics_answer = _maybe_answer_analytics(session_id, request.query)
+        if analytics_answer is not None:
+            final_ans = _clean_gemini_output(_safe_str_output(analytics_answer))
+            try:
+                memory.save_context({"input": request.query}, {"output": _safe_str_output(final_ans)})
+            except Exception:
+                pass
+            return ChatAnswerResponse(answer=final_ans)
+
+        # 2) Otherwise, use RAG + Gemini
         # Retrieve top-k relevant chunks from vector index
         top_chunks = _vector_search(session_id, request.query, top_k=3)
         # Include any Excel schema summaries available for this session to help the model understand data layout
@@ -475,6 +496,189 @@ def chat(request: ChatRequest):
         tb = traceback.format_exc()
         print(f"Internal Server Error in /chat endpoint: {e}\nTraceback:\n{tb}")
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {e}")
+
+
+# PUBLIC_INTERFACE
+def _maybe_answer_analytics(session_id: str, query: str) -> Optional[str]:
+    """
+    PUBLIC_INTERFACE
+    Attempt to detect and compute simple analytics from uploaded Excel data.
+
+    Supported intents (case-insensitive, simple heuristics):
+    - sum/sum of <col>
+    - average/avg/mean of <col>
+    - min of <col>
+    - max of <col>
+    - median of <col>
+    - count rows (with optional filters)
+    - count unique/unique count/distinct of <col>
+    - list unique values of <col> (limited)
+    Optionally with 'in sheet <sheet>' and simple equality filter 'where <col> = <value>'.
+
+    Returns:
+        str answer if detected and computed, otherwise None to fall back to LLM.
+    """
+    import pandas as pd
+    q = (query or "").strip()
+    if not q:
+        return None
+
+    store = EXCEL_RAW_STORE.get(session_id)
+    if not store:
+        return None
+
+    # Normalize whitespace
+    q_lc = " ".join(q.lower().split())
+
+    # Extract optional sheet hint: "in sheet <name>" or "from sheet <name>"
+    sheet_hint = None
+    m_sheet = re.search(r"(?:in|from)\s+sheet\s+([a-z0-9 _\-./]+)", q_lc)
+    if m_sheet:
+        sheet_hint = m_sheet.group(1).strip()
+
+    # Extract optional simple equality filter: where <col> = <value>
+    filter_col = None
+    filter_val: Optional[str] = None
+    m_where = re.search(r"where\s+([a-z0-9 _\-./]+)\s*=\s*['\"]?([^'\"\n\r]+?)['\"]?(?:\s|$)", q_lc)
+    if m_where:
+        filter_col = m_where.group(1).strip()
+        filter_val = m_where.group(2).strip()
+
+    # Operation and target column detection
+    OPS = [
+        ("sum", ["sum", "total"]),
+        ("avg", ["average", "avg", "mean"]),
+        ("min", ["min", "minimum", "lowest", "smallest"]),
+        ("max", ["max", "maximum", "highest", "largest"]),
+        ("median", ["median"]),
+        ("count_unique", ["count unique", "unique count", "distinct count", "count distinct"]),
+        ("list_unique", ["list unique", "unique values", "distinct values"]),
+        ("count_rows", ["count rows", "row count", "number of rows", "how many rows", "how many records"]),
+    ]
+
+    op_detected: Optional[str] = None
+    for op, keywords in OPS:
+        if any(k in q_lc for k in keywords):
+            op_detected = op
+            break
+
+    # Try to extract column name after 'of' or 'for' or 'in column'
+    target_col = None
+    m_col = re.search(r"(?:of|for|in\s+column)\s+([a-z0-9 _\-./]+)", q_lc)
+    if m_col:
+        target_col = m_col.group(1).strip()
+
+    # If we have no operation and no strong column pattern and the question doesn't look analytical, bail.
+    analytical_clues = ["sum", "average", "avg", "mean", "min", "max", "median", "count", "unique", "distinct"]
+    if not op_detected and not any(c in q_lc for c in analytical_clues):
+        return None
+
+    # Iterate available dataframes and try to find a match
+    def iter_session_frames():
+        for fname, meta in store.items():
+            if not isinstance(meta, dict):
+                continue
+            sheets = meta.get("sheets") or {}
+            for sname, df in sheets.items():
+                yield fname, sname, df
+
+    # Helper to pick frames by sheet hint
+    frames: List[Tuple[str, str, "pd.DataFrame"]] = []
+    for fn, sh, df in iter_session_frames():
+        if sheet_hint:
+            if sh.lower().strip() == sheet_hint:
+                frames.append((fn, sh, df))
+        else:
+            frames.append((fn, sh, df))
+
+    if not frames:
+        return None
+
+    # If a target column is provided, resolve best matching column by case-insensitive equality or fuzzy containment.
+    def resolve_column(df: "pd.DataFrame", col_hint: Optional[str]) -> Optional[str]:
+        if col_hint is None:
+            return None
+        cols = list(df.columns)
+        # exact case-insensitive match
+        for c in cols:
+            if str(c).lower().strip() == col_hint:
+                return c
+        # contains
+        for c in cols:
+            if col_hint in str(c).lower():
+                return c
+        return None
+
+    # For count rows, we don't need a column necessarily.
+    # For other ops except count_rows, we generally need a column.
+    for fn, sh, df in frames:
+        try:
+            df_work = df.copy()
+
+            # Apply simple equality filter if requested
+            if filter_col and filter_val is not None:
+                # Try to map filter_col to a real column
+                resolved_filter_col = resolve_column(df_work, filter_col)
+                if resolved_filter_col:
+                    # Cast to str compare fallback if direct compare fails
+                    try:
+                        df_work = df_work[df_work[resolved_filter_col] == filter_val]
+                    except Exception:
+                        df_work = df_work[df_work[resolved_filter_col].astype(str) == str(filter_val)]
+
+            # If operation is row count or question hints about counting rows
+            if op_detected == "count_rows" or ("count" in q_lc and "unique" not in q_lc and target_col is None):
+                return f"Row count in {fn} / {sh}: {len(df_work):,}"
+
+            # Resolve column if needed
+            col_name = resolve_column(df_work, target_col) if target_col else None
+
+            # If it looks like we need a column but couldn't resolve, try to infer numeric column if only one numeric exists
+            if not col_name and op_detected in {"sum", "avg", "min", "max", "median"}:
+                numeric_cols = df_work.select_dtypes(include=["number"]).columns.tolist()
+                if len(numeric_cols) == 1:
+                    col_name = numeric_cols[0]
+
+            if op_detected in {"sum", "avg", "min", "max", "median"} and not col_name:
+                # Can't confidently proceed
+                continue
+
+            # Perform the operation
+            if op_detected == "sum":
+                val = pd.to_numeric(df_work[col_name], errors="coerce").sum(skipna=True)
+                return f"Sum of '{col_name}' in {fn} / {sh}: {val:,.4f}"
+            if op_detected == "avg":
+                val = pd.to_numeric(df_work[col_name], errors="coerce").mean(skipna=True)
+                return f"Average of '{col_name}' in {fn} / {sh}: {val:,.4f}"
+            if op_detected == "min":
+                val = pd.to_numeric(df_work[col_name], errors="coerce").min(skipna=True)
+                return f"Minimum of '{col_name}' in {fn} / {sh}: {val:,.4f}"
+            if op_detected == "max":
+                val = pd.to_numeric(df_work[col_name], errors="coerce").max(skipna=True)
+                return f"Maximum of '{col_name}' in {fn} / {sh}: {val:,.4f}"
+            if op_detected == "median":
+                val = pd.to_numeric(df_work[col_name], errors="coerce").median(skipna=True)
+                return f"Median of '{col_name}' in {fn} / {sh}: {val:,.4f}"
+            if op_detected == "count_unique" and col_name:
+                n = df_work[col_name].nunique(dropna=True)
+                return f"Unique values count for '{col_name}' in {fn} / {sh}: {n:,}"
+            if op_detected == "list_unique" and col_name:
+                vals = df_work[col_name].dropna().astype(str).unique().tolist()
+                # Limit display
+                preview = ", ".join(vals[:20])
+                more = "" if len(vals) <= 20 else f" (+{len(vals)-20} more)"
+                return f"Unique values for '{col_name}' in {fn} / {sh}: {preview}{more}"
+            # Generic "count unique X" pattern without explicit op_detected mapping
+            if "count" in q_lc and "unique" in q_lc and col_name:
+                n = df_work[col_name].nunique(dropna=True)
+                return f"Unique values count for '{col_name}' in {fn} / {sh}: {n:,}"
+
+        except Exception:
+            # Continue to next frame
+            continue
+
+    # No confident structured answer
+    return None
 
 
 # PUBLIC_INTERFACE
@@ -630,7 +834,31 @@ def upload_chat_context(
         text = ""
         err = None
         schema_summary = None
-        if (filename or "").lower().endswith(".xlsx"):
+        is_xlsx = (filename or "").lower().endswith(".xlsx")
+        if is_xlsx:
+            # Keep raw bytes for analytics-on-demand; also parse to dataframes now
+            try:
+                import pandas as pd
+                from io import BytesIO
+                xls = pd.ExcelFile(BytesIO(data or b""))
+                # Initialize session map if missing
+                sess_excel_map = EXCEL_RAW_STORE.get(session_id, {})
+                # Build per-sheet dataframes (lightweight read; pandas handles streaming reasonably)
+                sheet_map: Dict[str, Any] = {}
+                for sname in xls.sheet_names:
+                    try:
+                        df = xls.parse(sname)
+                        # Normalize columns to string for consistent matching
+                        df.columns = [str(c) for c in df.columns]
+                        sheet_map[sname] = df
+                    except Exception:
+                        continue
+                sess_excel_map[filename] = {"bytes": data or b"", "sheets": sheet_map}
+                EXCEL_RAW_STORE[session_id] = sess_excel_map
+            except Exception:
+                # If pandas parse fails, analytics will be unavailable for this file
+                pass
+
             summary_or_text, schema, excel_err = extract_xlsx_schema_or_text(filename, data or b"")
             if excel_err:
                 text, err = "", excel_err
