@@ -111,34 +111,95 @@ def parse_xlsx_to_documents(content: bytes) -> Tuple[List[str], Optional[str]]:
         # Use pandas.ExcelFile for efficient multi-sheet handling
         xls = pd.ExcelFile(bio)
         documents: List[str] = []
+
+        # Helper: stringify a single cell value robustly
+        def _stringify_cell(v: Any) -> str:
+            try:
+                import datetime  # noqa: F401
+            except Exception:
+                pass
+            # None
+            if v is None:
+                return ""
+            # Pandas NA/NaN/NaT
+            try:
+                if pd.isna(v):  # type: ignore[arg-type]
+                    return ""
+            except Exception:
+                # If pd.isna fails, fall back to str below
+                pass
+            # Common types
+            if isinstance(v, str):
+                sval = v.strip()
+            elif hasattr(pd, "Timestamp") and isinstance(v, pd.Timestamp):  # pandas datetime
+                sval = v.isoformat()
+            elif isinstance(v, (list, tuple, set)):
+                parts = []
+                for x in v:
+                    try:
+                        if pd.isna(x):  # type: ignore[arg-type]
+                            continue
+                    except Exception:
+                        pass
+                    parts.append(str(x))
+                sval = ", ".join(parts)
+            elif isinstance(v, dict):
+                sval = json.dumps(v, ensure_ascii=False)
+            else:
+                sval = str(v).strip()
+            # Collapse internal whitespace/newlines
+            return " ".join(sval.split())
+
         for sheet_name in xls.sheet_names:
             df = pd.read_excel(xls, sheet_name=sheet_name, dtype=object)
-            # Normalize column names to strings
-            cols = [str(c).strip() if c is not None else "" for c in df.columns]
-            df.columns = cols
 
-            # Iterate rows and build natural-language strings
-            for i, row in df.iterrows():
+            # Normalize column names to strings
+            raw_cols = [str(c).strip() if c is not None else "" for c in df.columns]
+
+            # Deduplicate column names to avoid ambiguous selection (e.g., "Name", "Name#1", "Name#2")
+            seen = {}
+            cols: List[str] = []
+            for c in raw_cols:
+                base = c or ""
+                if base in seen:
+                    seen[base] += 1
+                    cols.append(f"{base}#{seen[base]}")
+                else:
+                    seen[base] = 0
+                    cols.append(base)
+
+            num_cols = len(cols)
+
+            # Iterate rows using position-based access (avoids Series returns for duplicate labels)
+            # itertuples(index=False, name=None) yields tuples in column order without the index.
+            for row_pos, row_vals in enumerate(df.itertuples(index=False, name=None)):
                 # Build key-value pairs for non-null values
-                kv_pairs = []
-                for col in cols:
-                    try:
-                        val = row[col]
-                    except KeyError:
+                kv_pairs: List[str] = []
+                # Ensure row_vals length matches num_cols (defensive)
+                for j in range(num_cols):
+                    val = row_vals[j] if j < len(row_vals) else None
+                    sval = _stringify_cell(val)
+                    if not sval:
                         continue
-                    # Treat NaN/None/empty as empty
-                    if pd.isna(val):
-                        continue
-                    sval = str(val).strip()
-                    if sval == "":
-                        continue
-                    # Replace internal newlines for cleaner sentences
-                    sval = " ".join(sval.split())
-                    kv_pairs.append(f"{col}: {sval}")
+                    kv_pairs.append(f"{cols[j]}: {sval}")
+
                 if not kv_pairs:
                     continue
-                doc_str = f"Sheet {sheet_name} | Row {int(i) + 1}: " + "; ".join(kv_pairs)
+
+                # Determine a human-friendly row number:
+                # Prefer DataFrame index if numeric, else fall back to 1-based position.
+                try:
+                    row_label = df.index[row_pos]
+                    if isinstance(row_label, (int, float)) and not pd.isna(row_label):
+                        row_number = int(row_label) + 1
+                    else:
+                        row_number = row_pos + 1
+                except Exception:
+                    row_number = row_pos + 1
+
+                doc_str = f"Sheet {sheet_name} | Row {row_number}: " + "; ".join(kv_pairs)
                 documents.append(doc_str)
+
         return documents, None
     except Exception as e:
         return [], f"Failed to parse .xlsx content: {e}"
