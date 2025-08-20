@@ -655,6 +655,46 @@ def get_gemini_response(
         return _clean_gemini_output(f"[Gemini enhancement unavailable: {e}]")
 
 
+def _combine_row_chunks_text(chunks: List[Dict[str, Any]]) -> str:
+    """
+    Combine multiple XLSX row-chunk texts into a single row document string.
+
+    Attempts to strip per-chunk headers like:
+        "Sheet <sheet> | Row <n> | Chunk i/n | "
+    and consolidates the remaining key-value parts. Falls back to joining the full
+    chunk texts if header stripping fails.
+    """
+    if not chunks:
+        return ""
+    # Sort by chunk_index if present
+    try:
+        chunks_sorted = sorted(chunks, key=lambda c: (c.get("chunk_index") if c.get("chunk_index") is not None else 0))
+    except Exception:
+        chunks_sorted = chunks
+
+    first = chunks_sorted[0]
+    sheet_name = first.get("sheet_name") or "Sheet"
+    row_number = first.get("row_number")
+    header_base = f"Sheet {sheet_name}"
+    if row_number is not None:
+        header_base += f" | Row {row_number}"
+
+    import re
+    header_pat = re.compile(r"^Sheet [^|]+ \| Row \d+ \| Chunk \d+/\d+ \| ?", flags=re.IGNORECASE)
+
+    parts: List[str] = []
+    for ch in chunks_sorted:
+        text = ch.get("text") or ""
+        stripped = header_pat.sub("", text).strip()
+        parts.append(stripped or text)
+
+    combined_pairs = " | ".join([p for p in parts if p]).strip()
+    if combined_pairs:
+        return f"{header_base} | {combined_pairs}"
+    # Fallback: join original texts if nothing matched
+    return " ".join([ch.get("text") or "" for ch in chunks_sorted]).strip()
+
+
 # Ensure user table exists on startup
 create_tables()
 
@@ -683,6 +723,11 @@ def chat(request: ChatRequest):
     Handles user's chat request. All answers come directly from Gemini.
     If the user has uploaded files for this session, the most relevant snippets from those files are retrieved
     via semantic vector search and provided as additional context to Gemini. The API returns only Gemini's final answer.
+
+    Updated retrieval behavior:
+    - Uses ChromaDB to find top relevant XLSX row chunks.
+    - Aggregates ALL chunks belonging to the same Excel row to reconstruct the full row document.
+    - Passes the reconstructed row documents as the only context to Gemini for answering.
     """
     import traceback
 
@@ -709,20 +754,74 @@ def chat(request: ChatRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
 
-        # Retrieve top-k relevant Excel row-chunks and force LLM to answer using only these rows
+        # Retrieve top-k relevant Excel row-chunks and then aggregate all chunks for those rows
         top_items = _vector_search_items(
             session_id,
             request.query,
             top_k=8,
             restrict_source_types=["xlsx_row_chunk", "xlsx_row"],  # prefer new chunked rows, keep legacy compatibility
         )
-        excel_rows = [it["text"] for it in top_items][:6]
 
-        if not excel_rows:
+        # Build row documents by aggregating chunks from the same row
+        row_docs: List[str] = []
+        seen_row_ids: set = set()
+
+        # Helper to pull in-memory chunks for a row (fallback if Chroma returns nothing)
+        def _gather_memory_row_chunks(sid: str, rid: str) -> List[Dict[str, Any]]:
+            out: List[Dict[str, Any]] = []
+            idx = RAG_INDEX_STORE.get(sid)
+            if not idx:
+                return out
+            for it in idx.get("chunks", []):
+                if it.get("source_type") == "xlsx_row_chunk" and it.get("row_id") == rid:
+                    out.append(it)
+            try:
+                out.sort(key=lambda c: (c.get("chunk_index") if c.get("chunk_index") is not None else 0))
+            except Exception:
+                pass
+            return out
+
+        for it in top_items:
+            if len(row_docs) >= 6:
+                break
+            st = it.get("source_type")
+
+            if st == "xlsx_row":
+                # Legacy per-row document already complete
+                txt = it.get("text") or ""
+                if txt:
+                    row_docs.append(txt)
+                continue
+
+            if st == "xlsx_row_chunk":
+                rid = it.get("row_id")
+                if not rid or rid in seen_row_ids:
+                    continue
+                seen_row_ids.add(rid)
+
+                # Fetch all chunks for this row from Chroma; fallback to in-memory if needed
+                all_chunks: List[Dict[str, Any]] = []
+                try:
+                    all_chunks = vector_store.get_row_chunks(session_id=session_id, row_id=rid, max_chunks=None)
+                except Exception:
+                    all_chunks = []
+
+                if not all_chunks:
+                    all_chunks = _gather_memory_row_chunks(session_id, rid)
+
+                # If still empty, at least include the selected chunk as-is
+                if not all_chunks:
+                    all_chunks = [it]
+
+                combined_text = _combine_row_chunks_text(all_chunks)
+                if combined_text:
+                    row_docs.append(combined_text)
+
+        if not row_docs:
             gemini_answer = "I don't have sufficient information in the provided Excel rows to answer that."
         else:
             try:
-                gemini_answer = get_gemini_response(request.query, memory, row_docs=excel_rows)
+                gemini_answer = get_gemini_response(request.query, memory, row_docs=row_docs[:6])
             except Exception as e:
                 gemini_answer = "[Gemini unavailable: {}]".format(e)
 

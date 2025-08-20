@@ -529,6 +529,118 @@ def get_session_embedding_items(
         return []
 
 
+# PUBLIC_INTERFACE
+def get_row_chunks(
+    session_id: str,
+    row_id: str,
+    max_chunks: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """PUBLIC_INTERFACE
+    Fetch all stored items for a specific Excel row (by row_id), ordered by chunk_index.
+
+    Uses Chroma metadata filtering (session_id + row_id) to retrieve row chunks. Falls back
+    to using the RowChunkMap table and fetching by stored Chroma IDs if direct filtering
+    is unsupported on the installed ChromaDB version.
+
+    Args:
+        session_id: The session identifier.
+        row_id: Logical row identifier (e.g., "Sheet1:r12").
+        max_chunks: Optional maximum number of chunks to return.
+
+    Returns:
+        List[Dict[str, Any]]: Items with at least
+            text, filename, source_type, key, (optional) row_id, chunk_id, sheet_name,
+            row_number, chunk_index, chunk_count, embedding, model.
+    """
+    if not _CHROMA_AVAILABLE:
+        return []
+
+    _, collection = _ensure_chroma()
+
+    def _sort_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        try:
+            return sorted(items, key=lambda x: (x.get("chunk_index") if x.get("chunk_index") is not None else 0))
+        except Exception:
+            return items
+
+    # Attempt direct metadata-filtered retrieval
+    where = {"$and": [
+        {"session_id": session_id},
+        {"row_id": row_id},
+        {"source_type": {"$in": ["xlsx_row_chunk", "xlsx_row"]}},
+    ]}
+    try:
+        res = _collection_get(collection, where=where, limit=max_chunks)
+        docs = res.get("documents") or []
+        metas = res.get("metadatas") or []
+        embs = res.get("embeddings") or []
+        items: List[Dict[str, Any]] = []
+        for i in range(min(len(docs), len(metas), len(embs))):
+            md = metas[i] or {}
+            item = {
+                "text": docs[i] or "",
+                "filename": md.get("filename"),
+                "source_type": md.get("source_type") or "file_text",
+                "key": md.get("key"),
+                "embedding": embs[i] if isinstance(embs[i], list) else None,
+                "model": md.get("model") or "models/text-embedding-004",
+            }
+            for fld in ("row_id", "chunk_id", "sheet_name", "row_number", "chunk_index", "chunk_count"):
+                if fld in md:
+                    item[fld] = md.get(fld)
+            items.append(item)
+        if items:
+            return _sort_items(items)
+    except Exception:
+        # Fall through to mapping-based retrieval
+        pass
+
+    # Fallback: use mapping table to fetch chroma IDs for row_id then pull by ids
+    db = SessionLocal()
+    try:
+        q = (
+            db.query(RowChunkMap)
+            .filter(RowChunkMap.session_id == session_id, RowChunkMap.row_id == row_id)
+            .order_by(RowChunkMap.chunk_index.asc())
+        )
+        rows = q.all()
+    finally:
+        db.close()
+
+    if not rows:
+        return []
+
+    # Limit number of chunks if requested
+    selected = rows[: max_chunks] if max_chunks and max_chunks > 0 else rows
+    ids = [r.chroma_id for r in selected if r.chroma_id]
+
+    # Many Chroma versions support collection.get(ids=...)
+    try:
+        include = ["documents", "metadatas", "embeddings"]
+        res = collection.get(ids=ids, include=include)
+        docs = res.get("documents") or []
+        metas = res.get("metadatas") or []
+        embs = res.get("embeddings") or []
+        out: List[Dict[str, Any]] = []
+        for i in range(min(len(docs), len(metas), len(embs))):
+            md = metas[i] or {}
+            item = {
+                "text": docs[i] or "",
+                "filename": md.get("filename"),
+                "source_type": md.get("source_type") or "file_text",
+                "key": md.get("key"),
+                "embedding": embs[i] if isinstance(embs[i], list) else None,
+                "model": md.get("model") or "models/text-embedding-004",
+            }
+            for fld in ("row_id", "chunk_id", "sheet_name", "row_number", "chunk_index", "chunk_count"):
+                if fld in md:
+                    item[fld] = md.get(fld)
+            out.append(item)
+        return _sort_items(out)
+    except Exception:
+        return []
+
+
 def _safe_norm(vec: Optional[List[float]]) -> Optional[float]:
     """Compute L2 norm of the vector if available. Retained for backward compatibility."""
     if not vec:
