@@ -1,5 +1,6 @@
 import io
-from typing import List, Tuple, Optional
+import json
+from typing import List, Tuple, Optional, Any
 
 # Libraries for file parsing
 # - TXT: native decode
@@ -120,3 +121,83 @@ def summarize_text_preview(text: str, max_chars: int = 500) -> str:
     if len(collapsed) <= max_chars:
         return collapsed
     return collapsed[: max_chars - 3] + "..."
+
+
+# PUBLIC_INTERFACE
+def parse_and_flatten_json(content: bytes) -> Tuple[List[Tuple[str, str]], Optional[str]]:
+    """
+    PUBLIC_INTERFACE
+    Parse the given bytes as JSON and flatten nested objects/arrays to dotted key-value pairs.
+
+    Examples:
+        {"order": {"customer": {"name": "Alice"}, "items": [{"sku": "A1"}]}}
+        -> [
+            ("order.customer.name", "Alice"),
+            ("order.items.0.sku", "A1"),
+        ]
+
+    Arrays are indexed numerically (0-based) in the dotted path.
+
+    Args:
+        content (bytes): Raw JSON file content (UTF-8 expected; errors ignored).
+
+    Returns:
+        Tuple[List[Tuple[str, str]], Optional[str]]:
+            - List of (dotted_key, value_as_string) pairs for each leaf value
+            - error string if parsing failed, otherwise None
+    """
+    try:
+        text = content.decode("utf-8", errors="ignore")
+        data = json.loads(text)
+    except Exception as e:
+        return [], f"Invalid JSON: {e}"
+
+    flattened: List[Tuple[str, str]] = []
+
+    def _stringify(val: Any) -> str:
+        if val is None:
+            return "null"
+        if isinstance(val, bool):
+            return "true" if val else "false"
+        if isinstance(val, (int, float)):
+            return str(val)
+        if isinstance(val, (dict, list)):
+            # Should not happen for leaf; defensively stringify
+            return json.dumps(val, ensure_ascii=False)
+        return str(val)
+
+    def _flatten(obj: Any, parent_key: str = ""):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                key = f"{parent_key}.{k}" if parent_key else str(k)
+                _flatten(v, key)
+        elif isinstance(obj, list):
+            for idx, v in enumerate(obj):
+                key = f"{parent_key}.{idx}" if parent_key else str(idx)
+                _flatten(v, key)
+        else:
+            flattened.append((parent_key, _stringify(obj)))
+
+    _flatten(data)
+    return flattened, None
+
+
+# PUBLIC_INTERFACE
+def format_kv_pairs_as_text(pairs: List[Tuple[str, str]]) -> str:
+    """
+    PUBLIC_INTERFACE
+    Render flattened key-value pairs to a human-readable multi-line text.
+
+    Format:
+        key1: value1
+        key2.subkey: value2
+        ...
+
+    Args:
+        pairs (List[Tuple[str, str]]): Flattened pairs.
+
+    Returns:
+        str: Multi-line string suitable for previews or indexing.
+    """
+    lines = [f"{k}: {v}" for k, v in pairs]
+    return "\n".join(lines).strip()

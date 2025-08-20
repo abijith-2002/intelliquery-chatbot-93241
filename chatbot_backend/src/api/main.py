@@ -12,7 +12,7 @@
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 import google.generativeai as genai
 
 from dotenv import load_dotenv
@@ -44,8 +44,15 @@ CONTEXT_STORE: Dict[str, Dict[str, Any]] = {}
 # Per-session in-memory vector index for RAG.
 # Structure:
 #   RAG_INDEX_STORE[session_id] = {
-#       "chunks": [ {"text": str, "filename": str} , ...],
-#       "embeddings": [ [float, ...], ...],
+#       "chunks": [
+#           {
+#              "text": str,
+#              "filename": str,
+#              "source_type": "file_text" | "json_kv",
+#              "key": Optional[str]  # present for json_kv
+#           }, ...
+#       ],
+#       "embeddings": [ [float, ...] | None, ...],
 #       "embedding_model": str
 #   }
 RAG_INDEX_STORE: Dict[str, Dict[str, Any]] = {}
@@ -292,8 +299,34 @@ def _index_text_for_session(session_id: str, filename: str, text: str):
 
     store = RAG_INDEX_STORE[session_id]
     for chunk, vec in zip(chunks, vectors):
-        store["chunks"].append({"text": chunk, "filename": filename})
+        store["chunks"].append({"text": chunk, "filename": filename, "source_type": "file_text"})
         store["embeddings"].append(vec)  # vec could be None; retrieval handles fallback
+
+
+def _index_json_kv_pairs_for_session(session_id: str, filename: str, pairs: List[Tuple[str, str]]):
+    """
+    Index flattened JSON key-value pairs for a session. Each (key, value) becomes a standalone chunk.
+
+    Args:
+        session_id: Session ID.
+        filename: Source JSON filename.
+        pairs: List of (dotted_key, value) pairs.
+    """
+    _ensure_session_index(session_id)
+    # Render each pair "key: value" as a chunk for embedding
+    texts = [f"{k}: {v}" for k, v in pairs if k]
+    if not texts:
+        return
+    vectors = _embed_texts(texts)
+    store = RAG_INDEX_STORE[session_id]
+    for (k, v), chunk_text, vec in zip(pairs, texts, vectors):
+        store["chunks"].append({
+            "text": chunk_text,
+            "filename": filename,
+            "source_type": "json_kv",
+            "key": k
+        })
+        store["embeddings"].append(vec)
 
 
 def _vector_search(session_id: str, query: str, top_k: int = 3) -> List[str]:
@@ -304,28 +337,39 @@ def _vector_search(session_id: str, query: str, top_k: int = 3) -> List[str]:
     Returns:
         List[str]: The text of the top-k retrieved chunks.
     """
+    items = _vector_search_items(session_id, query, top_k=top_k)
+    return [it["text"] for it in items]
+
+
+def _vector_search_items(session_id: str, query: str, top_k: int = 6) -> List[Dict[str, Any]]:
+    """
+    Retrieve the top-k items (with metadata) from the session index, boosting JSON facts slightly
+    so they surface as primary context when relevant.
+
+    Returns:
+        List[Dict[str, Any]]: Items with fields {text, filename, source_type, key?}
+    """
     index = RAG_INDEX_STORE.get(session_id)
     if not index or not index.get("chunks"):
         return []
 
     # Try vector search
     query_vec = _embed_one(query)
-    if query_vec:
-        scored = []
-        for item, vec in zip(index["chunks"], index["embeddings"]):
-            if vec:
-                score = _cosine_similarity(query_vec, vec)
-            else:
-                # If a particular chunk lacks embedding, degrade to lexical fallback for that item
-                score = _simple_similarity(query, item["text"])
-            scored.append((score, item["text"]))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [text for _, text in scored[:top_k]]
+    scored: List[Tuple[float, Dict[str, Any]]] = []
 
-    # Fallback: lexical similarity if no query embedding
-    scored_lex = [(_simple_similarity(query, item["text"]), item["text"]) for item in index["chunks"]]
-    scored_lex.sort(key=lambda x: x[0], reverse=True)
-    return [text for _, text in scored_lex[:top_k]]
+    for item, vec in zip(index["chunks"], index["embeddings"]):
+        if query_vec and vec:
+            score = _cosine_similarity(query_vec, vec)
+        else:
+            # Fallback lexical similarity
+            score = _simple_similarity(query, item["text"])
+        # Apply a modest boost to JSON facts to prioritize them as primary context
+        if item.get("source_type") == "json_kv":
+            score *= 1.2  # 20% boost
+        scored.append((score, item))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [item for _, item in scored[:top_k]]
 
 
 # PUBLIC_INTERFACE
@@ -344,6 +388,7 @@ def get_gemini_response(
         query (str): User query.
         memory (ConversationBufferMemory): Conversation memory buffer.
         extra_context (str): Additional, retrieved context from uploaded files. May be empty.
+            Place any JSON 'Key facts' section first in this string to ensure primacy.
 
     Returns:
         str: Model answer.
@@ -355,13 +400,15 @@ def get_gemini_response(
     if len(trimmed_extra) > MAX_CONTEXT_CHARS:
         trimmed_extra = trimmed_extra[: MAX_CONTEXT_CHARS]
 
-    # Compose prompt with uploaded/retrieved context primarily.
+    # Compose prompt with JSON-derived facts as primary context when present.
     prompt = (
-        f"You are an expert software assistant.\n"
+        "You are an expert software assistant.\n"
         f"User's question: '{query}'\n"
-        f"{f'Additional user-provided context (may be relevant):\n{trimmed_extra}\n' if trimmed_extra else ''}"
+        f"{f'Context for answering (use any Key facts first if present):\n{trimmed_extra}\n' if trimmed_extra else ''}"
         f"Conversation history:\n{mem_str}\n"
-        f"Please answer the user's latest question. Be concise and clear."
+        "Answer the user's latest question. Be concise and clear. If a 'Key facts from uploaded JSON' section "
+        "is present in the context, rely on those facts first and treat them as authoritative; use additional "
+        "context only to elaborate or provide background."
     )
 
     gemini_api_key = get_gemini_api_key()
@@ -432,9 +479,17 @@ def chat(request: ChatRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
 
-        # Retrieve top-k relevant chunks from vector index
-        top_chunks = _vector_search(session_id, request.query, top_k=3)
-        retrieved_context = "\n---\n".join(top_chunks).strip()
+        # Retrieve top-k relevant chunks from vector index, ensuring JSON facts are surfaced
+        top_items = _vector_search_items(session_id, request.query, top_k=6)
+        json_facts = [f"- {it['text']}" for it in top_items if it.get("source_type") == "json_kv"][:5]
+        other_ctx = [it["text"] for it in top_items if it.get("source_type") != "json_kv"][:3]
+
+        context_parts: List[str] = []
+        if json_facts:
+            context_parts.append("Key facts from uploaded JSON:\n" + "\n".join(json_facts))
+        if other_ctx:
+            context_parts.append("Other relevant context:\n" + "\n---\n".join(other_ctx))
+        retrieved_context = "\n\n".join(context_parts).strip()
 
         # Compose Gemini answer with retrieved context (if any)
         try:
@@ -546,8 +601,9 @@ def chat_wsinfo():
     summary="Upload context files for a chat session",
     description=(
         "Accepts one or more files via multipart/form-data and extracts readable text from supported types "
-        "(.docx, .xlsx, .pdf, .txt). The extracted content is stored per session and used as additional context "
+        "(.docx, .xlsx, .pdf, .txt, .json). The extracted content is stored per session and used as additional context "
         "when answering subsequent chat queries. Builds a vector index (Gemini embeddings) for semantic retrieval. "
+        "JSON files are parsed and flattened into dotted key-value pairs (e.g., order.customer.name: Alice) and each pair is indexed as an individual fact. "
         "Returns an acknowledgment with per-file processing results and a preview."
     ),
     responses={
@@ -557,17 +613,16 @@ def chat_wsinfo():
 )
 def upload_chat_context(
     session_id: str = Form(..., description="Session ID to associate uploaded context with"),
-    files: List[UploadFile] = File(..., description="One or more files (.docx, .xlsx, .pdf, .txt)"),
+    files: List[UploadFile] = File(..., description="One or more files (.docx, .xlsx, .pdf, .txt, .json)"),
 ):
     """
     PUBLIC_INTERFACE
     Upload and process files to add user-provided context for a given chat session.
 
     Process:
-        - Extract readable text.
-        - Split into overlapping chunks.
-        - Embed each chunk using Gemini embeddings (if API key available).
-        - Store chunks and embeddings in a per-session in-memory index for retrieval.
+        - For non-JSON: Extract readable text, split into overlapping chunks, embed each chunk, and index.
+        - For JSON (.json): Parse and flatten nested structures into dotted key-value pairs; each pair is treated
+          as an individual fact (chunk), embedded and indexed for retrieval. The preview shows formatted pairs.
 
     Args:
         session_id (str): The chat session ID.
@@ -576,7 +631,12 @@ def upload_chat_context(
     Returns:
         UploadContextResponse: Processing results and acknowledgment.
     """
-    from .file_utils import extract_text_from_bytes, summarize_text_preview
+    from .file_utils import (
+        extract_text_from_bytes,
+        summarize_text_preview,
+        parse_and_flatten_json,
+        format_kv_pairs_as_text,
+    )
 
     if not session_id or not isinstance(session_id, str):
         raise HTTPException(status_code=400, detail="session_id must be provided as a non-empty string.")
@@ -589,6 +649,7 @@ def upload_chat_context(
 
     for f in files:
         filename = f.filename or "unnamed"
+        name_lower = filename.lower()
         # Read file bytes
         try:
             data = f.file.read()
@@ -601,12 +662,40 @@ def upload_chat_context(
             continue
 
         size = len(data or b"")
-        # Extract
+
+        # Handle JSON separately: parse + flatten to dotted pairs
+        if name_lower.endswith(".json"):
+            pairs, parse_err = parse_and_flatten_json(data or b"")
+            text = format_kv_pairs_as_text(pairs) if pairs else ""
+            preview = summarize_text_preview(text, max_chars=500) if text else ""
+            chars = len(text)
+
+            # Append/Index only if successful and non-empty
+            if pairs and not parse_err:
+                combined_text_parts.append(f"[{filename}]\n{text}\n")
+                total_chars += chars
+                try:
+                    _index_json_kv_pairs_for_session(session_id, filename, pairs)
+                except Exception:
+                    # Do not fail upload on indexing failure; retrieval will fall back gracefully.
+                    pass
+
+            results.append(
+                UploadedFileResult(
+                    filename=filename,
+                    size=size,
+                    content_chars=chars,
+                    preview=preview,
+                    error=parse_err,
+                )
+            )
+            continue  # next file
+
+        # Non-JSON: use general extractors
         text, err = extract_text_from_bytes(filename, data or b"")
         preview = summarize_text_preview(text, max_chars=500) if text else ""
         chars = len(text)
 
-        # Append to combined only if successful and non-empty
         if text and not err:
             combined_text_parts.append(f"[{filename}]\n{text}\n")
             total_chars += chars
