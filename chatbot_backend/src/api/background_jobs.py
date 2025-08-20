@@ -92,6 +92,68 @@ class JobManager:
         return job_id
 
     # PUBLIC_INTERFACE
+    def submit_upload_job_from_paths(self, session_id: str, files: List[Tuple[str, str]]) -> str:
+        """
+        PUBLIC_INTERFACE
+        Submit an upload processing task by specifying file paths on disk.
+
+        This method reads the files from disk inside the background worker thread (not during
+        the HTTP request), then delegates to the standard upload job runner.
+
+        Args:
+            session_id (str): Session ID to associate with.
+            files (List[Tuple[str, str]]): List of (filename, filepath) tuples.
+
+        Returns:
+            str: job_id to poll status.
+        """
+        import os
+
+        job_id = uuid.uuid4().hex
+        self._set_job(
+            job_id,
+            status=JobStatus.PENDING,
+            progress=0,
+            message="Queued",
+            result=None,
+            session_id=session_id,
+        )
+
+        def _reader_and_run():
+            # Update status to indicate background file IO and processing
+            self._set_job(job_id, status=JobStatus.RUNNING, progress=3, message="Reading files from disk...")
+            files_data: List[Tuple[str, bytes]] = []
+            try:
+                total = max(1, len(files))
+                for i, (fname, fpath) in enumerate(files, start=1):
+                    try:
+                        with open(fpath, "rb") as fh:
+                            data = fh.read()
+                        files_data.append((fname, data))
+                    except Exception as e:
+                        # Append an empty file with error note in filename to continue processing others
+                        files_data.append((f"{fname} [read_error: {e}]", b""))
+                    # Update progress up to ~20% for IO
+                    pct = 3 + int((i / total) * 17)
+                    self._set_job(job_id, progress=pct, message=f"Staged {i}/{total} files")
+
+                # Optionally cleanup uploaded temp files after staging
+                for _, fpath in files:
+                    try:
+                        os.remove(fpath)
+                    except Exception:
+                        pass
+
+                # Delegate to the existing runner
+                self._run_upload_job(job_id, session_id, files_data)
+            except Exception as e:
+                self._set_job(job_id, status=JobStatus.FAILED, message=f"Job failed during staging: {e}")
+
+        # Enqueue the staging + processing task
+        self._executor.submit(_reader_and_run)
+        return job_id
+
+    # PUBLIC_INTERFACE
     def get_job(self, job_id: str) -> Dict[str, Any]:
         """
         PUBLIC_INTERFACE
