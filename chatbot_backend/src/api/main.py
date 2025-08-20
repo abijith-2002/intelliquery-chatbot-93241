@@ -414,31 +414,74 @@ def _vector_search(session_id: str, query: str, top_k: int = 3) -> List[str]:
 
 def _vector_search_items(session_id: str, query: str, top_k: int = 6) -> List[Dict[str, Any]]:
     """
-    Retrieve the top-k items (with metadata) from the session index, boosting JSON facts slightly
-    so they surface as primary context when relevant.
+    Retrieve the top-k items (with metadata) relevant to the user query.
+
+    This function now combines:
+      - In-memory session index items (built from current process uploads)
+      - Persisted items from the vector database, specifically Excel row documents,
+        so that row-level content is available even after restarts.
+
+    JSON facts receive a small boost to surface prominently. Excel row documents
+    are also boosted slightly to prioritize structured row-level context.
 
     Returns:
         List[Dict[str, Any]]: Items with fields {text, filename, source_type, key?}
     """
+    # Prepare query vector (if possible); otherwise lexical fallback will be used.
+    query_vec = _embed_one(query)
+
+    combined_items: List[Tuple[Dict[str, Any], Optional[List[float]]]] = []
+
+    # 1) In-memory items
     index = RAG_INDEX_STORE.get(session_id)
-    if not index or not index.get("chunks"):
+    if index and index.get("chunks"):
+        for item, vec in zip(index["chunks"], index["embeddings"]):
+            combined_items.append((item, vec))
+
+    # 2) Persisted items from DB: focus on Excel row documents to satisfy task requirements
+    try:
+        db_items = vector_store.get_session_embedding_items(
+            session_id=session_id,
+            source_types=["xlsx_row"],  # specifically ensure row-level retrieval
+            max_records=5000,
+        )
+        # Deduplicate against in-memory by (text, source_type)
+        seen = set((itm["text"], itm.get("source_type")) for itm, _ in combined_items)
+        for dbi in db_items:
+            key = (dbi.get("text") or "", dbi.get("source_type"))
+            if key in seen:
+                continue
+            item_dict = {
+                "text": dbi.get("text") or "",
+                "filename": dbi.get("filename"),
+                "source_type": dbi.get("source_type") or "file_text",
+                "key": dbi.get("key"),
+            }
+            vec = dbi.get("embedding") if isinstance(dbi.get("embedding"), list) else None
+            combined_items.append((item_dict, vec))
+            seen.add(key)
+    except Exception:
+        # If DB is unavailable or an error occurs, continue with in-memory results only.
+        pass
+
+    if not combined_items:
         return []
 
-    # Try vector search
-    query_vec = _embed_one(query)
+    # Score and rank
     scored: List[Tuple[float, Dict[str, Any]]] = []
-
-    for item, vec in zip(index["chunks"], index["embeddings"]):
+    for item, vec in combined_items:
         if query_vec and vec:
             score = _cosine_similarity(query_vec, vec)
         else:
-            # Fallback lexical similarity
-            score = _simple_similarity(query, item["text"])
-        # Apply boosts to structured facts/rows to prioritize them as primary context
-        if item.get("source_type") == "json_kv":
+            score = _simple_similarity(query, item.get("text", ""))
+
+        # Boosts for structured sources
+        st = item.get("source_type")
+        if st == "json_kv":
             score *= 1.2  # 20% boost for JSON facts
-        elif item.get("source_type") == "xlsx_row":
+        elif st == "xlsx_row":
             score *= 1.1  # 10% boost for Excel row documents
+
         scored.append((score, item))
 
     scored.sort(key=lambda x: x[0], reverse=True)

@@ -142,6 +142,59 @@ def get_session_embeddings_count(session_id: str) -> int:
         db.close()
 
 
+# PUBLIC_INTERFACE
+def get_session_embedding_items(
+    session_id: str,
+    source_types: Optional[List[str]] = None,
+    max_records: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """PUBLIC_INTERFACE
+    Fetch stored embedding items for a session from the persistent vector database.
+
+    This is used during retrieval to include persisted items (e.g., per-row Excel documents)
+    even after process restarts or when the in-memory index is empty.
+
+    Args:
+        session_id: Session identifier whose items should be returned.
+        source_types: Optional list of source types to include (e.g., ["xlsx_row"]).
+        max_records: Optional maximum number of records to return.
+
+    Returns:
+        List[Dict[str, Any]]: Each item has keys:
+            - text (str)
+            - filename (Optional[str])
+            - source_type (str)
+            - key (Optional[str])
+            - embedding (Optional[List[float]])
+            - model (str)
+    """
+    db = SessionLocal()
+    try:
+        q = db.query(EmbeddingRecord).filter(EmbeddingRecord.session_id == session_id)
+        if source_types:
+            q = q.filter(EmbeddingRecord.source_type.in_(source_types))
+        # Order newest first; limit if requested
+        q = q.order_by(EmbeddingRecord.id.desc())
+        if max_records and max_records > 0:
+            q = q.limit(int(max_records))
+        rows = q.all()
+        results: List[Dict[str, Any]] = []
+        for r in rows:
+            results.append(
+                {
+                    "text": r.text or "",
+                    "filename": r.filename,
+                    "source_type": r.source_type or "file_text",
+                    "key": r.key,
+                    "embedding": r.embedding if isinstance(r.embedding, list) else None,
+                    "model": r.model or "models/text-embedding-004",
+                }
+            )
+        return results
+    finally:
+        db.close()
+
+
 def _safe_norm(vec: Optional[List[float]]) -> Optional[float]:
     """Compute L2 norm of the vector if available."""
     if not vec:
