@@ -72,6 +72,31 @@ RAG_INDEX_STORE: Dict[str, Dict[str, Any]] = {}
 #   }
 EXCEL_RAW_STORE: Dict[str, Dict[str, Any]] = {}
 
+# Per-session Excel computed summaries (categorical distributions and numeric stats).
+# Structure:
+#   EXCEL_SUMMARY_STORE[session_id] = {
+#       "<filename>": {
+#           "sheets": {
+#               "<sheet_name>": {
+#                   "categorical": {
+#                       "<col_name>": {
+#                           "unique_count": int,
+#                           "top_values": [ {"value": str, "count": int, "percentage": float}, ... up to top_k ],
+#                           "total_non_null": int
+#                       }, ...
+#                   },
+#                   "numeric": {
+#                       "<col_name>": {
+#                           "count": int, "min": float, "max": float, "mean": float, "median": float,
+#                           "p10": float, "p25": float, "p75": float, "p90": float
+#                       }, ...
+#                   }
+#               }
+#           }
+#       }
+#   }
+EXCEL_SUMMARY_STORE: Dict[str, Dict[str, Any]] = {}
+
 app = FastAPI(
     title="IntelliQuery Chatbot API",
     version="1.0.0",
@@ -455,6 +480,149 @@ def _infer_possible_column_names(df_cols: List[str], hint: str) -> List[str]:
     scored.sort(key=lambda x: x[0], reverse=True)
     return [c for _, c in scored[:3]]
 
+def _is_numeric_series(s) -> bool:
+    """Return True if pandas Series is numeric-like."""
+    try:
+        import pandas as pd  # noqa: F401
+        return str(getattr(s, "dtype", "")).startswith(("float", "int", "UInt", "Float"))
+    except Exception:
+        return False
+
+
+def _compute_categorical_summary(series, top_k: int = 10) -> Dict[str, Any]:
+    """
+    Compute value distribution for a categorical Series.
+    Returns counts and percentages for top_k values, along with total non-null and unique count.
+    """
+    try:
+        s = series.dropna().astype(str)
+        total = int(s.shape[0])
+        vc = s.value_counts(dropna=False)
+        uniq = int(vc.shape[0])
+        top = vc.head(top_k)
+        top_list = []
+        for val, cnt in top.items():
+            pct = (cnt / total * 100.0) if total > 0 else 0.0
+            top_list.append({"value": str(val), "count": int(cnt), "percentage": round(pct, 4)})
+        return {"unique_count": uniq, "top_values": top_list, "total_non_null": total}
+    except Exception:
+        return {"unique_count": 0, "top_values": [], "total_non_null": 0}
+
+
+def _compute_numeric_summary(series) -> Dict[str, Any]:
+    """
+    Compute summary statistics for numeric Series.
+    Includes count, min, max, mean, median, and percentiles (10th, 25th, 75th, 90th).
+    """
+    import numpy as np
+    try:
+        s = series
+        # coerce to numeric
+        s = s.apply(lambda x: np.nan if x is None else x)
+        s = s.astype(float)
+        s = s.replace([np.inf, -np.inf], np.nan).dropna()
+        if s.empty:
+            return {"count": 0, "min": None, "max": None, "mean": None, "median": None, "p10": None, "p25": None, "p75": None, "p90": None}
+        return {
+            "count": int(s.shape[0]),
+            "min": float(np.nanmin(s.values)),
+            "max": float(np.nanmax(s.values)),
+            "mean": float(np.nanmean(s.values)),
+            "median": float(np.nanmedian(s.values)),
+            "p10": float(np.nanpercentile(s.values, 10)),
+            "p25": float(np.nanpercentile(s.values, 25)),
+            "p75": float(np.nanpercentile(s.values, 75)),
+            "p90": float(np.nanpercentile(s.values, 90)),
+        }
+    except Exception:
+        return {"count": 0, "min": None, "max": None, "mean": None, "median": None, "p10": None, "p25": None, "p75": None, "p90": None}
+
+
+def _compute_excel_summaries_for_file(file_entry: Dict[str, Any], categorical_top_k: int = 10, high_cardinality_threshold: int = 50) -> Dict[str, Any]:
+    """
+    Given a file entry from EXCEL_RAW_STORE[session][filename] with "sheets": { name: DataFrame },
+    compute per-sheet categorical distributions and numeric summaries.
+
+    High-cardinality categorical columns are still summarized, but downstream render will compress to top_k only.
+    """
+    result: Dict[str, Any] = {"sheets": {}}
+    if not file_entry or "sheets" not in file_entry:
+        return result
+    try:
+        for sname, df in (file_entry.get("sheets") or {}).items():
+            sheet_cat: Dict[str, Any] = {}
+            sheet_num: Dict[str, Any] = {}
+            if df is None:
+                result["sheets"][sname] = {"categorical": sheet_cat, "numeric": sheet_num}
+                continue
+            # Normalize columns to strings already ensured on upload
+            for col in df.columns:
+                ser = df[col]
+                # Decide if numeric
+                if _is_numeric_series(ser):
+                    sheet_num[str(col)] = _compute_numeric_summary(ser)
+                else:
+                    # Treat as categorical-like: strings, booleans, object, etc.
+                    summary = _compute_categorical_summary(ser, top_k=categorical_top_k)
+                    sheet_cat[str(col)] = summary
+            result["sheets"][sname] = {"categorical": sheet_cat, "numeric": sheet_num}
+    except Exception:
+        # Best-effort; return what we have
+        pass
+    return result
+
+
+def _render_summary_context_for_query(session_id: str, query: str, max_files: int = 2, max_sheets_per_file: int = 2, top_k_values: int = 10) -> Optional[str]:
+    """
+    Build a concise text context of precomputed summaries to help LLM respond to
+    trends, distributions, or summary-stat queries.
+
+    Heuristics: if query mentions distribution, top values, percentiles, summary, min/max/mean/median,
+    unique counts, trends, stats, histogram, etc., include relevant summaries.
+    """
+    q = (query or "").lower()
+    triggers = ["distribution", "top", "percentile", "summary", "statistics", "stats", "min", "max", "mean", "median", "unique", "distinct", "trend", "quartile", "percentiles"]
+    if not any(t in q for t in triggers):
+        return None
+
+    store = EXCEL_SUMMARY_STORE.get(session_id) or {}
+    if not store:
+        return None
+
+    parts: List[str] = []
+    file_items = list(store.items())[:max_files]
+    for fname, meta in file_items:
+        sheets = (meta or {}).get("sheets") or {}
+        sheet_items = list(sheets.items())[:max_sheets_per_file]
+        for sname, sums in sheet_items:
+            cat = (sums or {}).get("categorical") or {}
+            num = (sums or {}).get("numeric") or {}
+            # Render numeric stats summary
+            if num:
+                num_lines: List[str] = []
+                for col, st in list(num.items())[:20]:
+                    if not st or st.get("count", 0) == 0:
+                        continue
+                    num_lines.append(f"{col}: count={st.get('count')}, min={st.get('min')}, max={st.get('max')}, mean={st.get('mean')}, median={st.get('median')}, p10={st.get('p10')}, p25={st.get('p25')}, p75={st.get('p75')}, p90={st.get('p90')}")
+                if num_lines:
+                    parts.append(f"[{fname} | {sname} | Numeric summary]\n" + "\n".join(num_lines))
+            # Render categorical distribution summary
+            if cat:
+                cat_lines: List[str] = []
+                for col, st in list(cat.items())[:20]:
+                    if not st or st.get("total_non_null", 0) == 0:
+                        continue
+                    top_vals = st.get("top_values") or []
+                    top_preview = ", ".join([f"{tv.get('value')} ({tv.get('count')}, {tv.get('percentage')}%)" for tv in top_vals[:top_k_values]])
+                    cat_lines.append(f"{col}: unique={st.get('unique_count')}, total={st.get('total_non_null')}, top: {top_preview}")
+                if cat_lines:
+                    parts.append(f"[{fname} | {sname} | Categorical distribution]\n" + "\n".join(cat_lines))
+    if not parts:
+        return None
+    return "\n---\n".join(parts)
+
+
+# PUBLIC_INTERFACE
 def _maybe_fetch_jit_excel_context(session_id: str, query: str, row_limit: int = 25) -> Optional[str]:
     """
     PUBLIC_INTERFACE
@@ -657,12 +825,20 @@ def chat(request: ChatRequest):
             if isinstance(entry, dict) and "summary" in entry:
                 excel_schema_notes.append(f"[{fname} schema]\n{entry['summary']}")
 
-        # Build final retrieved context prioritizing JIT slices > retrieved chunks > brief schema notes
+        # Build final retrieved context prioritizing:
+        # 1) JIT data slices, 2) vector-search chunks, 3) summary stats/distributions, 4) brief schema notes
         context_parts = []
         if jit_context:
             context_parts.append(jit_context)
         if top_chunks:
             context_parts.append("\n".join(top_chunks))
+        # Include precomputed summary statistics and categorical distributions if query suggests it
+        try:
+            summary_ctx = _render_summary_context_for_query(session_id, request.query)
+            if summary_ctx:
+                context_parts.append(summary_ctx)
+        except Exception:
+            pass
         if excel_schema_notes:
             context_parts.append("\n".join(excel_schema_notes))
         retrieved_context = "\n---\n".join(context_parts).strip()
@@ -1047,6 +1223,15 @@ def upload_chat_context(
                         continue
                 sess_excel_map[filename] = {"bytes": data or b"", "sheets": sheet_map}
                 EXCEL_RAW_STORE[session_id] = sess_excel_map
+                # Compute and store summaries for this Excel file
+                try:
+                    summaries = _compute_excel_summaries_for_file(sess_excel_map[filename])
+                    sess_summ_map = EXCEL_SUMMARY_STORE.get(session_id, {})
+                    sess_summ_map[filename] = summaries
+                    EXCEL_SUMMARY_STORE[session_id] = sess_summ_map
+                except Exception:
+                    # best-effort; ignore summary failures
+                    pass
             except Exception:
                 # If pandas parse fails, analytics will be unavailable for this file
                 pass
