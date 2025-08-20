@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.env
+*.env
+
+# Local databases and data
+chatbot_users.db
+
+# VCS
+.git
+.gitignore
+
+# Editor/OS files
+.DS_Store
+.idea/
+.vscode/
+
+# Caches and builds
+dist/
+build/
+*.egg-info/
+.cache/
+.mypy_cache/
+.pytest_cache/
