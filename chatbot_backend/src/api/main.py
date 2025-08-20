@@ -270,13 +270,37 @@ def _embed_one(text: str) -> Optional[List[float]]:
 
 def _embed_texts(texts: List[str]) -> List[Optional[List[float]]]:
     """
-    Embed a batch of texts (serially) using Gemini embeddings.
-    If embedding fails or key missing, returns list of None entries.
+    Embed a batch of texts using Gemini embeddings with parallelization.
+
+    Uses a ThreadPoolExecutor to speed up embedding IO calls. Concurrency can be tuned via
+    CHATBOT_EMBED_MAX_WORKERS env var (default: 8). If embedding fails or key missing,
+    returns list of None entries.
     """
-    vectors: List[Optional[List[float]]] = []
-    for t in texts:
-        vectors.append(_embed_one(t))
-    return vectors
+    import os
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    if not texts:
+        return []
+
+    try:
+        max_workers = int(os.getenv("CHATBOT_EMBED_MAX_WORKERS", "8"))
+    except Exception:
+        max_workers = 8
+    max_workers = max(1, max_workers)
+
+    results: List[Optional[List[float]]] = [None] * len(texts)
+
+    def _task(i: int, s: str):
+        vec = _embed_one(s)
+        results[i] = vec
+
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="embed") as ex:
+        futures = []
+        for i, s in enumerate(texts):
+            futures.append(ex.submit(_task, i, s))
+        for _f in as_completed(futures):
+            pass
+    return results
 
 
 def _ensure_session_index(session_id: str):
@@ -295,32 +319,37 @@ def _index_text_for_session(session_id: str, filename: str, text: str):
     """
     Chunk, embed, and store vectors and their source chunks for a session.
     Falls back to storing chunks without embeddings if embeddings are unavailable.
+    Processes in batches to reduce memory footprint for large documents.
     """
     _ensure_session_index(session_id)
     chunks = _split_into_chunks(text, chunk_size_words=180, overlap_words=40)
     if not chunks:
         return
-    vectors = _embed_texts(chunks)
 
     store = RAG_INDEX_STORE[session_id]
-    items_for_db = []
-    for chunk, vec in zip(chunks, vectors):
-        store["chunks"].append({"text": chunk, "filename": filename, "source_type": "file_text"})
-        store["embeddings"].append(vec)  # vec could be None; retrieval handles fallback
-        items_for_db.append(
-            {"text": chunk, "filename": filename, "source_type": "file_text", "key": None}
-        )
+    BATCH = 256
+    for start in range(0, len(chunks), BATCH):
+        sub = chunks[start:start + BATCH]
+        vectors = _embed_texts(sub)
 
-    # Persist to vector DB (best-effort; ignore failures)
-    try:
-        vector_store.add_embeddings(
-            session_id=session_id,
-            items=items_for_db,
-            vectors=vectors,
-            model=_get_embedding_model_name(),
-        )
-    except Exception:
-        pass
+        items_for_db = []
+        for chunk, vec in zip(sub, vectors):
+            store["chunks"].append({"text": chunk, "filename": filename, "source_type": "file_text"})
+            store["embeddings"].append(vec)
+            items_for_db.append(
+                {"text": chunk, "filename": filename, "source_type": "file_text", "key": None}
+            )
+
+        # Persist to vector DB (best-effort; ignore failures)
+        try:
+            vector_store.add_embeddings(
+                session_id=session_id,
+                items=items_for_db,
+                vectors=vectors,
+                model=_get_embedding_model_name(),
+            )
+        except Exception:
+            pass
 
 
 def _index_json_kv_pairs_for_session(session_id: str, filename: str, pairs: List[Tuple[str, str]]):
@@ -335,34 +364,38 @@ def _index_json_kv_pairs_for_session(session_id: str, filename: str, pairs: List
     _ensure_session_index(session_id)
     # Filter pairs to those with a non-empty key and render "key: value"
     filtered_pairs = [(k, v) for (k, v) in pairs if k]
-    texts = [f"{k}: {v}" for k, v in filtered_pairs]
-    if not texts:
+    if not filtered_pairs:
         return
-    vectors = _embed_texts(texts)
-    store = RAG_INDEX_STORE[session_id]
-    items_for_db = []
-    for (k, v), chunk_text, vec in zip(filtered_pairs, texts, vectors):
-        store["chunks"].append({
-            "text": chunk_text,
-            "filename": filename,
-            "source_type": "json_kv",
-            "key": k
-        })
-        store["embeddings"].append(vec)
-        items_for_db.append(
-            {"text": chunk_text, "filename": filename, "source_type": "json_kv", "key": k}
-        )
 
-    # Persist to vector DB (best-effort; ignore failures)
-    try:
-        vector_store.add_embeddings(
-            session_id=session_id,
-            items=items_for_db,
-            vectors=vectors,
-            model=_get_embedding_model_name(),
-        )
-    except Exception:
-        pass
+    store = RAG_INDEX_STORE[session_id]
+    BATCH = 512
+    for start in range(0, len(filtered_pairs), BATCH):
+        sub_pairs = filtered_pairs[start:start + BATCH]
+        texts = [f"{k}: {v}" for k, v in sub_pairs]
+        vectors = _embed_texts(texts)
+        items_for_db = []
+        for (k, v), chunk_text, vec in zip(sub_pairs, texts, vectors):
+            store["chunks"].append({
+                "text": chunk_text,
+                "filename": filename,
+                "source_type": "json_kv",
+                "key": k
+            })
+            store["embeddings"].append(vec)
+            items_for_db.append(
+                {"text": chunk_text, "filename": filename, "source_type": "json_kv", "key": k}
+            )
+
+        # Persist to vector DB (best-effort; ignore failures)
+        try:
+            vector_store.add_embeddings(
+                session_id=session_id,
+                items=items_for_db,
+                vectors=vectors,
+                model=_get_embedding_model_name(),
+            )
+        except Exception:
+            pass
 
 
 def _index_xlsx_documents_for_session(session_id: str, filename: str, docs: List[str]):
@@ -405,75 +438,67 @@ def _index_xlsx_documents_for_session(session_id: str, filename: str, docs: List
 
 def _index_xlsx_row_chunks_for_session(session_id: str, filename: str, row_chunks: List[Dict[str, Any]]):
     """
-    Index XLSX row-chunks with metadata.
+    Index XLSX row-chunks with metadata, in batches to control memory use and latencies.
 
-    Each row_chunk dict must have at least:
-        {
-            "text": <str>,
-            "sheet_name": <str>,
-            "row_number": <int>,
-            "row_id": <str>,
-            "chunk_index": <int>,
-            "chunk_count": <int>,
-            "chunk_id": <str>,
-        }
-
-    Metadata is encoded as JSON and persisted in the 'key' column for retrieval later.
+    Each row_chunk dict must have at least the keys specified in the docstring.
     """
     _ensure_session_index(session_id)
     if not row_chunks:
         return
 
-    texts = [rc.get("text", "") for rc in row_chunks]
-    vectors = _embed_texts(texts)
     store = RAG_INDEX_STORE[session_id]
-    items_for_db = []
+    BATCH = 512
+    for start in range(0, len(row_chunks), BATCH):
+        sub = row_chunks[start:start + BATCH]
+        texts = [rc.get("text", "") for rc in sub]
+        vectors = _embed_texts(texts)
+        items_for_db = []
 
-    for rc, vec in zip(row_chunks, vectors):
-        # In-memory item includes full metadata for direct retrieval
-        mem_item = {
-            "text": rc.get("text", ""),
-            "filename": filename,
-            "source_type": "xlsx_row_chunk",
-            "key": rc.get("chunk_id"),  # raw key for quick identification
-            "row_id": rc.get("row_id"),
-            "chunk_id": rc.get("chunk_id"),
-            "sheet_name": rc.get("sheet_name"),
-            "row_number": rc.get("row_number"),
-            "chunk_index": rc.get("chunk_index"),
-            "chunk_count": rc.get("chunk_count"),
-        }
-        store["chunks"].append(mem_item)
-        store["embeddings"].append(vec)
-
-        # Persisted 'key' stores JSON-encoded metadata for later reconstruction
-        meta = {
-            "row_id": rc.get("row_id"),
-            "chunk_id": rc.get("chunk_id"),
-            "sheet_name": rc.get("sheet_name"),
-            "row_number": rc.get("row_number"),
-            "chunk_index": rc.get("chunk_index"),
-            "chunk_count": rc.get("chunk_count"),
-        }
-        items_for_db.append(
-            {
+        for rc, vec in zip(sub, vectors):
+            # In-memory item includes full metadata for direct retrieval
+            mem_item = {
                 "text": rc.get("text", ""),
                 "filename": filename,
                 "source_type": "xlsx_row_chunk",
-                "key": json.dumps(meta, ensure_ascii=False),
+                "key": rc.get("chunk_id"),  # raw key for quick identification
+                "row_id": rc.get("row_id"),
+                "chunk_id": rc.get("chunk_id"),
+                "sheet_name": rc.get("sheet_name"),
+                "row_number": rc.get("row_number"),
+                "chunk_index": rc.get("chunk_index"),
+                "chunk_count": rc.get("chunk_count"),
             }
-        )
+            store["chunks"].append(mem_item)
+            store["embeddings"].append(vec)
 
-    # Persist to vector DB (best-effort; ignore failures)
-    try:
-        vector_store.add_embeddings(
-            session_id=session_id,
-            items=items_for_db,
-            vectors=vectors,
-            model=_get_embedding_model_name(),
-        )
-    except Exception:
-        pass
+            # Persisted 'key' stores JSON-encoded metadata for later reconstruction
+            meta = {
+                "row_id": rc.get("row_id"),
+                "chunk_id": rc.get("chunk_id"),
+                "sheet_name": rc.get("sheet_name"),
+                "row_number": rc.get("row_number"),
+                "chunk_index": rc.get("chunk_index"),
+                "chunk_count": rc.get("chunk_count"),
+            }
+            items_for_db.append(
+                {
+                    "text": rc.get("text", ""),
+                    "filename": filename,
+                    "source_type": "xlsx_row_chunk",
+                    "key": json.dumps(meta, ensure_ascii=False),
+                }
+            )
+
+        # Persist to vector DB (best-effort; ignore failures)
+        try:
+            vector_store.add_embeddings(
+                session_id=session_id,
+                items=items_for_db,
+                vectors=vectors,
+                model=_get_embedding_model_name(),
+            )
+        except Exception:
+            pass
 
 
 def _vector_search(session_id: str, query: str, top_k: int = 3) -> List[str]:
@@ -922,17 +947,32 @@ def chat_wsinfo():
 # --- FILE UPLOAD ENDPOINTS FOR CONTEXT ---
 
 # PUBLIC_INTERFACE
+# Models for async job acceptance and status
+class UploadJobAccepted(BaseModel):
+    """Acknowledgement for async upload processing."""
+    job_id: str = Field(..., description="Background job identifier")
+    status_url: str = Field(..., description="URL to poll job status")
+    message: str = Field(..., description="Acknowledgement message")
+
+
+class UploadJobStatus(BaseModel):
+    """Status for an async upload processing job."""
+    job_id: str = Field(..., description="Background job identifier")
+    status: str = Field(..., description="Job status: pending|running|succeeded|failed|canceled")
+    progress: int = Field(..., ge=0, le=100, description="Progress percentage")
+    message: str = Field(..., description="Status message")
+    result: Optional[UploadContextResponse] = Field(default=None, description="Final result if completed")
+
+
+# PUBLIC_INTERFACE
 @app.post(
     "/chat/upload-context",
     response_model=UploadContextResponse,
     tags=["Chat"],
     summary="Upload context files for a chat session",
     description=(
-        "Accepts one or more files via multipart/form-data and extracts readable text from supported types "
-        "(.docx, .xlsx, .pdf, .txt, .json). The extracted content is stored per session and used as additional context "
-        "when answering subsequent chat queries. Builds a vector index (Gemini embeddings) for semantic retrieval. "
-        "JSON files are parsed and flattened into dotted key-value pairs (e.g., order.customer.name: Alice) and each pair is indexed as an individual fact. "
-        "Returns an acknowledgment with per-file processing results and a preview."
+        "Synchronous processing: extracts readable text from supported files and indexes them for retrieval. "
+        "For very large uploads, prefer the async endpoint to avoid timeouts."
     ),
     responses={
         400: {"description": "Validation error or no files provided"},
@@ -945,160 +985,110 @@ def upload_chat_context(
 ):
     """
     PUBLIC_INTERFACE
-    Upload and process files to add user-provided context for a given chat session.
-
-    Process:
-        - For non-JSON: Extract readable text, split into overlapping chunks, embed each chunk, and index.
-        - For JSON (.json): Parse and flatten nested structures into dotted key-value pairs; each pair is treated
-          as an individual fact (chunk), embedded and indexed for retrieval.
-        - For XLSX (.xlsx): Treat each row as the logical unit. Split wide rows into column chunks (~30 per chunk),
-          produce compact readable text with '|' separators, include row/chunk IDs as metadata, and index each chunk.
-
-    Args:
-        session_id (str): The chat session ID.
-        files (List[UploadFile]): Uploaded files (multipart/form-data).
-
-    Returns:
-        UploadContextResponse: Processing results and acknowledgment.
+    Synchronous upload and processing. Suitable for small/medium files. For large/wide Excel files,
+    use /chat/upload-context/async to prevent timeouts.
     """
-    from .file_utils import (
-        extract_text_from_bytes,
-        summarize_text_preview,
-        parse_and_flatten_json,
-        format_kv_pairs_as_text,
-        parse_xlsx_to_row_chunks,
+    from .processing import process_files
+
+    # Read file bytes upfront
+    files_data: List[Tuple[str, bytes]] = []
+    for f in files:
+        filename = f.filename or "unnamed"
+        try:
+            data = f.file.read()
+        except Exception:
+            data = b""
+        files_data.append((filename, data))
+
+    result = process_files(session_id=session_id, files_data=files_data, progress_callback=None)
+    # Convert dict to UploadContextResponse model
+    return UploadContextResponse(
+        session_id=result["session_id"],
+        files_processed=[UploadedFileResult(**r) for r in result["files_processed"]],
+        total_chars=result["total_chars"],
+        message=result["message"],
     )
+
+
+# PUBLIC_INTERFACE
+@app.post(
+    "/chat/upload-context/async",
+    response_model=UploadJobAccepted,
+    tags=["Chat"],
+    summary="Upload context files (async)",
+    description=(
+        "Queues files for background processing (chunking, embeddings, ChromaDB storage) to avoid timeouts. "
+        "Returns a job_id to poll status."
+    ),
+)
+def upload_chat_context_async(
+    session_id: str = Form(..., description="Session ID to associate uploaded context with"),
+    files: List[UploadFile] = File(..., description="One or more files (.docx, .xlsx, .pdf, .txt, .json)"),
+):
+    """
+    PUBLIC_INTERFACE
+    Accepts files and schedules background processing to prevent gateway timeouts on large uploads.
+    """
+    from .background_jobs import get_job_manager
 
     if not session_id or not isinstance(session_id, str):
         raise HTTPException(status_code=400, detail="session_id must be provided as a non-empty string.")
-    if not files or len(files) == 0:
+    if not files:
         raise HTTPException(status_code=400, detail="At least one file must be provided.")
 
-    results: List[UploadedFileResult] = []
-    combined_text_parts: List[str] = []
-    total_chars = 0
-
+    # Read file bytes upfront (UploadFile cannot be used outside request context)
+    files_data: List[Tuple[str, bytes]] = []
     for f in files:
         filename = f.filename or "unnamed"
-        name_lower = filename.lower()
-        # Read file bytes
         try:
             data = f.file.read()
-        except Exception as e:
-            results.append(
-                UploadedFileResult(
-                    filename=filename, size=0, content_chars=0, preview="", error=f"Failed to read file: {e}"
-                )
-            )
-            continue
+        except Exception:
+            data = b""
+        files_data.append((filename, data))
 
-        size = len(data or b"")
+    jm = get_job_manager()
+    job_id = jm.submit_upload_job(session_id=session_id, files_data=files_data)
 
-        # Handle JSON separately: parse + flatten to dotted pairs
-        if name_lower.endswith(".json"):
-            pairs, parse_err = parse_and_flatten_json(data or b"")
-            text = format_kv_pairs_as_text(pairs) if pairs else ""
-            preview = summarize_text_preview(text, max_chars=500) if text else ""
-            chars = len(text)
+    # Construct status URL (best-effort)
+    status_url = f"/chat/upload-context/jobs/{job_id}"
+    return UploadJobAccepted(job_id=job_id, status_url=status_url, message="Accepted for background processing")
 
-            # Append/Index only if successful and non-empty
-            if pairs and not parse_err:
-                combined_text_parts.append(f"[{filename}]\n{text}\n")
-                total_chars += chars
-                try:
-                    _index_json_kv_pairs_for_session(session_id, filename, pairs)
-                except Exception:
-                    # Do not fail upload on indexing failure; retrieval will fall back gracefully.
-                    pass
 
-            results.append(
-                UploadedFileResult(
-                    filename=filename,
-                    size=size,
-                    content_chars=chars,
-                    preview=preview,
-                    error=parse_err,
-                )
-            )
-            continue  # next file
+# PUBLIC_INTERFACE
+@app.get(
+    "/chat/upload-context/jobs/{job_id}",
+    response_model=UploadJobStatus,
+    tags=["Chat"],
+    summary="Upload job status",
+    description="Poll the status of a background upload processing job.",
+)
+def get_upload_job_status(job_id: str):
+    """
+    PUBLIC_INTERFACE
+    Return the current status/progress of a queued/running upload job, and the final
+    result if completed.
+    """
+    from .background_jobs import get_job_manager
+    jm = get_job_manager()
+    info = jm.get_job(job_id)
+    if not info:
+        raise HTTPException(status_code=404, detail="Job not found")
 
-        # Handle XLSX with row-chunking, metadata, and compact formatting
-        if name_lower.endswith(".xlsx"):
-            row_chunks, parse_err = parse_xlsx_to_row_chunks(data or b"", cols_per_chunk=30)
-            # For preview, join the chunk texts
-            joined = "\n".join(rc["text"] for rc in row_chunks) if row_chunks else ""
-            preview = summarize_text_preview(joined, max_chars=500) if joined else ""
-            chars = len(joined)
-
-            if row_chunks and not parse_err:
-                combined_text_parts.append(f"[{filename}]\n{joined}\n")
-                total_chars += chars
-                try:
-                    _index_xlsx_row_chunks_for_session(session_id, filename, row_chunks)
-                except Exception:
-                    # Do not fail upload on indexing failure; retrieval will fall back gracefully.
-                    pass
-
-            results.append(
-                UploadedFileResult(
-                    filename=filename,
-                    size=size,
-                    content_chars=chars,
-                    preview=preview,
-                    error=parse_err,
-                )
-            )
-            continue  # next file
-
-        # Non-JSON and Non-XLSX: use general extractors (txt, pdf, docx)
-        text, err = extract_text_from_bytes(filename, data or b"")
-        preview = summarize_text_preview(text, max_chars=500) if text else ""
-        chars = len(text)
-
-        if text and not err:
-            combined_text_parts.append(f"[{filename}]\n{text}\n")
-            total_chars += chars
-
-            # Build semantic index: chunk + embed + store
-            try:
-                _index_text_for_session(session_id, filename, text)
-            except Exception:
-                # Do not fail upload on indexing failure; retrieval will fall back gracefully.
-                pass
-
-        results.append(
-            UploadedFileResult(
-                filename=filename,
-                size=size,
-                content_chars=chars,
-                preview=preview,
-                error=err,
-            )
+    # Coerce result to model if available
+    result_model = None
+    if info.get("result"):
+        r = info["result"]
+        result_model = UploadContextResponse(
+            session_id=r["session_id"],
+            files_processed=[UploadedFileResult(**x) for x in r["files_processed"]],
+            total_chars=r["total_chars"],
+            message=r["message"],
         )
 
-    # If at least one file produced content, update the legacy session context store (for optional previews)
-    if total_chars > 0:
-        combined_text = "\n".join(combined_text_parts).strip()
-        prev_ctx = CONTEXT_STORE.get(session_id, {})
-        prev_combined = prev_ctx.get("combined", "")
-        prev_files = prev_ctx.get("files", [])
-
-        # Merge with previous context if any
-        merged_combined = (prev_combined + "\n\n" + combined_text).strip() if prev_combined else combined_text
-        CONTEXT_STORE[session_id] = {
-            "files": prev_files + [r.model_dump() for r in results],
-            "combined": merged_combined,
-        }
-
-    message = (
-        "Processed files successfully. Session context updated and indexed."
-        if total_chars > 0
-        else "Processed files, but no readable content was extracted."
-    )
-
-    return UploadContextResponse(
-        session_id=session_id,
-        files_processed=results,
-        total_chars=total_chars,
-        message=message,
+    return UploadJobStatus(
+        job_id=job_id,
+        status=info.get("status", "unknown"),
+        progress=int(info.get("progress", 0)),
+        message=info.get("message", ""),
+        result=result_model,
     )
