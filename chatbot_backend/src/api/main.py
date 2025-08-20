@@ -41,6 +41,17 @@ CONVERSATION_MEMORY: Dict[str, ConversationBufferMemory] = {}
 # Structure: { session_id: { "files": [ {filename, size, chars, preview, error?} ], "combined": str } }
 CONTEXT_STORE: Dict[str, Dict[str, Any]] = {}
 
+# Per-session schema summaries extracted from large Excel files for LLM context lookup.
+# Structure:
+#   EXCEL_SCHEMA_STORE[session_id] = {
+#       "<filename>": {
+#           "schema": { ...structured schema... },
+#           "summary": "Sheet: ...; Columns: [...]"   # human-readable quick summary
+#       },
+#       ...
+#   }
+EXCEL_SCHEMA_STORE: Dict[str, Dict[str, Any]] = {}
+
 # Per-session in-memory vector index for RAG.
 # Structure:
 #   RAG_INDEX_STORE[session_id] = {
@@ -434,7 +445,14 @@ def chat(request: ChatRequest):
 
         # Retrieve top-k relevant chunks from vector index
         top_chunks = _vector_search(session_id, request.query, top_k=3)
-        retrieved_context = "\n---\n".join(top_chunks).strip()
+        # Include any Excel schema summaries available for this session to help the model understand data layout
+        excel_schema_notes = []
+        sess_schema = EXCEL_SCHEMA_STORE.get(session_id) or {}
+        # Keep this lightweight: include only up to 2 schema summaries
+        for fname, entry in list(sess_schema.items())[:2]:
+            if isinstance(entry, dict) and "summary" in entry:
+                excel_schema_notes.append(f"[{fname} schema]\n{entry['summary']}")
+        retrieved_context = "\n---\n".join([*top_chunks, *excel_schema_notes]).strip()
 
         # Compose Gemini answer with retrieved context (if any)
         try:
@@ -576,7 +594,7 @@ def upload_chat_context(
     Returns:
         UploadContextResponse: Processing results and acknowledgment.
     """
-    from .file_utils import extract_text_from_bytes, summarize_text_preview
+    from .file_utils import extract_text_from_bytes, summarize_text_preview, extract_xlsx_schema_or_text
 
     if not session_id or not isinstance(session_id, str):
         raise HTTPException(status_code=400, detail="session_id must be provided as a non-empty string.")
@@ -601,15 +619,38 @@ def upload_chat_context(
             continue
 
         size = len(data or b"")
-        # Extract
-        text, err = extract_text_from_bytes(filename, data or b"")
+        # Extract with special handling for Excel large files
+        text = ""
+        err = None
+        schema_summary = None
+        if (filename or "").lower().endswith(".xlsx"):
+            summary_or_text, schema, excel_err = extract_xlsx_schema_or_text(filename, data or b"")
+            if excel_err:
+                text, err = "", excel_err
+            else:
+                if schema:
+                    # Large file path: store schema and provide human-readable summary as preview
+                    schema_summary = {"schema": schema, "summary": summary_or_text}
+                    text = summary_or_text  # Use the concise schema summary as the extracted "text"
+                else:
+                    # Small file path: we have full text
+                    text = summary_or_text
+        else:
+            text, err = extract_text_from_bytes(filename, data or b"")
+
         preview = summarize_text_preview(text, max_chars=500) if text else ""
         chars = len(text)
 
         # Append to combined only if successful and non-empty
-        if text and not err:
+        if not err and text:
             combined_text_parts.append(f"[{filename}]\n{text}\n")
             total_chars += chars
+
+            # Store Excel schema for large files for LLM context lookup
+            if schema_summary:
+                sess_map = EXCEL_SCHEMA_STORE.get(session_id, {})
+                sess_map[filename] = schema_summary
+                EXCEL_SCHEMA_STORE[session_id] = sess_map
 
             # Build semantic index: chunk + embed + store
             try:
