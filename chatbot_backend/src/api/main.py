@@ -594,7 +594,13 @@ def upload_chat_context(
     Returns:
         UploadContextResponse: Processing results and acknowledgment.
     """
-    from .file_utils import extract_text_from_bytes, summarize_text_preview, extract_xlsx_schema_or_text
+    from .file_utils import (
+        extract_text_from_bytes,
+        summarize_text_preview,
+        extract_xlsx_schema_or_text,
+        build_xlsx_column_chunks_from_schema,
+        render_xlsx_column_chunk_text,
+    )
 
     if not session_id or not isinstance(session_id, str):
         raise HTTPException(status_code=400, detail="session_id must be provided as a non-empty string.")
@@ -632,6 +638,21 @@ def upload_chat_context(
                     # Large file path: store schema and provide human-readable summary as preview
                     schema_summary = {"schema": schema, "summary": summary_or_text}
                     text = summary_or_text  # Use the concise schema summary as the extracted "text"
+
+                    # Additionally, build column chunks and index each chunk separately
+                    try:
+                        col_chunks = build_xlsx_column_chunks_from_schema(schema, group_size=100, prefer_theme_groups=True)
+                        for ch in col_chunks:
+                            chunk_text = render_xlsx_column_chunk_text(
+                                filename=filename,
+                                sheet=ch.get("sheet", "Sheet"),
+                                group_label=ch.get("group_label", ""),
+                                column_names=ch.get("column_names", []),
+                            )
+                            _index_text_for_session(session_id, f"{filename}:{ch.get('sheet')}:{ch.get('group_label')}", chunk_text)
+                    except Exception:
+                        # Do not block upload if chunking fails
+                        pass
                 else:
                     # Small file path: we have full text
                     text = summary_or_text

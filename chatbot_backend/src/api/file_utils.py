@@ -130,6 +130,138 @@ def _infer_column_type(samples: List[Any]) -> str:
     return "string"
 
 
+def _group_headers_by_theme(headers: List[str]) -> Dict[str, List[int]]:
+    """
+    Group column indices by header 'theme' using simple heuristics.
+    Theme is inferred by common prefixes before delimiters like ':', '-', or by shared keywords.
+
+    Returns:
+        dict: {theme: [zero_based_col_indices]}
+    """
+    import re
+    themes: Dict[str, List[int]] = {}
+    for idx, h in enumerate(headers):
+        base = (h or "").strip()
+        # Normalize
+        key = base.lower()
+        # Try to extract thematic prefix
+        m = re.match(r"([a-z0-9 ]+)[ _:-]+.*", key)
+        theme = m.group(1).strip() if m else key
+        # Guard: if theme too short, use full header
+        if len(theme) < 3:
+            theme = key
+        themes.setdefault(theme, []).append(idx)
+    return themes
+
+
+def _fixed_size_column_groups(num_cols: int, group_size: int = 100) -> List[List[int]]:
+    """
+    Build equal-sized groups of zero-based column indices.
+    """
+    groups: List[List[int]] = []
+    start = 0
+    while start < num_cols:
+        end = min(num_cols, start + group_size)
+        groups.append(list(range(start, end)))
+        start = end
+    return groups
+
+
+# PUBLIC_INTERFACE
+def build_xlsx_column_chunks_from_schema(
+    schema: Dict[str, Any],
+    group_size: int = 100,
+    prefer_theme_groups: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    PUBLIC_INTERFACE
+    Given a large-workbook schema (as returned by extract_xlsx_schema_or_text),
+    compute column chunk groups for each sheet.
+
+    If prefer_theme_groups is True, attempt to group columns by header theme; if that
+    yields too many tiny groups or is ineffective, fall back to fixed-size groups.
+
+    Returns:
+        List[Dict[str, Any]]:
+            [
+              {
+                "sheet": "Sheet1",
+                "group_type": "theme" | "fixed",
+                "group_label": "orders" | "columns_1_100",
+                "column_indices": [0,1,2,...],   # zero-based indices
+                "column_names": ["Order ID", "Order Date", ...]
+              },
+              ...
+            ]
+    """
+    chunks: List[Dict[str, Any]] = []
+    if not schema or "sheets" not in schema:
+        return chunks
+
+    for sheet in schema.get("sheets", []):
+        headers = [c.get("name", f"Column_{i+1}") for i, c in enumerate(sheet.get("columns", []))]
+        num_cols = len(headers)
+
+        used_groups: List[List[int]] = []
+        group_type = "fixed"
+        labels: List[str] = []
+
+        if prefer_theme_groups and headers:
+            theme_map = _group_headers_by_theme(headers)
+            # Consider theme grouping effective if average group size >= 3 or max group size >= group_size/2
+            group_lists = list(theme_map.values())
+            if group_lists:
+                avg = sum(len(g) for g in group_lists) / len(group_lists)
+                mx = max(len(g) for g in group_lists)
+                if avg >= 3 or mx >= max(10, group_size // 2):
+                    used_groups = [sorted(g) for g in group_lists]
+                    group_type = "theme"
+                    labels = list(theme_map.keys())
+
+        if not used_groups:
+            used_groups = _fixed_size_column_groups(num_cols, group_size=group_size)
+            group_type = "fixed"
+            labels = [f"columns_{g[0]+1}_{g[-1]+1}" for g in used_groups if g]
+
+        # Build chunk descriptors
+        for i, g in enumerate(used_groups):
+            if not g:
+                continue
+            column_names = [headers[j] for j in g]
+            label = labels[i] if i < len(labels) else (f"{group_type}_{i+1}")
+            chunks.append(
+                {
+                    "sheet": sheet.get("name", "Sheet"),
+                    "group_type": group_type,
+                    "group_label": label,
+                    "column_indices": g,
+                    "column_names": column_names,
+                }
+            )
+    return chunks
+
+
+# PUBLIC_INTERFACE
+def render_xlsx_column_chunk_text(
+    filename: str,
+    sheet: str,
+    group_label: str,
+    column_names: List[str],
+) -> str:
+    """
+    PUBLIC_INTERFACE
+    Render a lightweight textual representation for a column chunk to be embedded/indexed.
+
+    This avoids scanning all rows of the Excel file; it relies on column names and types in schema,
+    focusing the embedding on the 'theme' of the columns.
+
+    Returns:
+        str: A concise description suitable for RAG indexing.
+    """
+    names_preview = ", ".join(column_names[:50])
+    return f"[{filename} | {sheet} | Columns: {group_label}]\n{names_preview}"
+
+
 # PUBLIC_INTERFACE
 def extract_xlsx_schema_or_text(
     filename: str,
