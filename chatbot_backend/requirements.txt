@@ -52,3 +52,4 @@ python-docx==1.1.2
 openpyxl==3.1.5
 pdfminer.six==20231228
 pandas==2.2.3
+duckdb==0.9.2

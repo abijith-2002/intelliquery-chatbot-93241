@@ -18,6 +18,13 @@ import re
 
 from dotenv import load_dotenv
 from langchain.memory import ConversationBufferMemory
+# DuckDB integration
+from .duckdb_utils import (
+    register_pandas_tables,
+    try_parse_inline_sql,
+    execute_sql_compact,
+    explain_schema,
+)
 
 # Import authentication/database helpers
 from .auth_utils import (
@@ -801,6 +808,27 @@ def chat(request: ChatRequest):
             raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
 
         # 1) Try analytics detection + computation on uploaded Excel data first
+        # 1a) If user provided inline SQL or direct SQL query, execute via DuckDB
+        inline_sql = try_parse_inline_sql(request.query)
+        if inline_sql:
+            try:
+                tsv, total_rows, total_cols = execute_sql_compact(session_id, inline_sql, row_limit=50, col_limit=24)
+                # Return a compact preview; mention counts succinctly
+                header = f"[SQL result preview: rows={total_rows}, cols={total_cols}]"
+                final_ans = _clean_gemini_output(f"{header}\n{tsv}")
+                try:
+                    memory.save_context({"input": request.query}, {"output": _safe_str_output(final_ans)})
+                except Exception:
+                    pass
+                return ChatAnswerResponse(answer=final_ans)
+            except Exception as ex:
+                final_ans = _clean_gemini_output(f"SQL error: {ex}")
+                try:
+                    memory.save_context({"input": request.query}, {"output": _safe_str_output(final_ans)})
+                except Exception:
+                    pass
+                return ChatAnswerResponse(answer=final_ans)
+
         analytics_answer = _maybe_answer_analytics(session_id, request.query)
         if analytics_answer is not None:
             final_ans = _clean_gemini_output(_safe_str_output(analytics_answer))
@@ -826,7 +854,7 @@ def chat(request: ChatRequest):
                 excel_schema_notes.append(f"[{fname} schema]\n{entry['summary']}")
 
         # Build final retrieved context prioritizing:
-        # 1) JIT data slices, 2) vector-search chunks, 3) summary stats/distributions, 4) brief schema notes
+        # 1) JIT data slices, 2) vector-search chunks, 3) summary stats/distributions, 4) brief schema notes, 5) DuckDB schema
         context_parts = []
         if jit_context:
             context_parts.append(jit_context)
@@ -841,6 +869,23 @@ def chat(request: ChatRequest):
             pass
         if excel_schema_notes:
             context_parts.append("\n".join(excel_schema_notes))
+
+        # Optionally include a compact DuckDB schema snapshot if question suggests analytics/data exploration
+        try:
+            q_low = (request.query or "").lower()
+            if any(x in q_low for x in ["sql", "table", "columns", "schema", "dataframe", "sheet", "join", "group by", "select", "average", "sum", "count"]):
+                schema = explain_schema(session_id)
+                tables = schema.get("tables", [])[:5]  # limit snapshot size
+                if tables:
+                    lines = []
+                    for t in tables:
+                        cols = ", ".join([f"{c.get('name')}:{c.get('type')}" for c in (t.get("columns") or [])[:25]])
+                        lines.append(f"{t.get('name')}: {cols}")
+                    context_parts.append("[DuckDB schema snapshot]\n" + "\n".join(lines))
+                    context_parts.append("Note: You may generate SQL using these table names to answer analytical questions. Return only concise results.")
+        except Exception:
+            pass
+
         retrieved_context = "\n---\n".join(context_parts).strip()
 
         # Compose Gemini answer with retrieved context (if any)
@@ -1223,6 +1268,14 @@ def upload_chat_context(
                         continue
                 sess_excel_map[filename] = {"bytes": data or b"", "sheets": sheet_map}
                 EXCEL_RAW_STORE[session_id] = sess_excel_map
+
+                # Register sheets as DuckDB tables for this session
+                try:
+                    register_pandas_tables(session_id, filename, sheet_map)
+                except Exception:
+                    # Do not fail upload if DuckDB registration fails
+                    pass
+
                 # Compute and store summaries for this Excel file
                 try:
                     summaries = _compute_excel_summaries_for_file(sess_excel_map[filename])
