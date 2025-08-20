@@ -48,7 +48,7 @@ CONTEXT_STORE: Dict[str, Dict[str, Any]] = {}
 #           {
 #              "text": str,
 #              "filename": str,
-#              "source_type": "file_text" | "json_kv",
+#              "source_type": "file_text" | "json_kv" | "xlsx_row",
 #              "key": Optional[str]  # present for json_kv
 #           }, ...
 #       ],
@@ -329,6 +329,29 @@ def _index_json_kv_pairs_for_session(session_id: str, filename: str, pairs: List
         store["embeddings"].append(vec)
 
 
+def _index_xlsx_documents_for_session(session_id: str, filename: str, docs: List[str]):
+    """
+    Index per-row XLSX documents (already formatted natural-language strings).
+
+    Args:
+        session_id (str): Session ID.
+        filename (str): Source XLSX filename.
+        docs (List[str]): List of natural-language row documents.
+    """
+    _ensure_session_index(session_id)
+    if not docs:
+        return
+    vectors = _embed_texts(docs)
+    store = RAG_INDEX_STORE[session_id]
+    for doc_text, vec in zip(docs, vectors):
+        store["chunks"].append({
+            "text": doc_text,
+            "filename": filename,
+            "source_type": "xlsx_row",
+        })
+        store["embeddings"].append(vec)
+
+
 def _vector_search(session_id: str, query: str, top_k: int = 3) -> List[str]:
     """
     Perform semantic vector search for the top_k relevant chunks using cosine similarity
@@ -363,9 +386,11 @@ def _vector_search_items(session_id: str, query: str, top_k: int = 6) -> List[Di
         else:
             # Fallback lexical similarity
             score = _simple_similarity(query, item["text"])
-        # Apply a modest boost to JSON facts to prioritize them as primary context
+        # Apply boosts to structured facts/rows to prioritize them as primary context
         if item.get("source_type") == "json_kv":
-            score *= 1.2  # 20% boost
+            score *= 1.2  # 20% boost for JSON facts
+        elif item.get("source_type") == "xlsx_row":
+            score *= 1.1  # 10% boost for Excel row documents
         scored.append((score, item))
 
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -622,7 +647,9 @@ def upload_chat_context(
     Process:
         - For non-JSON: Extract readable text, split into overlapping chunks, embed each chunk, and index.
         - For JSON (.json): Parse and flatten nested structures into dotted key-value pairs; each pair is treated
-          as an individual fact (chunk), embedded and indexed for retrieval. The preview shows formatted pairs.
+          as an individual fact (chunk), embedded and indexed for retrieval.
+        - For XLSX (.xlsx): Use pandas to read each sheet and convert each row into a natural-language document;
+          each document is embedded and indexed individually.
 
     Args:
         session_id (str): The chat session ID.
@@ -636,6 +663,7 @@ def upload_chat_context(
         summarize_text_preview,
         parse_and_flatten_json,
         format_kv_pairs_as_text,
+        parse_xlsx_to_documents,
     )
 
     if not session_id or not isinstance(session_id, str):
@@ -691,7 +719,34 @@ def upload_chat_context(
             )
             continue  # next file
 
-        # Non-JSON: use general extractors
+        # Handle XLSX: pandas-based row-to-document indexing
+        if name_lower.endswith(".xlsx"):
+            docs, parse_err = parse_xlsx_to_documents(data or b"")
+            joined = "\n".join(docs) if docs else ""
+            preview = summarize_text_preview(joined, max_chars=500) if joined else ""
+            chars = len(joined)
+
+            if docs and not parse_err:
+                combined_text_parts.append(f"[{filename}]\n{joined}\n")
+                total_chars += chars
+                try:
+                    _index_xlsx_documents_for_session(session_id, filename, docs)
+                except Exception:
+                    # Do not fail upload on indexing failure; retrieval will fall back gracefully.
+                    pass
+
+            results.append(
+                UploadedFileResult(
+                    filename=filename,
+                    size=size,
+                    content_chars=chars,
+                    preview=preview,
+                    error=parse_err,
+                )
+            )
+            continue  # next file
+
+        # Non-JSON and Non-XLSX: use general extractors (txt, pdf, docx)
         text, err = extract_text_from_bytes(filename, data or b"")
         preview = summarize_text_preview(text, max_chars=500) if text else ""
         chars = len(text)

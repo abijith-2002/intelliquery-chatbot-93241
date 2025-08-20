@@ -6,10 +6,10 @@ from typing import List, Tuple, Optional, Any
 # - TXT: native decode
 # - PDF: pdfminer.six
 # - DOCX: python-docx
-# - XLSX: openpyxl
+# - XLSX: pandas (reads via openpyxl engine)
 from pdfminer.high_level import extract_text as pdf_extract_text
 from docx import Document as DocxDocument
-from openpyxl import load_workbook
+import pandas as pd
 
 
 # PUBLIC_INTERFACE
@@ -22,7 +22,7 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
         - .txt  : UTF-8 decode with errors ignored
         - .pdf  : pdfminer.six text extraction
         - .docx : python-docx extraction (paragraphs and table cells)
-        - .xlsx : openpyxl extraction (sheet name and cells, tab-separated rows)
+        - .xlsx : pandas-based row-wise document extraction; returns a joined text preview
 
     Args:
         filename (str): Original filename (used for type detection).
@@ -43,7 +43,12 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
         if name_lower.endswith(".docx"):
             return _extract_docx(content), None
         if name_lower.endswith(".xlsx"):
-            return _extract_xlsx(content), None
+            # For backwards compatibility this returns a single text blob by joining
+            # the per-row natural language documents with newlines.
+            docs, err = parse_xlsx_to_documents(content)
+            if err:
+                return "", err
+            return "\n".join(docs).strip(), None
         return "", f"Unsupported file type for '{filename}'. Allowed: .txt, .pdf, .docx, .xlsx"
     except Exception as e:
         return "", f"Failed to extract '{filename}': {e}"
@@ -81,25 +86,72 @@ def _extract_docx(content: bytes) -> str:
     return "\n".join(parts).strip()
 
 
+# PUBLIC_INTERFACE
+def parse_xlsx_to_documents(content: bytes) -> Tuple[List[str], Optional[str]]:
+    """
+    PUBLIC_INTERFACE
+    Read an Excel (.xlsx) file using pandas and convert each non-empty row
+    into a natural-language document string suitable for embeddings and indexing.
+
+    Document format per row:
+        "Sheet <sheet_name> | Row <row_number>: col1: val1; col2: val2; ..."
+
+    Empty rows (all NaN/blank) are skipped.
+
+    Args:
+        content (bytes): Raw file content of the .xlsx file.
+
+    Returns:
+        Tuple[List[str], Optional[str]]:
+            - List of document strings (one per row)
+            - error message if parsing failed, else None
+    """
+    try:
+        bio = io.BytesIO(content or b"")
+        # Use pandas.ExcelFile for efficient multi-sheet handling
+        xls = pd.ExcelFile(bio)
+        documents: List[str] = []
+        for sheet_name in xls.sheet_names:
+            df = pd.read_excel(xls, sheet_name=sheet_name, dtype=object)
+            # Normalize column names to strings
+            cols = [str(c).strip() if c is not None else "" for c in df.columns]
+            df.columns = cols
+
+            # Iterate rows and build natural-language strings
+            for i, row in df.iterrows():
+                # Build key-value pairs for non-null values
+                kv_pairs = []
+                for col in cols:
+                    try:
+                        val = row[col]
+                    except KeyError:
+                        continue
+                    # Treat NaN/None/empty as empty
+                    if pd.isna(val):
+                        continue
+                    sval = str(val).strip()
+                    if sval == "":
+                        continue
+                    # Replace internal newlines for cleaner sentences
+                    sval = " ".join(sval.split())
+                    kv_pairs.append(f"{col}: {sval}")
+                if not kv_pairs:
+                    continue
+                doc_str = f"Sheet {sheet_name} | Row {int(i) + 1}: " + "; ".join(kv_pairs)
+                documents.append(doc_str)
+        return documents, None
+    except Exception as e:
+        return [], f"Failed to parse .xlsx content: {e}"
+
+
 def _extract_xlsx(content: bytes) -> str:
-    """Extract text from XLSX using openpyxl (sheet by sheet, TSV rows)."""
-    bio = io.BytesIO(content)
-    wb = load_workbook(bio, data_only=True, read_only=True)
-    parts: List[str] = []
-    for ws in wb.worksheets:
-        parts.append(f"[Sheet: {ws.title}]")
-        for row in ws.iter_rows(values_only=True):
-            vals = []
-            for cell in row:
-                if cell is None:
-                    vals.append("")
-                else:
-                    vals.append(str(cell))
-            # Skip completely empty rows
-            if any(v.strip() for v in vals):
-                parts.append("\t".join(vals))
-        parts.append("")  # blank line between sheets
-    return "\n".join(parts).strip()
+    """
+    Extract text from XLSX using pandas by converting each row to a natural-language
+    document and joining them with newlines. Prefer parse_xlsx_to_documents() directly
+    when you need individual row documents for embeddings.
+    """
+    docs, _err = parse_xlsx_to_documents(content)
+    return "\n".join(docs).strip()
 
 
 # PUBLIC_INTERFACE
