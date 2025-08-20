@@ -415,6 +415,185 @@ def health_check():
     return {"message": "Healthy"}
 
 
+def _normalize_str(s: Any) -> str:
+    """Normalize any value to a trimmed lower-case string for matching purposes."""
+    try:
+        return str(s).strip()
+    except Exception:
+        return ""
+
+def _infer_possible_column_names(df_cols: List[str], hint: str) -> List[str]:
+    """
+    Try to resolve a user-provided column hint to actual columns:
+    - exact case-insensitive match
+    - contains hint
+    - fuzzy token overlap
+    """
+    hint_lc = (hint or "").lower().strip()
+    if not hint_lc:
+        return []
+    exact = [c for c in df_cols if str(c).lower().strip() == hint_lc]
+    if exact:
+        return exact
+    contains = [c for c in df_cols if hint_lc in str(c).lower()]
+    if contains:
+        return contains[:3]
+
+    # token overlap (very light)
+    import re
+    tokens = set(re.findall(r"[a-z0-9]+", hint_lc))
+    if not tokens:
+        return []
+    scored = []
+    for c in df_cols:
+        ctoks = set(re.findall(r"[a-z0-9]+", str(c).lower()))
+        if not ctoks:
+            continue
+        overlap = len(tokens & ctoks) / max(len(tokens), 1)
+        if overlap > 0:
+            scored.append((overlap, c))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [c for _, c in scored[:3]]
+
+def _maybe_fetch_jit_excel_context(session_id: str, query: str, row_limit: int = 25) -> Optional[str]:
+    """
+    PUBLIC_INTERFACE
+    Dynamically fetch only the columns/data requested in the user's query from uploaded Excel DataFrames
+    and render a concise, tabular preview as LLM context.
+
+    Query patterns supported (heuristic, case-insensitive):
+      - "show <col1>[, <col2> ...] from sheet <sheet>"
+      - "list <col> where <colX> = <val> [in/from sheet <sheet>]"
+      - "what is the value of <col> for <colX> = <val> [in/from sheet <sheet>]"
+      - "show rows where <colX> = <val> [in/from sheet <sheet>]"
+      - "top/first N rows of [columns <col1>, <col2>] [from sheet <sheet>]"
+
+    Only small slices (up to row_limit) are returned to avoid large payloads.
+    """
+    import pandas as pd
+    q = (query or "").strip()
+    if not q:
+        return None
+
+    store = EXCEL_RAW_STORE.get(session_id)
+    if not store:
+        return None
+
+    q_lc = " ".join(q.lower().split())
+
+    # Extract sheet hint
+    sheet_hint = None
+    m_sheet = re.search(r"(?:in|from)\s+sheet\s+([a-z0-9 _\-\./]+)", q_lc)
+    if m_sheet:
+        sheet_hint = m_sheet.group(1).strip()
+
+    # Extract N for "top/first N rows" if present
+    n_rows_req = None
+    m_top = re.search(r"(?:top|first)\s+([0-9]+)\s+rows", q_lc)
+    if m_top:
+        try:
+            n_rows_req = int(m_top.group(1))
+        except Exception:
+            n_rows_req = None
+
+    # Extract simple equality filter "where <col> = <val>"
+    filter_col = None
+    filter_val: Optional[str] = None
+    m_where = re.search(r"where\s+([a-z0-9 _\-\./]+)\s*=\s*['\"]?([^'\"\n\r]+?)['\"]?(?:\s|$)", q_lc)
+    if m_where:
+        filter_col = m_where.group(1).strip()
+        filter_val = m_where.group(2).strip()
+
+    # Extract requested columns after "show"/"list" or "columns"
+    requested_cols: List[str] = []
+    m_cols_after_show = re.search(r"(?:show|list)\s+([a-z0-9 _,\-\./]+)\s+(?:from|in|where|for|top|first)", q_lc)
+    if m_cols_after_show:
+        part = m_cols_after_show.group(1).strip().strip(",")
+        requested_cols = [c.strip() for c in part.split(",") if c.strip()]
+
+    if not requested_cols:
+        m_cols_named = re.search(r"columns?\s+([a-z0-9 _,\-\./]+)", q_lc)
+        if m_cols_named:
+            part = m_cols_named.group(1).strip().strip(",")
+            requested_cols = [c.strip() for c in part.split(",") if c.strip()]
+
+    # Iterate frames; limit to hinted sheet if provided
+    frames: List[Tuple[str, str, "pd.DataFrame"]] = []
+    for fname, meta in store.items():
+        if not isinstance(meta, dict):
+            continue
+        sheets = meta.get("sheets") or {}
+        for sname, df in sheets.items():
+            if sheet_hint and sname.lower().strip() != sheet_hint:
+                continue
+            frames.append((fname, sname, df))
+
+    if not frames:
+        return None
+
+    # Try to prepare a small preview per matching frame
+    previews: List[str] = []
+    max_frames_preview = 2
+    for idx, (fn, sh, df) in enumerate(frames):
+        if idx >= max_frames_preview:
+            break
+        df_work = df.copy()
+
+        # Apply equality filter
+        if filter_col and filter_val is not None:
+            candidates = _infer_possible_column_names(list(df_work.columns), filter_col)
+            if candidates:
+                # Try first candidate
+                c0 = candidates[0]
+                try:
+                    mask = df_work[c0] == filter_val
+                except Exception:
+                    mask = df_work[c0].astype(str) == str(filter_val)
+                df_work = df_work[mask]
+
+        # Project only requested columns if specified
+        if requested_cols:
+            proj_cols: List[str] = []
+            for hint in requested_cols:
+                matches = _infer_possible_column_names(list(df_work.columns), hint)
+                proj_cols.extend(matches)
+            # De-duplicate while preserving order
+            seen = set()
+            proj_cols = [c for c in proj_cols if not (c in seen or seen.add(c))]
+            if proj_cols:
+                df_work = df_work[proj_cols]
+
+        # Determine how many rows to show
+        n = max(1, min(row_limit, n_rows_req if isinstance(n_rows_req, int) and n_rows_req > 0 else row_limit))
+
+        if df_work.empty:
+            # If nothing matches after filters/columns, skip
+            continue
+
+        # Create a compact, safe-to-serialize preview
+        try:
+            df_preview = df_work.head(n)
+            # Convert to markdown-like table for readability
+            # Keep small number of columns to avoid huge payloads
+            max_cols_preview = 12
+            if df_preview.shape[1] > max_cols_preview:
+                df_preview = df_preview.iloc[:, :max_cols_preview]
+            # Stringify with NA as empty
+            df_print = df_preview.fillna("").astype(str)
+            # Build simple TSV for compactness
+            headers = "\t".join([str(c) for c in df_print.columns.tolist()])
+            rows = ["\t".join(map(_normalize_str, r)) for r in df_print.values.tolist()]
+            table_text = headers + "\n" + "\n".join(rows)
+            previews.append(f"[{fn} | {sh} | JIT rows {min(n, len(df_work))}/{len(df_work)}]\n{table_text}")
+        except Exception:
+            # If preview fails, ignore this frame
+            continue
+
+    if not previews:
+        return None
+
+    return "\n---\n".join(previews)
+
 @app.post(
     "/chat",
     response_model=ChatAnswerResponse,
@@ -463,9 +642,13 @@ def chat(request: ChatRequest):
                 pass
             return ChatAnswerResponse(answer=final_ans)
 
-        # 2) Otherwise, use RAG + Gemini
+        # 2) Otherwise, use RAG + Gemini with just-in-time (JIT) Excel context
         # Retrieve top-k relevant chunks from vector index
         top_chunks = _vector_search(session_id, request.query, top_k=3)
+
+        # Attempt to fetch only the columns/data referenced by the user query from uploaded Excel DataFrames
+        jit_context = _maybe_fetch_jit_excel_context(session_id, request.query)
+
         # Include any Excel schema summaries available for this session to help the model understand data layout
         excel_schema_notes = []
         sess_schema = EXCEL_SCHEMA_STORE.get(session_id) or {}
@@ -473,7 +656,16 @@ def chat(request: ChatRequest):
         for fname, entry in list(sess_schema.items())[:2]:
             if isinstance(entry, dict) and "summary" in entry:
                 excel_schema_notes.append(f"[{fname} schema]\n{entry['summary']}")
-        retrieved_context = "\n---\n".join([*top_chunks, *excel_schema_notes]).strip()
+
+        # Build final retrieved context prioritizing JIT slices > retrieved chunks > brief schema notes
+        context_parts = []
+        if jit_context:
+            context_parts.append(jit_context)
+        if top_chunks:
+            context_parts.append("\n".join(top_chunks))
+        if excel_schema_notes:
+            context_parts.append("\n".join(excel_schema_notes))
+        retrieved_context = "\n---\n".join(context_parts).strip()
 
         # Compose Gemini answer with retrieved context (if any)
         try:
