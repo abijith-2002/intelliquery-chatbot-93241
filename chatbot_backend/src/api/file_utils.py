@@ -9,6 +9,7 @@ from typing import List, Tuple, Optional, Dict, Any
 from pdfminer.high_level import extract_text as pdf_extract_text
 from docx import Document as DocxDocument
 from openpyxl import load_workbook
+from itertools import islice
 
 
 # PUBLIC_INTERFACE
@@ -239,6 +240,119 @@ def build_xlsx_column_chunks_from_schema(
                 }
             )
     return chunks
+
+
+# PUBLIC_INTERFACE
+def iter_xlsx_row_slices(
+    filename: str,
+    content: bytes,
+    per_row_max_cols: int = 200,
+    group_size: int = 100,
+    max_rows: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """
+    PUBLIC_INTERFACE
+    Iterate an .xlsx and produce minimal 'record slices' for very wide rows.
+
+    Behavior:
+      - For each worksheet, read the header (first row) and subsequent data rows.
+      - If the number of columns > per_row_max_cols, split each row into multiple
+        column groups (slices) using fixed-size groups of length `group_size`.
+      - For narrower rows, a single slice containing all non-empty columns is produced.
+      - Each slice is a minimal text unit suitable for indexing/embedding.
+
+    Args:
+        filename: Original filename for traceability.
+        content: Raw xlsx bytes.
+        per_row_max_cols: Threshold of columns beyond which a row is sliced.
+        group_size: Number of columns per slice when slicing is needed.
+        max_rows: Optional cap on number of data rows to process per sheet (for safety).
+
+    Returns:
+        List[Dict[str, Any]]: A list of slice descriptors:
+            {
+              "sheet": str,
+              "row_index": int,  # 1-based Excel row number
+              "slice_index": int,  # 1-based slice index within the row
+              "column_indices": List[int],  # zero-based indices included in this slice
+              "text": str,  # rendered minimal text for the slice
+              "meta": {
+                  "filename": str,
+                  "group_label": str,  # e.g., columns_1_100
+              }
+            }
+    """
+    bio = io.BytesIO(content)
+    wb = load_workbook(bio, data_only=True, read_only=True)
+
+    slices: List[Dict[str, Any]] = []
+    for ws in wb.worksheets:
+        # Header row (names)
+        header_cells = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), None)
+        headers: List[str] = []
+        if header_cells:
+            headers = [str(c) if c is not None else f"Column_{idx+1}" for idx, c in enumerate(header_cells)]
+        num_cols = ws.max_column or len(headers)
+        if headers and num_cols < len(headers):
+            num_cols = len(headers)
+
+        # Decide if row slicing is needed based on width
+        needs_slicing = (num_cols or 0) > per_row_max_cols
+        column_groups: List[List[int]]
+        if needs_slicing:
+            column_groups = _fixed_size_column_groups(num_cols, group_size=group_size)
+        else:
+            column_groups = [list(range(0, num_cols))] if num_cols else []
+
+        # Iterate data rows
+        start_row = 2
+        end_row = ws.max_row or 1
+        row_iter = ws.iter_rows(min_row=start_row, max_row=end_row, values_only=True)
+        if max_rows is not None and max_rows > 0:
+            row_iter = islice(row_iter, 0, max_rows)
+
+        for idx_offset, row_vals in enumerate(row_iter):
+            excel_row_num = start_row + idx_offset
+            # Normalize row values list to num_cols length
+            row_list = list(row_vals or [])
+            if len(row_list) < num_cols:
+                row_list = row_list + [None] * (num_cols - len(row_list))
+
+            # Skip fully empty rows
+            if not any((str(v).strip() if v is not None else "") for v in row_list):
+                continue
+
+            # Build text slices per group
+            for s_idx, g in enumerate(column_groups, start=1):
+                if not g:
+                    continue
+                cols_text_parts: List[str] = []
+                for j in g:
+                    col_name = headers[j] if j < len(headers) else f"Column_{j+1}"
+                    val = row_list[j]
+                    val_str = "" if val is None else str(val)
+                    if val_str.strip() == "":
+                        continue
+                    cols_text_parts.append(f"{col_name}: {val_str}")
+                # If nothing non-empty in this slice, skip to avoid noisy empty chunks
+                if not cols_text_parts:
+                    continue
+                group_label = f"columns_{g[0]+1}_{g[-1]+1}"
+                text = f"[{filename} | {ws.title} | Row {excel_row_num} | {group_label}]\n" + "; ".join(cols_text_parts)
+                slices.append(
+                    {
+                        "sheet": ws.title,
+                        "row_index": excel_row_num,
+                        "slice_index": s_idx,
+                        "column_indices": g,
+                        "text": text,
+                        "meta": {
+                            "filename": filename,
+                            "group_label": group_label,
+                        },
+                    }
+                )
+    return slices
 
 
 # PUBLIC_INTERFACE

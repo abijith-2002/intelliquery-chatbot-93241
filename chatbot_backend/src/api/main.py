@@ -600,6 +600,7 @@ def upload_chat_context(
         extract_xlsx_schema_or_text,
         build_xlsx_column_chunks_from_schema,
         render_xlsx_column_chunk_text,
+        iter_xlsx_row_slices,
     )
 
     if not session_id or not isinstance(session_id, str):
@@ -656,6 +657,27 @@ def upload_chat_context(
                 else:
                     # Small file path: we have full text
                     text = summary_or_text
+                    # Additionally, if rows are very wide, build record slices and index them independently.
+                    try:
+                        # Use defaults: slice if >200 columns, groups of 100 columns, cap processed rows for safety.
+                        row_slices = iter_xlsx_row_slices(
+                            filename=filename,
+                            content=data or b"",
+                            per_row_max_cols=200,
+                            group_size=100,
+                            # Safety cap to avoid huge ingestion in extremely tall sheets:
+                            max_rows=2000,
+                        )
+                        for rs in row_slices:
+                            # Store each slice as independent minimal unit
+                            _index_text_for_session(
+                                session_id,
+                                f"{filename}:{rs.get('sheet')}:{rs.get('row_index')}:{rs.get('meta',{}).get('group_label','')}",
+                                rs.get("text", ""),
+                            )
+                    except Exception:
+                        # Do not fail upload if row slicing fails
+                        pass
         else:
             text, err = extract_text_from_bytes(filename, data or b"")
 
