@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Dict, Any, Tuple
 import google.generativeai as genai
+import json
 
 from dotenv import load_dotenv
 from langchain.memory import ConversationBufferMemory
@@ -50,8 +51,10 @@ CONTEXT_STORE: Dict[str, Dict[str, Any]] = {}
 #           {
 #              "text": str,
 #              "filename": str,
-#              "source_type": "file_text" | "json_kv" | "xlsx_row",
-#              "key": Optional[str]  # present for json_kv
+#              "source_type": "file_text" | "json_kv" | "xlsx_row" | "xlsx_row_chunk",
+#              "key": Optional[str],  # present for json_kv or encoded metadata for xlsx_row_chunk
+#              # Optional metadata for xlsx_row_chunk:
+#              # "row_id", "chunk_id", "sheet_name", "row_number", "chunk_index", "chunk_count"
 #           }, ...
 #       ],
 #       "embeddings": [ [float, ...] | None, ...],
@@ -400,6 +403,79 @@ def _index_xlsx_documents_for_session(session_id: str, filename: str, docs: List
         pass
 
 
+def _index_xlsx_row_chunks_for_session(session_id: str, filename: str, row_chunks: List[Dict[str, Any]]):
+    """
+    Index XLSX row-chunks with metadata.
+
+    Each row_chunk dict must have at least:
+        {
+            "text": <str>,
+            "sheet_name": <str>,
+            "row_number": <int>,
+            "row_id": <str>,
+            "chunk_index": <int>,
+            "chunk_count": <int>,
+            "chunk_id": <str>,
+        }
+
+    Metadata is encoded as JSON and persisted in the 'key' column for retrieval later.
+    """
+    _ensure_session_index(session_id)
+    if not row_chunks:
+        return
+
+    texts = [rc.get("text", "") for rc in row_chunks]
+    vectors = _embed_texts(texts)
+    store = RAG_INDEX_STORE[session_id]
+    items_for_db = []
+
+    for rc, vec in zip(row_chunks, vectors):
+        # In-memory item includes full metadata for direct retrieval
+        mem_item = {
+            "text": rc.get("text", ""),
+            "filename": filename,
+            "source_type": "xlsx_row_chunk",
+            "key": rc.get("chunk_id"),  # raw key for quick identification
+            "row_id": rc.get("row_id"),
+            "chunk_id": rc.get("chunk_id"),
+            "sheet_name": rc.get("sheet_name"),
+            "row_number": rc.get("row_number"),
+            "chunk_index": rc.get("chunk_index"),
+            "chunk_count": rc.get("chunk_count"),
+        }
+        store["chunks"].append(mem_item)
+        store["embeddings"].append(vec)
+
+        # Persisted 'key' stores JSON-encoded metadata for later reconstruction
+        meta = {
+            "row_id": rc.get("row_id"),
+            "chunk_id": rc.get("chunk_id"),
+            "sheet_name": rc.get("sheet_name"),
+            "row_number": rc.get("row_number"),
+            "chunk_index": rc.get("chunk_index"),
+            "chunk_count": rc.get("chunk_count"),
+        }
+        items_for_db.append(
+            {
+                "text": rc.get("text", ""),
+                "filename": filename,
+                "source_type": "xlsx_row_chunk",
+                "key": json.dumps(meta, ensure_ascii=False),
+            }
+        )
+
+    # Persist to vector DB (best-effort; ignore failures)
+    try:
+        vector_store.add_embeddings(
+            session_id=session_id,
+            items=items_for_db,
+            vectors=vectors,
+            model=_get_embedding_model_name(),
+        )
+    except Exception:
+        pass
+
+
 def _vector_search(session_id: str, query: str, top_k: int = 3) -> List[str]:
     """
     Perform semantic vector search for the top_k relevant chunks using cosine similarity
@@ -423,12 +499,12 @@ def _vector_search_items(
 
     This function now combines:
       - In-memory session index items (built from current process uploads)
-      - Persisted items from the vector database (e.g., per-row Excel documents)
+      - Persisted items from the vector database (e.g., per-row Excel row-chunks)
 
     Optionally restricts candidate items by source_type via `restrict_source_types`.
 
     Returns:
-        List[Dict[str, Any]]: Items with fields {text, filename, source_type, key?}
+        List[Dict[str, Any]]: Items with fields {text, filename, source_type, key?, metadata?}
     """
     # Prepare query vector (if possible); otherwise lexical fallback will be used.
     query_vec = _embed_one(query)
@@ -456,12 +532,34 @@ def _vector_search_items(
             key = (dbi.get("text") or "", dbi.get("source_type"))
             if key in seen:
                 continue
+
             item_dict = {
                 "text": dbi.get("text") or "",
                 "filename": dbi.get("filename"),
                 "source_type": dbi.get("source_type") or "file_text",
                 "key": dbi.get("key"),
             }
+
+            # Attempt to parse JSON metadata stored in 'key' (for xlsx_row_chunk)
+            meta = None
+            key_val = dbi.get("key")
+            if isinstance(key_val, str):
+                try:
+                    meta = json.loads(key_val)
+                except Exception:
+                    meta = None
+
+            if isinstance(meta, dict):
+                # Promote metadata to top-level fields for downstream use
+                item_dict.update({
+                    "row_id": meta.get("row_id"),
+                    "chunk_id": meta.get("chunk_id"),
+                    "sheet_name": meta.get("sheet_name"),
+                    "row_number": meta.get("row_number"),
+                    "chunk_index": meta.get("chunk_index"),
+                    "chunk_count": meta.get("chunk_count"),
+                })
+
             vec = dbi.get("embedding") if isinstance(dbi.get("embedding"), list) else None
             combined_items.append((item_dict, vec))
             seen.add(key)
@@ -484,8 +582,8 @@ def _vector_search_items(
         st = item.get("source_type")
         if st == "json_kv":
             score *= 1.2  # 20% boost for JSON facts
-        elif st == "xlsx_row":
-            score *= 1.1  # 10% boost for Excel row documents
+        elif st in ("xlsx_row", "xlsx_row_chunk"):
+            score *= 1.1  # 10% boost for Excel row-derived documents
 
         scored.append((score, item))
 
@@ -611,12 +709,12 @@ def chat(request: ChatRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
 
-        # Retrieve top-k relevant Excel row documents and force LLM to answer using only these rows
+        # Retrieve top-k relevant Excel row-chunks and force LLM to answer using only these rows
         top_items = _vector_search_items(
             session_id,
             request.query,
             top_k=8,
-            restrict_source_types=["xlsx_row"],
+            restrict_source_types=["xlsx_row_chunk", "xlsx_row"],  # prefer new chunked rows, keep legacy compatibility
         )
         excel_rows = [it["text"] for it in top_items][:6]
 
@@ -754,8 +852,8 @@ def upload_chat_context(
         - For non-JSON: Extract readable text, split into overlapping chunks, embed each chunk, and index.
         - For JSON (.json): Parse and flatten nested structures into dotted key-value pairs; each pair is treated
           as an individual fact (chunk), embedded and indexed for retrieval.
-        - For XLSX (.xlsx): Use pandas to read each sheet and convert each row into a natural-language document;
-          each document is embedded and indexed individually.
+        - For XLSX (.xlsx): Treat each row as the logical unit. Split wide rows into column chunks (~30 per chunk),
+          produce compact readable text with '|' separators, include row/chunk IDs as metadata, and index each chunk.
 
     Args:
         session_id (str): The chat session ID.
@@ -769,7 +867,7 @@ def upload_chat_context(
         summarize_text_preview,
         parse_and_flatten_json,
         format_kv_pairs_as_text,
-        parse_xlsx_to_documents,
+        parse_xlsx_to_row_chunks,
     )
 
     if not session_id or not isinstance(session_id, str):
@@ -825,18 +923,19 @@ def upload_chat_context(
             )
             continue  # next file
 
-        # Handle XLSX: pandas-based row-to-document indexing
+        # Handle XLSX with row-chunking, metadata, and compact formatting
         if name_lower.endswith(".xlsx"):
-            docs, parse_err = parse_xlsx_to_documents(data or b"")
-            joined = "\n".join(docs) if docs else ""
+            row_chunks, parse_err = parse_xlsx_to_row_chunks(data or b"", cols_per_chunk=30)
+            # For preview, join the chunk texts
+            joined = "\n".join(rc["text"] for rc in row_chunks) if row_chunks else ""
             preview = summarize_text_preview(joined, max_chars=500) if joined else ""
             chars = len(joined)
 
-            if docs and not parse_err:
+            if row_chunks and not parse_err:
                 combined_text_parts.append(f"[{filename}]\n{joined}\n")
                 total_chars += chars
                 try:
-                    _index_xlsx_documents_for_session(session_id, filename, docs)
+                    _index_xlsx_row_chunks_for_session(session_id, filename, row_chunks)
                 except Exception:
                     # Do not fail upload on indexing failure; retrieval will fall back gracefully.
                     pass

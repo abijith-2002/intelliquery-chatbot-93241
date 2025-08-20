@@ -1,6 +1,6 @@
 import io
 import json
-from typing import List, Tuple, Optional, Any
+from typing import List, Tuple, Optional, Any, Dict
 
 # Libraries for file parsing
 # - TXT: native decode
@@ -22,7 +22,7 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
         - .txt  : UTF-8 decode with errors ignored
         - .pdf  : pdfminer.six text extraction
         - .docx : python-docx extraction (paragraphs and table cells)
-        - .xlsx : pandas-based row-wise document extraction; returns a joined text preview
+        - .xlsx : row-wise chunked text using parse_xlsx_to_row_chunks(); returns a joined text preview
 
     Args:
         filename (str): Original filename (used for type detection).
@@ -43,12 +43,12 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
         if name_lower.endswith(".docx"):
             return _extract_docx(content), None
         if name_lower.endswith(".xlsx"):
-            # For backwards compatibility this returns a single text blob by joining
-            # the per-row natural language documents with newlines.
-            docs, err = parse_xlsx_to_documents(content)
+            # Build a compact joined text from row-chunks for preview/back-compat usage
+            chunks, err = parse_xlsx_to_row_chunks(content)
             if err:
                 return "", err
-            return "\n".join(docs).strip(), None
+            joined = "\n".join(ch["text"] for ch in chunks)
+            return joined.strip(), None
         return "", f"Unsupported file type for '{filename}'. Allowed: .txt, .pdf, .docx, .xlsx"
     except Exception as e:
         return "", f"Failed to extract '{filename}': {e}"
@@ -87,30 +87,41 @@ def _extract_docx(content: bytes) -> str:
 
 
 # PUBLIC_INTERFACE
-def parse_xlsx_to_documents(content: bytes) -> Tuple[List[str], Optional[str]]:
+def parse_xlsx_to_row_chunks(content: bytes, cols_per_chunk: int = 30) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     """
     PUBLIC_INTERFACE
-    Read an Excel (.xlsx) file using pandas and convert each non-empty row
-    into a natural-language document string suitable for embeddings and indexing.
+    Read an Excel (.xlsx) file using pandas and convert each non-empty row into one or more
+    compact, RAG-friendly text chunks by grouping columns in chunks of up to `cols_per_chunk`.
 
-    Document format per row:
-        "Sheet <sheet_name> | Row <row_number>: col1: val1; col2: val2; ..."
+    Chunk text format:
+        "Sheet <sheet_name> | Row <row_number> | Chunk <i>/<n> | col1: val1 | col2: val2 | ..."
+
+    Metadata per chunk is returned alongside text for downstream processing:
+        {
+            "text": <str>,
+            "sheet_name": <str>,
+            "row_number": <int>,     # 1-based
+            "row_id": <str>,         # e.g., "Sheet1:r12"
+            "chunk_index": <int>,    # 0-based
+            "chunk_count": <int>,    # total chunks for the row
+            "chunk_id": <str>,       # e.g., "Sheet1:r12:c1of3"
+        }
 
     Empty rows (all NaN/blank) are skipped.
 
     Args:
         content (bytes): Raw file content of the .xlsx file.
+        cols_per_chunk (int): Maximum number of column key-value pairs per chunk.
 
     Returns:
-        Tuple[List[str], Optional[str]]:
-            - List of document strings (one per row)
+        Tuple[List[Dict[str, Any]], Optional[str]]:
+            - List of chunk dicts (see structure above)
             - error message if parsing failed, else None
     """
     try:
         bio = io.BytesIO(content or b"")
-        # Use pandas.ExcelFile for efficient multi-sheet handling
         xls = pd.ExcelFile(bio)
-        documents: List[str] = []
+        chunks_out: List[Dict[str, Any]] = []
 
         # Helper: stringify a single cell value robustly
         def _stringify_cell(v: Any) -> str:
@@ -156,7 +167,7 @@ def parse_xlsx_to_documents(content: bytes) -> Tuple[List[str], Optional[str]]:
             # Normalize column names to strings
             raw_cols = [str(c).strip() if c is not None else "" for c in df.columns]
 
-            # Deduplicate column names to avoid ambiguous selection (e.g., "Name", "Name#1", "Name#2")
+            # Deduplicate column names to avoid ambiguity (e.g., "Name", "Name#1", "Name#2")
             seen = {}
             cols: List[str] = []
             for c in raw_cols:
@@ -170,24 +181,22 @@ def parse_xlsx_to_documents(content: bytes) -> Tuple[List[str], Optional[str]]:
 
             num_cols = len(cols)
 
-            # Iterate rows using position-based access (avoids Series returns for duplicate labels)
-            # itertuples(index=False, name=None) yields tuples in column order without the index.
+            # Iterate rows using position-based tuples for performance and clarity
             for row_pos, row_vals in enumerate(df.itertuples(index=False, name=None)):
-                # Build key-value pairs for non-null values
-                kv_pairs: List[str] = []
-                # Ensure row_vals length matches num_cols (defensive)
+                # Collect non-empty kv pairs for the row
+                kv_pairs: List[Tuple[str, str]] = []
                 for j in range(num_cols):
                     val = row_vals[j] if j < len(row_vals) else None
                     sval = _stringify_cell(val)
                     if not sval:
                         continue
-                    kv_pairs.append(f"{cols[j]}: {sval}")
+                    colname = cols[j] if cols[j] else f"col{j+1}"
+                    kv_pairs.append((colname, sval))
 
                 if not kv_pairs:
                     continue
 
                 # Determine a human-friendly row number:
-                # Prefer DataFrame index if numeric, else fall back to 1-based position.
                 try:
                     row_label = df.index[row_pos]
                     if isinstance(row_label, (int, float)) and not pd.isna(row_label):
@@ -197,22 +206,67 @@ def parse_xlsx_to_documents(content: bytes) -> Tuple[List[str], Optional[str]]:
                 except Exception:
                     row_number = row_pos + 1
 
-                doc_str = f"Sheet {sheet_name} | Row {row_number}: " + "; ".join(kv_pairs)
-                documents.append(doc_str)
+                # Chunk the kv pairs into groups of up to cols_per_chunk
+                total = (len(kv_pairs) + cols_per_chunk - 1) // cols_per_chunk
+                if total <= 0:
+                    total = 1
+                row_id = f"{sheet_name}:r{row_number}"
 
-        return documents, None
+                for ci in range(total):
+                    start = ci * cols_per_chunk
+                    end = min(len(kv_pairs), (ci + 1) * cols_per_chunk)
+                    sub_pairs = kv_pairs[start:end]
+                    # Build compact text with "|" separators
+                    pairs_text = " | ".join(f"{k}: {v}" for k, v in sub_pairs)
+                    header = f"Sheet {sheet_name} | Row {row_number} | Chunk {ci+1}/{total}"
+                    text = f"{header} | {pairs_text}" if pairs_text else header
+                    chunk = {
+                        "text": text.strip(),
+                        "sheet_name": sheet_name,
+                        "row_number": row_number,
+                        "row_id": row_id,
+                        "chunk_index": ci,
+                        "chunk_count": total,
+                        "chunk_id": f"{row_id}:c{ci+1}of{total}",
+                    }
+                    chunks_out.append(chunk)
+
+        return chunks_out, None
     except Exception as e:
         return [], f"Failed to parse .xlsx content: {e}"
 
 
+# PUBLIC_INTERFACE
+def parse_xlsx_to_documents(content: bytes) -> Tuple[List[str], Optional[str]]:
+    """
+    PUBLIC_INTERFACE
+    Backward-compatible wrapper that converts an .xlsx into a list of natural-language
+    documents by joining the new row-chunk outputs' text.
+
+    Each document is effectively a row-chunk string produced by parse_xlsx_to_row_chunks().
+
+    Args:
+        content (bytes): Raw file content of the .xlsx file.
+
+    Returns:
+        Tuple[List[str], Optional[str]]:
+            - List of document strings (one per row-chunk)
+            - error message if parsing failed, else None
+    """
+    chunks, err = parse_xlsx_to_row_chunks(content)
+    if err:
+        return [], err
+    return [c["text"] for c in chunks], None
+
+
 def _extract_xlsx(content: bytes) -> str:
     """
-    Extract text from XLSX using pandas by converting each row to a natural-language
-    document and joining them with newlines. Prefer parse_xlsx_to_documents() directly
-    when you need individual row documents for embeddings.
+    Extract text from XLSX using pandas by converting each row into compact row-chunks
+    and joining them with newlines. Prefer parse_xlsx_to_row_chunks() directly when
+    you need individual chunks with metadata for embeddings.
     """
-    docs, _err = parse_xlsx_to_documents(content)
-    return "\n".join(docs).strip()
+    chunks, _err = parse_xlsx_to_row_chunks(content)
+    return "\n".join(ch["text"] for ch in chunks).strip()
 
 
 # PUBLIC_INTERFACE
