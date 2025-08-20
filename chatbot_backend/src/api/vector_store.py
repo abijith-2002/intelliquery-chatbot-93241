@@ -1,18 +1,27 @@
-"""Persistent vector store for chatbot embeddings using SQLAlchemy.
+"""Chroma-backed persistent vector store for chatbot embeddings.
 
-This module defines the EmbeddingRecord model and helper functions to persist
-embeddings per session. It reuses the shared SQLAlchemy engine/session from
-auth_utils to keep a single DB file, controlled by the CHATBOT_SQLALCHEMY_DATABASE_URL
-environment variable.
+This module integrates ChromaDB as the vector database for storing embeddings and
+associated metadata. It also maintains a separate SQLAlchemy mapping table for Excel
+row/chunk IDs to support exact filtering and context aggregation.
 
-Tables are created when Base.metadata.create_all() is called in auth_utils.create_tables().
-To ensure the embeddings table is created, make sure this module is imported before
-create_tables() is executed.
+Environment variables:
+    CHATBOT_CHROMA_DIR           -> Directory for Chroma persistence (default: ./chroma_data)
+    CHATBOT_CHROMA_COLLECTION    -> Chroma collection name (default: chatbot_embeddings)
+
+Public functions preserved for compatibility:
+    - add_embeddings(session_id, items, vectors, model) -> int
+    - delete_session_embeddings(session_id) -> int
+    - get_session_embeddings_count(session_id) -> int
+    - get_session_embedding_items(session_id, source_types=None, max_records=None) -> List[dict]
 """
 from __future__ import annotations
 
-from typing import List, Optional, Dict, Any
+import os
+import json
+import hashlib
+from typing import List, Optional, Dict, Any, Tuple
 
+# SQLAlchemy base/session reused from auth_utils
 from sqlalchemy import (
     Column,
     Integer,
@@ -20,29 +29,65 @@ from sqlalchemy import (
     Text,
     DateTime,
     Float,
+    UniqueConstraint,
     func,
 )
-from sqlalchemy.types import JSON
-
-# Reuse Base, engine, and session factory from auth_utils
+from sqlalchemy.types import JSON as SAJSON  # Distinct from Python json
 from .auth_utils import Base, SessionLocal
 
+# Try to import Chroma with graceful fallback
+try:
+    import chromadb  # type: ignore
+    _CHROMA_AVAILABLE = True
+except Exception:
+    chromadb = None  # type: ignore
+    _CHROMA_AVAILABLE = False
 
-class EmbeddingRecord(Base):
-    """ORM model to persist embeddings per chunk/document.
+
+# =========================
+# SQLAlchemy ORM (mapping)
+# =========================
+
+class RowChunkMap(Base):
+    """Mapping table to track Excel row/chunk IDs and their corresponding Chroma record.
 
     Fields:
         id: Primary key.
-        session_id: Session identifier to group embeddings.
-        filename: Original source filename (if any).
-        source_type: One of "file_text", "json_kv", "xlsx_row".
-        key: Optional key for structured sources (e.g., JSON dotted key path).
-        text: The chunk/document text that was embedded.
-        embedding: The numeric vector as a JSON array (list[float]); may be None if embedding unavailable.
-        model: Embedding model name (e.g., "models/text-embedding-004").
-        vector_norm: Optional cached vector L2 norm for retrieval optimizations (not currently used).
-        created_at: Timestamp of record creation.
+        session_id: Session identifier.
+        row_id: Logical Excel row identifier (e.g., "Sheet1:r12").
+        chunk_id: Logical chunk identifier (e.g., "Sheet1:r12:c1of3").
+        chroma_id: The record ID used in Chroma.
+        filename: Source filename.
+        sheet_name: Sheet name.
+        row_number: Row number (1-based).
+        chunk_index: Chunk index (0-based).
+        chunk_count: Total chunks for the row.
+        created_at: Row creation timestamp.
     """
+    __tablename__ = "row_chunk_map"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String(128), index=True, nullable=False)
+    row_id = Column(String(256), nullable=True, index=True)
+    chunk_id = Column(String(256), nullable=True, index=True)
+    chroma_id = Column(String(256), nullable=False, index=True)
+    filename = Column(String(260), nullable=True)
+    sheet_name = Column(String(128), nullable=True)
+    row_number = Column(Integer, nullable=True)
+    chunk_index = Column(Integer, nullable=True)
+    chunk_count = Column(Integer, nullable=True)
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("session_id", "chunk_id", name="uix_session_chunk"),
+    )
+
+
+# Backward-compatibility: keep the historical EmbeddingRecord model definition for migrations,
+# but it is no longer used for new writes. It can be retained to avoid import errors and
+# allow future data migration if necessary.
+class EmbeddingRecord(Base):
+    """Deprecated SQLAlchemy model. No longer used for persistence of new embeddings."""
     __tablename__ = "embeddings"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -51,11 +96,188 @@ class EmbeddingRecord(Base):
     source_type = Column(String(32), nullable=False)
     key = Column(String(512), nullable=True)
     text = Column(Text, nullable=False)
-    embedding = Column(JSON, nullable=True)
+    embedding = Column(SAJSON, nullable=True)
     model = Column(String(64), nullable=False, default="models/text-embedding-004")
     vector_norm = Column(Float, nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
 
+
+# =========================
+# Chroma setup utilities
+# =========================
+
+def _get_chroma_dir() -> str:
+    """Resolve Chroma persistence directory (creates it if missing)."""
+    base = os.getenv("CHATBOT_CHROMA_DIR", os.path.join(".", "chroma_data"))
+    os.makedirs(base, exist_ok=True)
+    return base
+
+
+def _get_chroma_collection_name() -> str:
+    """Resolve Chroma collection name."""
+    return os.getenv("CHATBOT_CHROMA_COLLECTION", "chatbot_embeddings")
+
+
+_CHROMA_CLIENT = None
+_CHROMA_COLLECTION = None
+
+
+def _ensure_chroma() -> Tuple[Any, Any]:
+    """Create/return a Chroma persistent client and collection, handling API variations."""
+    if not _CHROMA_AVAILABLE:
+        raise RuntimeError("ChromaDB is not installed. Please ensure 'chromadb' is available.")
+
+    global _CHROMA_CLIENT, _CHROMA_COLLECTION
+    if _CHROMA_CLIENT is not None and _CHROMA_COLLECTION is not None:
+        return _CHROMA_CLIENT, _CHROMA_COLLECTION
+
+    # Instantiate persistent client depending on the installed version.
+    persist_dir = _get_chroma_dir()
+    coll_name = _get_chroma_collection_name()
+
+    client = None
+    try:
+        # Chroma >= 0.5
+        if hasattr(chromadb, "PersistentClient"):
+            client = chromadb.PersistentClient(path=persist_dir)  # type: ignore[attr-defined]
+        else:
+            # Chroma 0.4.x
+            try:
+                from chromadb.config import Settings  # type: ignore
+            except Exception:
+                Settings = None  # type: ignore
+            if Settings is None:
+                raise RuntimeError("chromadb.config.Settings not available in this version.")
+            client = chromadb.Client(
+                Settings(chroma_db_impl="duckdb+parquet", persist_directory=persist_dir)  # type: ignore
+            )
+    except Exception as e:
+        raise RuntimeError(f"Failed to initialize Chroma client: {e}")
+
+    # Create or get collection (no embedding function; we pass precomputed embeddings)
+    try:
+        collection = client.get_or_create_collection(name=coll_name, metadata={"hnsw:space": "cosine"})
+    except TypeError:
+        # Some versions accept only 'name'
+        collection = client.get_or_create_collection(name=coll_name)
+    except Exception as e:
+        raise RuntimeError(f"Failed to get/create Chroma collection '{coll_name}': {e}")
+
+    _CHROMA_CLIENT = client
+    _CHROMA_COLLECTION = collection
+    return client, collection
+
+
+def _deterministic_hash(*parts: str, max_len: int = 24) -> str:
+    """Build a deterministic short hash for a set of string parts."""
+    h = hashlib.sha1("||".join(parts).encode("utf-8", errors="ignore")).hexdigest()
+    return h[:max_len]
+
+
+def _make_chroma_id(session_id: str, item: Dict[str, Any], vec: Optional[List[float]]) -> str:
+    """Create a stable Chroma record ID.
+
+    If the item has an explicit 'chunk_id' (from Excel row-chunk), we prefer:
+        f"{session_id}::chunk::{chunk_id}"
+    Otherwise, create a deterministic hash from key fields.
+    """
+    # If item already includes chunk_id metadata, prefer that
+    chunk_id = None
+    # chunk_id may be nested in item["key"] as JSON (for persisted form) or as a direct field
+    if "chunk_id" in item and item.get("chunk_id"):
+        chunk_id = str(item.get("chunk_id"))
+    else:
+        key_val = item.get("key")
+        if isinstance(key_val, str):
+            try:
+                meta = json.loads(key_val)
+                chunk_id = meta.get("chunk_id")
+            except Exception:
+                chunk_id = None
+
+    if chunk_id:
+        return f"{session_id}::chunk::{chunk_id}"
+
+    # Fall back to hash of relevant attributes
+    filename = str(item.get("filename") or "")
+    source_type = str(item.get("source_type") or "file_text")
+    key = str(item.get("key") or "")
+    text = str(item.get("text") or "")
+    vec_tag = "v1" if vec else "v0"
+    dh = _deterministic_hash(session_id, source_type, filename, key, text)
+    return f"{session_id}::{source_type}::{dh}::{vec_tag}"
+
+
+def _extract_rowchunk_meta(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract row/chunk metadata from item['key'] (JSON) or direct fields."""
+    md: Dict[str, Any] = {}
+
+    # Direct fields (in-memory entries from main.py carry these)
+    for fld in ("row_id", "chunk_id", "sheet_name", "row_number", "chunk_index", "chunk_count"):
+        if fld in item and item.get(fld) is not None:
+            md[fld] = item.get(fld)
+
+    # If not present, try to parse JSON in key
+    key_val = item.get("key")
+    if isinstance(key_val, str):
+        try:
+            parsed = json.loads(key_val)
+            if isinstance(parsed, dict):
+                for fld in ("row_id", "chunk_id", "sheet_name", "row_number", "chunk_index", "chunk_count"):
+                    if fld in parsed and parsed.get(fld) is not None and fld not in md:
+                        md[fld] = parsed.get(fld)
+        except Exception:
+            pass
+
+    return md
+
+
+def _upsert_rowchunk_mappings(session_id: str, mappings: List[Dict[str, Any]]) -> int:
+    """Insert row/chunk mappings into SQLAlchemy table, ignoring duplicates by constraint."""
+    if not mappings:
+        return 0
+    db = SessionLocal()
+    inserted = 0
+    try:
+        for m in mappings:
+            # Skip if missing identifiers
+            if not m.get("chunk_id") or not m.get("chroma_id"):
+                continue
+            # Check existing to avoid raising on unique constraint for common backends
+            exists = (
+                db.query(RowChunkMap)
+                .filter(
+                    RowChunkMap.session_id == session_id,
+                    RowChunkMap.chunk_id == m.get("chunk_id"),
+                )
+                .first()
+            )
+            if exists:
+                continue
+
+            row = RowChunkMap(
+                session_id=session_id,
+                row_id=m.get("row_id"),
+                chunk_id=m.get("chunk_id"),
+                chroma_id=m.get("chroma_id"),
+                filename=m.get("filename"),
+                sheet_name=m.get("sheet_name"),
+                row_number=m.get("row_number"),
+                chunk_index=m.get("chunk_index"),
+                chunk_count=m.get("chunk_count"),
+            )
+            db.add(row)
+            inserted += 1
+        if inserted:
+            db.commit()
+        return inserted
+    finally:
+        db.close()
+
+
+# =========================
+# Public API (Chroma-backed)
+# =========================
 
 # PUBLIC_INTERFACE
 def add_embeddings(
@@ -65,81 +287,180 @@ def add_embeddings(
     model: str,
 ) -> int:
     """PUBLIC_INTERFACE
-    Persist a batch of embeddings for a session.
+    Persist a batch of embeddings for a session into Chroma, and store row/chunk mappings.
 
     Args:
         session_id: Session identifier.
-        items: List of item dicts with keys: text (str), filename (str), source_type (str), key (Optional[str]).
-        vectors: List of embedding vectors (list[float]) or None for each item.
+        items: List of item dicts with keys:
+            text (str), filename (str), source_type (str), key (Optional[str]).
+            For Excel row chunks, row/chunk metadata should be included either
+            directly (row_id, chunk_id, sheet_name, row_number, chunk_index, chunk_count)
+            or JSON-encoded in 'key'.
+        vectors: Precomputed embedding vectors (list[float]) or None for each item.
+                Only items with vectors are upserted into Chroma.
         model: Embedding model name.
 
     Returns:
-        int: Number of records inserted.
+        int: Number of records upserted into Chroma.
     """
     if not items:
         return 0
-    # Lengths should match; zip will truncate to shortest for safety.
-    to_insert: List[EmbeddingRecord] = []
-    for item, vec in zip(items, vectors):
-        rec = EmbeddingRecord(
-            session_id=session_id,
-            filename=item.get("filename"),
-            source_type=item.get("source_type") or "file_text",
-            key=item.get("key"),
-            text=item.get("text") or "",
-            embedding=vec if isinstance(vec, list) else None,
-            model=model,
-            vector_norm=_safe_norm(vec),
-        )
-        to_insert.append(rec)
 
-    db = SessionLocal()
+    if not _CHROMA_AVAILABLE:
+        # Graceful no-op if Chroma not installed (keeps compatibility)
+        return 0
+
+    # Ensure Chroma collection exists
+    _, collection = _ensure_chroma()
+
+    # Build payloads; Chroma requires all lists to be same length
+    ids: List[str] = []
+    documents: List[str] = []
+    metadatas: List[Dict[str, Any]] = []
+    embeddings: List[List[float]] = []
+    mappings: List[Dict[str, Any]] = []
+
+    for item, vec in zip(items, vectors):
+        # Only persist entries that have an embedding vector
+        if not isinstance(vec, list) or not vec:
+            continue
+
+        text = str(item.get("text") or "")
+        filename = item.get("filename")
+        source_type = item.get("source_type") or "file_text"
+        key = item.get("key")
+
+        rowchunk_meta = _extract_rowchunk_meta(item)
+        chroma_id = _make_chroma_id(session_id, {**item, **rowchunk_meta}, vec)
+
+        meta = {
+            "session_id": session_id,
+            "model": model,
+            "filename": filename,
+            "source_type": source_type,
+            "key": key,
+            # Promote row/chunk fields for exact filtering/aggregation
+            **rowchunk_meta,
+        }
+
+        ids.append(chroma_id)
+        documents.append(text)
+        metadatas.append(meta)
+        embeddings.append([float(x) for x in vec])
+
+        # If row/chunk metadata present, track a mapping record
+        if "chunk_id" in rowchunk_meta and rowchunk_meta.get("chunk_id"):
+            mappings.append({
+                "row_id": rowchunk_meta.get("row_id"),
+                "chunk_id": rowchunk_meta.get("chunk_id"),
+                "chroma_id": chroma_id,
+                "filename": filename,
+                "sheet_name": rowchunk_meta.get("sheet_name"),
+                "row_number": rowchunk_meta.get("row_number"),
+                "chunk_index": rowchunk_meta.get("chunk_index"),
+                "chunk_count": rowchunk_meta.get("chunk_count"),
+            })
+
+    if not ids:
+        return 0
+
+    # Upsert into Chroma
     try:
-        db.add_all(to_insert)
-        db.commit()
-        return len(to_insert)
-    finally:
-        db.close()
+        collection.upsert(
+            ids=ids,
+            documents=documents,
+            metadatas=metadatas,
+            embeddings=embeddings,
+        )
+    except Exception:
+        # If upsert fails entirely, do not insert mappings
+        # but do not raise to avoid breaking uploads.
+        return 0
+
+    # Update mapping table for row/chunk metadata
+    try:
+        if mappings:
+            _upsert_rowchunk_mappings(session_id, mappings)
+    except Exception:
+        # Mapping failures should not break overall flow
+        pass
+
+    return len(ids)
 
 
 # PUBLIC_INTERFACE
 def delete_session_embeddings(session_id: str) -> int:
     """PUBLIC_INTERFACE
-    Delete all embedding records for a given session.
+    Delete all embedding records for a given session from Chroma and clear mappings.
 
     Args:
         session_id: Session identifier to clear.
 
     Returns:
-        int: Number of rows deleted.
+        int: Number of Chroma records deleted (best-effort; may be an estimate).
     """
+    if not _CHROMA_AVAILABLE:
+        return 0
+
+    _, collection = _ensure_chroma()
+
+    # Count first (best-effort)
+    try:
+        count_before = get_session_embeddings_count(session_id)
+    except Exception:
+        count_before = 0
+
+    # Delete from Chroma
+    try:
+        collection.delete(where={"session_id": session_id})
+    except Exception:
+        pass
+
+    # Delete mappings
     db = SessionLocal()
     try:
-        q = db.query(EmbeddingRecord).filter(EmbeddingRecord.session_id == session_id)
-        count = q.count()
+        q = db.query(RowChunkMap).filter(RowChunkMap.session_id == session_id)
         q.delete(synchronize_session=False)
         db.commit()
-        return count
     finally:
         db.close()
+
+    return int(count_before)
+
+
+def _collection_get(collection, where: Dict[str, Any], limit: Optional[int]) -> Dict[str, Any]:
+    """Compatibility wrapper around collection.get for various Chroma versions."""
+    include = ["documents", "metadatas", "embeddings"]
+    try:
+        if limit and limit > 0:
+            return collection.get(where=where, include=include, limit=int(limit))
+        return collection.get(where=where, include=include)
+    except TypeError:
+        # Older versions may not support 'limit' parameter
+        return collection.get(where=where, include=include)
 
 
 # PUBLIC_INTERFACE
 def get_session_embeddings_count(session_id: str) -> int:
     """PUBLIC_INTERFACE
-    Return the number of embedding records stored for a session.
+    Return the number of embedding records stored for a session in Chroma.
 
     Args:
         session_id: Session identifier.
 
     Returns:
-        int: Count of records.
+        int: Count of records (best-effort based on collection.get()).
     """
-    db = SessionLocal()
+    if not _CHROMA_AVAILABLE:
+        return 0
+
+    _, collection = _ensure_chroma()
     try:
-        return db.query(EmbeddingRecord).filter(EmbeddingRecord.session_id == session_id).count()
-    finally:
-        db.close()
+        res = _collection_get(collection, where={"session_id": session_id}, limit=None)
+        ids = res.get("ids") or []
+        return len(ids)
+    except Exception:
+        return 0
 
 
 # PUBLIC_INTERFACE
@@ -149,14 +470,14 @@ def get_session_embedding_items(
     max_records: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """PUBLIC_INTERFACE
-    Fetch stored embedding items for a session from the persistent vector database.
+    Fetch stored embedding items for a session from Chroma.
 
     This is used during retrieval to include persisted items (e.g., per-row Excel documents)
     even after process restarts or when the in-memory index is empty.
 
     Args:
         session_id: Session identifier whose items should be returned.
-        source_types: Optional list of source types to include (e.g., ["xlsx_row"]).
+        source_types: Optional list of source types to include (e.g., ["xlsx_row_chunk", "xlsx_row"]).
         max_records: Optional maximum number of records to return.
 
     Returns:
@@ -167,36 +488,49 @@ def get_session_embedding_items(
             - key (Optional[str])
             - embedding (Optional[List[float]])
             - model (str)
+            - (optional) row_id, chunk_id, sheet_name, row_number, chunk_index, chunk_count
     """
-    db = SessionLocal()
+    if not _CHROMA_AVAILABLE:
+        return []
+
+    _, collection = _ensure_chroma()
+
+    where: Dict[str, Any] = {"session_id": session_id}
+    if source_types:
+        # Add source type filter
+        where = {"$and": [where, {"source_type": {"$in": source_types}}]}
+
     try:
-        q = db.query(EmbeddingRecord).filter(EmbeddingRecord.session_id == session_id)
-        if source_types:
-            q = q.filter(EmbeddingRecord.source_type.in_(source_types))
-        # Order newest first; limit if requested
-        q = q.order_by(EmbeddingRecord.id.desc())
-        if max_records and max_records > 0:
-            q = q.limit(int(max_records))
-        rows = q.all()
-        results: List[Dict[str, Any]] = []
-        for r in rows:
-            results.append(
-                {
-                    "text": r.text or "",
-                    "filename": r.filename,
-                    "source_type": r.source_type or "file_text",
-                    "key": r.key,
-                    "embedding": r.embedding if isinstance(r.embedding, list) else None,
-                    "model": r.model or "models/text-embedding-004",
-                }
-            )
-        return results
-    finally:
-        db.close()
+        res = _collection_get(collection, where=where, limit=max_records)
+        ids = res.get("ids") or []
+        docs = res.get("documents") or []
+        metas = res.get("metadatas") or []
+        embs = res.get("embeddings") or []
+
+        out: List[Dict[str, Any]] = []
+        for i in range(min(len(ids), len(docs), len(metas), len(embs))):
+            md = metas[i] or {}
+            out_item = {
+                "text": docs[i] or "",
+                "filename": md.get("filename"),
+                "source_type": md.get("source_type") or "file_text",
+                "key": md.get("key"),
+                "embedding": embs[i] if isinstance(embs[i], list) else None,
+                "model": md.get("model") or "models/text-embedding-004",
+            }
+            # Promote row/chunk metadata if available
+            for fld in ("row_id", "chunk_id", "sheet_name", "row_number", "chunk_index", "chunk_count"):
+                if fld in md:
+                    out_item[fld] = md.get(fld)
+            out.append(out_item)
+
+        return out
+    except Exception:
+        return []
 
 
 def _safe_norm(vec: Optional[List[float]]) -> Optional[float]:
-    """Compute L2 norm of the vector if available."""
+    """Compute L2 norm of the vector if available. Retained for backward compatibility."""
     if not vec:
         return None
     try:
