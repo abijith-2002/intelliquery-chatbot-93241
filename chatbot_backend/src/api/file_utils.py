@@ -241,7 +241,8 @@ def extract_xlsx_wide_chunks(
         # Construct chunks by iterating rows in windows
         current_rows: List[List[Any]] = []
         start_row_idx = 2  # assuming row 1 is header
-        last_row_number = ws.max_row if ws.max_row is not None else 1
+        # Determine last row dynamically via the final buffer when flushing.
+        # Avoid storing ws.max_row to prevent linter warnings and ensure accurate metadata.
 
         def flush_chunk(rows: List[List[Any]], start_idx: int, end_idx: int):
             if not rows:
@@ -321,7 +322,11 @@ def extract_xlsx_wide_chunks(
 
         # Flush remaining
         if current_rows:
-            flush_chunk(current_rows, start_row_idx, last_row_number)
+            # Use actual last row number included in the final buffer instead of ws.max_row.
+            # This ensures the [Rows: a-b] metadata reflects the true last indexed row and helps verify that
+            # rows beyond earlier windows (e.g., row 40) are indeed processed and indexed.
+            final_end_row_number = start_row_idx + len(current_rows) - 1
+            flush_chunk(current_rows, start_row_idx, final_end_row_number)
 
     return chunks
 
