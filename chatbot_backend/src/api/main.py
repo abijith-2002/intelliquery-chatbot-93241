@@ -83,6 +83,10 @@ openapi_tags = [
 # Register chat title router (Gemini-powered title generator)
 app.include_router(chat_title_router)
 
+# Register Excel Q&A router
+from .ask_excel_question import router as ask_excel_router  # noqa: E402
+app.include_router(ask_excel_router)
+
 # Allow CORS from everywhere for demo/dev
 app.add_middleware(
     CORSMiddleware,

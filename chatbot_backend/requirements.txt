@@ -55,3 +55,4 @@ pdfminer.six==20231228
 # DataFrame and Parquet support
 pandas==2.2.3
 pyarrow==17.0.0
+duckdb==1.1.3
