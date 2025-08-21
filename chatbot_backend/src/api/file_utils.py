@@ -78,8 +78,9 @@ def process_excel_for_session(
         session_dir.mkdir(parents=True, exist_ok=True)
         
         # Load Excel file with pandas
-        bio = io.BytesIO(content)
-        excel_file = pd.ExcelFile(bio)
+        # Important: create a fresh BytesIO per sheet read; some engines advance the stream position
+        bio_master = io.BytesIO(content)
+        excel_file = pd.ExcelFile(bio_master)
         
         metadata = {
             "filename": filename,
@@ -95,7 +96,8 @@ def process_excel_for_session(
         for sheet_name in excel_file.sheet_names:
             try:
                 # Read sheet into DataFrame
-                df = pd.read_excel(bio, sheet_name=sheet_name, engine='openpyxl')
+                # Create a new BytesIO for each read to avoid pointer issues
+                df = pd.read_excel(io.BytesIO(content), sheet_name=sheet_name, engine='openpyxl')
                 
                 # Clean column names (remove spaces, special chars for SQL compatibility)
                 df.columns = [_clean_column_name(str(col)) for col in df.columns]
@@ -123,12 +125,17 @@ def process_excel_for_session(
                 print(f"Error processing sheet '{sheet_name}': {e}")
                 continue
         
-        # Save metadata as JSON
-        metadata_path = session_dir / f"{_clean_column_name(filename.replace('.xlsx', ''))}_metadata.json"
+        # Save metadata as JSON with a deterministic name pattern: <base>_metadata.json
+        base_name = _clean_column_name(filename.replace('.xlsx', ''))
+        metadata_path = session_dir / f"{base_name}_metadata.json"
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=2)
         
         metadata["metadata_path"] = str(metadata_path)
+        
+        # Sanity check: ensure at least some structure was detected
+        if metadata.get("total_rows", 0) == 0 and not metadata.get("sheets"):
+            return metadata, f"No rows or sheets detected in '{filename}'. Please verify the Excel file contents."
         
         return metadata, None
         

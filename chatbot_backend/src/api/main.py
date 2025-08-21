@@ -56,6 +56,27 @@ RAG_INDEX_STORE: Dict[str, Dict[str, Any]] = {}
 # Structure: { session_id: [metadata_dict1, metadata_dict2, ...] }
 EXCEL_METADATA_STORE: Dict[str, List[Dict[str, Any]]] = {}
 
+# PUBLIC_INTERFACE
+def _load_session_metadata_from_disk(session_id: str) -> List[Dict[str, Any]]:
+    """
+    PUBLIC_INTERFACE
+    Attempt to load Excel metadata for a session from disk when in-memory store is empty.
+
+    Args:
+        session_id (str): The session identifier.
+
+    Returns:
+        List[Dict[str, Any]]: List of Excel metadata dictionaries, or empty list if none found.
+    """
+    try:
+        from .file_utils import get_session_excel_metadata
+        metas = get_session_excel_metadata(session_id)
+        if metas:
+            EXCEL_METADATA_STORE[session_id] = metas
+        return metas
+    except Exception:
+        return []
+
 app = FastAPI(
     title="IntelliQuery Chatbot API",
     version="1.0.0",
@@ -785,6 +806,9 @@ def ask_excel_question(request: ExcelQuestionRequest):
     
     # Get Excel metadata for the session
     excel_metadata_list = EXCEL_METADATA_STORE.get(session_id, [])
+    # Lazy-load from disk if memory store is empty (e.g., after restart)
+    if not excel_metadata_list:
+        excel_metadata_list = _load_session_metadata_from_disk(session_id)
     if not excel_metadata_list:
         raise HTTPException(
             status_code=400, 
@@ -820,6 +844,12 @@ def ask_excel_question(request: ExcelQuestionRequest):
                         sample_vals = col_data.get('sample_values', [])
                         sample_str = ', '.join(str(v) for v in sample_vals[:3]) if sample_vals else 'No samples'
                         data_context_parts.append(f"    * {col_name} ({col_type}): {sample_str}")
+                # Include a compact view of first rows if available
+                sample_rows = sheet_info.get('sample_data', {}).get('first_5_rows', [])
+                if sample_rows:
+                    data_context_parts.append("  - Sample rows (up to 3):")
+                    for row in sample_rows[:3]:
+                        data_context_parts.append(f"    • {row}")
         
         data_context = '\n'.join(data_context_parts)
         
