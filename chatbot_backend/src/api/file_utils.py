@@ -11,6 +11,7 @@ from typing import List, Tuple, Optional, Dict, Any
 from pdfminer.high_level import extract_text as pdf_extract_text
 from docx import Document as DocxDocument
 from openpyxl import load_workbook
+import pandas as pd
 
 
 # PUBLIC_INTERFACE
@@ -356,3 +357,176 @@ def summarize_text_preview(text: str, max_chars: int = 500) -> str:
     if len(collapsed) <= max_chars:
         return collapsed
     return collapsed[: max_chars - 3] + "..."
+
+
+def _infer_series_dtype(series: "pd.Series") -> str:
+    """
+    Infer a friendly dtype label for a pandas Series.
+    """
+    try:
+        # Handle pandas nullable types gracefully
+        if pd.api.types.is_integer_dtype(series):
+            return "integer"
+        if pd.api.types.is_float_dtype(series):
+            return "float"
+        if pd.api.types.is_bool_dtype(series):
+            return "boolean"
+        if pd.api.types.is_datetime64_any_dtype(series):
+            return "datetime"
+        if pd.api.types.is_timedelta64_dtype(series):
+            return "timedelta"
+        if pd.api.types.is_categorical_dtype(series):
+            return "category"
+        # Try coercions to detect numeric/date even if read as object
+        s_non_null = series.dropna()
+        if not s_non_null.empty:
+            # Numeric?
+            try:
+                pd.to_numeric(s_non_null, errors="raise")
+                # if all integers after conversion
+                if (pd.to_numeric(s_non_null) % 1 == 0).all():
+                    return "integer"
+                return "float"
+            except Exception:
+                pass
+            # Datetime?
+            try:
+                pd.to_datetime(s_non_null, errors="raise", infer_datetime_format=True)
+                return "datetime"
+            except Exception:
+                pass
+        return "string"
+    except Exception:
+        return "string"
+
+
+def _top_values(series: "pd.Series", top_k: int = 5) -> list:
+    """
+    Compute top-k frequent non-null, non-empty stringified values.
+    """
+    try:
+        s = series.astype("object")
+        s = s.dropna()
+        # Remove empty strings once stringified
+        s = s.map(lambda x: _stringify(x).strip()).replace("", pd.NA).dropna()
+        vc = s.value_counts(dropna=False)
+        return [idx for idx in list(vc.index)[:top_k]]
+    except Exception:
+        # Fallback: naive Python counting
+        counts = {}
+        for v in series:
+            if v is None:
+                continue
+            sv = _stringify(v).strip()
+            if not sv:
+                continue
+            counts[sv] = counts.get(sv, 0) + 1
+        top = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:top_k]
+        return [k for k, _ in top]
+
+
+# PUBLIC_INTERFACE
+def extract_xlsx_schema_and_dfs(content: bytes) -> (Dict[str, Any], Dict[str, "pd.DataFrame"]):
+    """
+    PUBLIC_INTERFACE
+    Read an Excel workbook from bytes, build a schema describing each sheet's
+    columns with inferred dtypes and top-5 frequent values, and return both
+    the schema dict and a mapping of sheet name to pandas DataFrame.
+
+    Behavior:
+      1. Iterates each sheet
+      2. Extracts headers and builds a DataFrame (first row as header if present)
+      3. Infers a friendly dtype per column
+      4. Computes top-5 values (by frequency) per column (excluding blanks)
+      5. Builds schema JSON/dict:
+         {
+           "sheets": [
+             {
+               "name": "<sheet_name>",
+               "columns": [
+                 {"name": "<col_name>", "dtype": "<dtype>", "top_values": [v1,...]}
+               ]
+             },
+             ...
+           ]
+         }
+
+    Args:
+        content (bytes): Raw .xlsx file content.
+
+    Returns:
+        Tuple[dict, Dict[str, pandas.DataFrame]]: (schema, dataframes)
+    """
+    # Load workbook with openpyxl and then build DataFrames via values_only
+    bio = io.BytesIO(content)
+    wb = load_workbook(bio, data_only=True, read_only=True)
+
+    schema: Dict[str, Any] = {"sheets": []}
+    dataframes: Dict[str, pd.DataFrame] = {}
+
+    for ws in wb.worksheets:
+        sheet_name = ws.title
+
+        # Read all rows as lists
+        rows_iter = ws.iter_rows(values_only=True)
+        all_rows = [list(r or []) for r in rows_iter]
+
+        # Determine header
+        headers: List[str] = []
+        data_start_idx = 0
+
+        if all_rows:
+            # Use first row as header if any non-empty cell exists in that row
+            first = all_rows[0]
+            if first and any((_stringify(c).strip() != "") for c in first):
+                headers = [(_stringify(c).strip() or f"col_{i+1}") for i, c in enumerate(first)]
+                data_start_idx = 1
+            else:
+                # No meaningful header; infer width from first non-empty row
+                width = 0
+                for r in all_rows[:3]:
+                    width = max(width, len(r))
+                headers = [f"col_{i+1}" for i in range(width or 1)]
+        else:
+            # Empty sheet -> empty DF
+            dataframes[sheet_name] = pd.DataFrame()
+            schema["sheets"].append({"name": sheet_name, "columns": []})
+            continue
+
+        # Normalize data rows to header width
+        data_rows = all_rows[data_start_idx:]
+        norm_rows = []
+        for r in data_rows:
+            row = list(r or [])
+            if len(row) < len(headers):
+                row.extend([None] * (len(headers) - len(row)))
+            elif len(row) > len(headers):
+                row = row[: len(headers)]
+            norm_rows.append(row)
+
+        df = pd.DataFrame(norm_rows, columns=headers)
+        dataframes[sheet_name] = df
+
+        # Build column schema entries
+        col_entries = []
+        for col_name in df.columns:
+            series = df[col_name]
+
+            dtype_label = _infer_series_dtype(series)
+            top_vals = _top_values(series, top_k=5)
+
+            col_entries.append(
+                {
+                    "name": col_name,
+                    "dtype": dtype_label,
+                    "top_values": top_vals,
+                }
+            )
+
+        sheet_entry = {
+            "name": sheet_name,
+            "columns": col_entries,
+        }
+        schema["sheets"].append(sheet_entry)
+
+    return schema, dataframes
