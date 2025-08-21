@@ -265,33 +265,71 @@ def _get_embedding_model_name() -> str:
     # text-embedding-004 is the current recommended Gemini embedding model.
     return "models/text-embedding-004"
 
-def _pandas_safe_to_string(obj: Any, max_rows: int = 20, max_chars: int = 4000) -> str:
+def _pandas_safe_to_string(
+    obj: Any,
+    max_rows: int = 30,
+    max_cols: int = 8,
+    max_col_width: int = 60,
+    max_chars: int = 3000,
+) -> str:
     """
     Convert a pandas result (DataFrame, Series) or scalar to a compact, safe string.
-    Truncates rows and overall characters for safety.
+    Truncates rows, columns, individual column width, and overall characters for safety.
+
+    Args:
+        obj: DataFrame, Series, or scalar.
+        max_rows: Maximum number of rows to include.
+        max_cols: Maximum number of columns to include when rendering tabular results.
+        max_col_width: Maximum characters per cell/column content (approx for display).
+        max_chars: Maximum number of characters in the final string.
     """
     try:
         if isinstance(obj, pd.DataFrame):
-            s = obj.head(max_rows).to_string(index=False)
+            # Ensure we only preview up to max_cols columns
+            df = obj.copy()
+            if df.shape[1] > max_cols:
+                # Keep first max_cols columns and mark trimming
+                extra = df.shape[1] - max_cols
+                df = df.iloc[:, :max_cols].copy()
+                df[f"... +{extra} more cols"] = ""
+            # Head limit the rows
+            df = df.head(max_rows)
+            with pd.option_context(
+                "display.max_rows", max_rows,
+                "display.max_columns", max_cols + 1,  # account for added marker column
+                "display.max_colwidth", max_col_width,
+                "display.width", 1000,
+            ):
+                s = df.to_string(index=False)
         elif isinstance(obj, pd.Series):
             s = obj.head(max_rows).to_string()
         else:
             s = str(obj)
-        s = str(s)
+
+        s = str(s).strip()
         if len(s) > max_chars:
             s = s[: max_chars - 3] + "..."
         return s
     except Exception:
-        return str(obj)
+        # Fallback to raw string conversion
+        try:
+            s = str(obj)
+            if len(s) > max_chars:
+                s = s[: max_chars - 3] + "..."
+            return s
+        except Exception:
+            return "<unrenderable result>"
 
 
 # PUBLIC_INTERFACE
 def get_gemini_nl_answer_from_pandas(query: str, pandas_result_text: str) -> str:
     """
     PUBLIC_INTERFACE
-    Given the user's original query and the textual representation of a pandas result,
+    Given the user's original query and a compact textual representation of a pandas result,
     ask Gemini to produce a concise, direct natural-language answer without referencing code,
     schemas, or internal processing steps.
+
+    Prompts are intentionally compact to control token usage.
 
     Args:
         query (str): The original user question.
@@ -299,31 +337,31 @@ def get_gemini_nl_answer_from_pandas(query: str, pandas_result_text: str) -> str
 
     Returns:
         str: A concise, plain-language answer phrased by Gemini.
-
-    Notes:
-        - The prompt explicitly forbids mentioning the schema, code generation, or pandas.
-        - The function returns a cleaned answer (meta text removed); if Gemini fails,
-          a minimal fallback is returned using the plain pandas result text.
     """
     if not pandas_result_text or not pandas_result_text.strip():
         return ""
 
     key = get_gemini_api_key()
     if not key:
-        # If we don't have Gemini available, just return the tabular summary as-is
         return pandas_result_text.strip()
 
+    # Compact instruction and prompt
     instruction = (
-        "Using ONLY the result table/value below and the user's question, produce a brief, direct answer. "
-        "Do NOT reference code, pandas, dataframes, or schemas. "
-        "Avoid meta explanations or caveats. Keep it concise and to the point."
+        "Answer briefly using only the given result. "
+        "Do not mention code, pandas, or schemas. No meta explanations."
     )
-    prompt = (
-        f"{instruction}\n\n"
-        f"User question:\n{query}\n\n"
-        f"Result:\n{pandas_result_text}\n\n"
-        f"Answer:"
-    )
+    # Limit the size we send to the model defensively
+    MAX_RESULT_CHARS = 2800
+    compact_result = pandas_result_text.strip()
+    if len(compact_result) > MAX_RESULT_CHARS:
+        compact_result = compact_result[: MAX_RESULT_CHARS - 3] + "..."
+
+    MAX_QUERY_CHARS = 500
+    compact_query = (query or "").strip()
+    if len(compact_query) > MAX_QUERY_CHARS:
+        compact_query = compact_query[: MAX_QUERY_CHARS - 3] + "..."
+
+    prompt = f"{instruction}\nQ: {compact_query}\nResult:\n{compact_result}\nAnswer:"
 
     try:
         genai.configure(api_key=key)
@@ -332,12 +370,11 @@ def get_gemini_nl_answer_from_pandas(query: str, pandas_result_text: str) -> str
         text = (resp.text or "").strip()
         return _clean_gemini_output(text) if text else pandas_result_text.strip()
     except Exception:
-        # On any Gemini error, degrade gracefully to the computed result text
         return pandas_result_text.strip()
 
 def _build_schema_prompt(session_id: str) -> Tuple[str, Dict[str, Dict[str, pd.DataFrame]]]:
     """
-    Construct a concise schema description and return also the DataFrame store mapping for evaluation.
+    Construct a compact schema description and return also the DataFrame store mapping for evaluation.
 
     Returns:
         (schema_text, df_store_for_session)
@@ -348,19 +385,17 @@ def _build_schema_prompt(session_id: str) -> Tuple[str, Dict[str, Dict[str, pd.D
         return "", {}
 
     lines: List[str] = []
-    lines.append("Available Excel datasets and sheets with columns:")
+    # Keep ultra-compact formatting to minimize tokens
     for wb_name, schema in schema_bundle.items():
-        lines.append(f"- Workbook: {wb_name}")
         try:
             sheets = schema.get("sheets", [])
             for s in sheets:
                 sheet_name = s.get("name", "")
                 col_names = [c.get("name", "") for c in s.get("columns", [])]
-                # compact display
-                cols_display = ", ".join(col_names[:50])
-                if len(col_names) > 50:
+                cols_display = ", ".join(col_names[:30])
+                if len(col_names) > 30:
                     cols_display += ", ..."
-                lines.append(f"  - Sheet: {sheet_name} | Columns: {cols_display}")
+                lines.append(f"{wb_name}::{sheet_name} | {cols_display}")
         except Exception:
             continue
 
@@ -380,23 +415,14 @@ def _gemini_pandas_code_for_query(user_query: str, schema_text: str) -> str:
 
     instruction = textwrap.dedent(
         """
-        You are given a user question and a data schema describing pandas DataFrames per workbook and sheet.
+        Produce ONLY Python code (plain text, no markdown/comments) using pandas on provided DataFrames.
 
-        Constraints:
-        - Return ONLY Python code as plain text (no backticks, no markdown, no comments, no extra text).
-        - Use pandas operations on provided DataFrames to answer the question.
-        - DataFrames are accessible via a nested mapping: DFS[workbook_name][sheet_name] -> pandas.DataFrame.
-        - Do not import modules or define functions.
-        - Do not read files or access network.
-        - Ensure your code assigns the final answer to a variable named RESULT, e.g., RESULT = <pandas_expression>.
-        - Keep computations simple and safe.
-
-        Examples of acceptable outputs:
-        RESULT = DFS["report.xlsx"]["Sales"].groupby("Region")["Amount"].sum().sort_values(ascending=False).head(10)
-        RESULT = DFS["data.xlsx"]["Employees"]["Department"].value_counts()
-
-        If the question cannot be answered with the available columns, set:
-        RESULT = "Not answerable from provided sheets"
+        Rules:
+        - Access DataFrames via DFS[workbook][sheet].
+        - No imports, no functions, no I/O, no network.
+        - Assign final result to RESULT (e.g., RESULT = <expression>).
+        - Keep operations simple and safe.
+        - If not answerable with given columns: RESULT = "Not answerable from provided sheets"
         """
     ).strip()
 
@@ -420,27 +446,56 @@ def _safe_eval_pandas(code: str, dfs: Dict[str, Dict[str, pd.DataFrame]]) -> Tup
     Safely evaluate a pandas code string where the code must set RESULT variable.
     We restrict builtins and globals; only DFS and pd are available.
 
+    Security:
+    - Blocks dangerous tokens and access patterns: imports, dunders, file/network/process APIs, exec/eval, etc.
+    - Disallows attribute access on modules other than pd/DFS objects resolved at runtime via pandas methods only.
+    - Single-statement expectation: assignment to RESULT.
+
     Returns:
         (success, result_or_error)
     """
     if not code:
         return False, "No code produced"
-    # refuse dangerous patterns quickly
-    forbidden = ["import ", "__", "os.", "sys.", "open(", "eval(", "exec(", "subprocess", "pickle", "builtins", "globals(", "locals("]
-    lowered = code.lower()
-    for pat in forbidden:
-        if pat in lowered:
-            return False, f"Forbidden token detected in code: {pat}"
 
+    # Normalize newlines/spaces for checks
+    lowered = " ".join(code.lower().split())
+
+    # Forbidden token substrings to block outright
+    forbidden_tokens = [
+        "import", "__", "os.", "sys.", "pathlib", "shutil", "tempfile", "builtins",
+        "pickle", "dill", "marshal", "ctypes", "cffi", "subprocess", "multiprocessing",
+        "thread", "threading", "socket", "requests", "urllib", "http", "https",
+        "ftp", "smtplib", "paramiko",
+        "open(", "io.", "eval(", "exec(", "compile(", "globals(", "locals(", "vars(",
+        "setattr(", "getattr(", "delattr(", "input(", "print(", "exit(", "quit(",
+        "__import__", "memoryview(", "bytearray(", "buffer(", "reload(",
+        "sys.exit", "os.system", "os.popen",
+    ]
+    for tok in forbidden_tokens:
+        if tok in lowered:
+            return False, f"Forbidden token detected in code: {tok}"
+
+    # Forbid assignments to global names other than RESULT; block semicolons (multi stmt)
+    if ";" in code:
+        return False, "Multiple statements are not allowed"
+    # Ensure RESULT is assigned
+    if "result" not in lowered or "=" not in code:
+        return False, "Code must assign the final value to RESULT"
+
+    # Very conservative guard on backticks and triple-backticks
+    if "```" in code or "`" in code:
+        return False, "Code formatting markers are not allowed"
+
+    # Prepare isolated execution env
     local_env: Dict[str, Any] = {}
     safe_globals = {
-        "__builtins__": {},
-        "DFS": dfs,
-        "pd": pd,
+        "__builtins__": {},  # no builtins
+        "DFS": dfs,          # provided dataframes
+        "pd": pd,            # allow pandas access
     }
+
     try:
         exec(code, safe_globals, local_env)
-        # Check both local and globals for RESULT
         result = local_env.get("RESULT", safe_globals.get("RESULT"))
         if result is None:
             return False, "Code did not assign to RESULT"
@@ -986,3 +1041,41 @@ def upload_chat_context(
         total_chars=total_chars,
         message=message,
     )
+
+# PUBLIC_INTERFACE
+@app.get(
+    "/chat/schema",
+    tags=["Chat"],
+    summary="Get uploaded Excel schema JSON",
+    description="Retrieve the stored schema JSON for an uploaded Excel file by session_id and filename.",
+    responses={
+        200: {"description": "Schema JSON returned"},
+        404: {"description": "Schema not found for session/filename"},
+        400: {"description": "Invalid request parameters"},
+    },
+)
+def get_uploaded_schema(session_id: str, filename: str):
+    """
+    PUBLIC_INTERFACE
+    Returns the JSON schema extracted from an uploaded Excel workbook for debugging or UI display.
+
+    Args:
+        session_id (str): The session identifier used during upload.
+        filename (str): Original Excel filename used in the upload.
+
+    Returns:
+        dict: Schema JSON with sheets and columns metadata.
+
+    Raises:
+        HTTPException: 400 for invalid params, 404 if not found.
+    """
+    if not session_id or not filename:
+        raise HTTPException(status_code=400, detail="session_id and filename are required")
+    session_store = XLSX_SCHEMA_STORE.get(session_id)
+    if not session_store:
+        raise HTTPException(status_code=404, detail="No schema found for session")
+    schema = session_store.get(filename)
+    if not schema:
+        raise HTTPException(status_code=404, detail="No schema found for given filename in session")
+    # Return compacted schema (no change to content)
+    return schema
