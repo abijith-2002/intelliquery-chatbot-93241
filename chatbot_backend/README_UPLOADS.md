@@ -28,9 +28,17 @@ Troubleshooting large Excel files not appearing:
 - If Excel parsing is skipped due to memory or time limits, the file still appears with a warning in the preview; schema is either deferred or partially built from sampled rows.
 - Increase `CHATBOT_EXCEL_SCHEMA_MAX_SAMPLE_ROWS` cautiously if you need deeper schema statistics, or decrease it to reduce CPU/memory pressure.
 
-Additional diagnostics for /chat/excel-query:
-- Server logs now include:
+Additional diagnostics and controls for /chat/excel-query:
+- Request controls:
+  - mode: 'auto' (default), 'summary' (schema + sample), 'entire' (attempt full data for small files), 'sample' (force sample), 'sheet' (focus on selected sheet/column).
+  - sheet_name: Optional string to select a particular sheet.
+  - column_name: Optional string to narrow to a particular column for context and computation.
+- Server logs include:
   - "[excel_query] Rebuilt schema..." when an empty or invalid schema is detected and rebuilt.
   - "[excel_query] Prompt preview..." showing the first up to 1000 characters of the prompt sent to Gemini (includes a compact per-sheet summary and a safely truncated JSON schema preview).
   - "[excel_query] Schema summary: sheets=..., cols_per_sheet=[...]" to confirm schema richness.
-- These logs help confirm that the Gemini prompt is never empty and includes representative schema even for very large files (with sampling/truncation noted in schema notes).
+  - Notes about direct-answer mode, large-file summaries, and any failures/limitations.
+- The API response 'result' now includes a 'diagnostics' object for visibility in the UI when chunking/summarization was applied or when requests were constrained by size.
+- For extremely large datasets:
+  - If aggregate intent is detected, the server computes aggregates over the full dataset in pandas (and may use rolling strategies internally) and asks Gemini to provide a narrative.
+  - If non-aggregate and the dataset is too large, the server returns high-level overview stats and a Gemini narrative explaining limitations and suggested next steps (e.g., filtering or grouping).

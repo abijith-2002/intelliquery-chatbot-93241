@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, EmailStr
 from typing import List, Optional, Dict, Any
 import google.generativeai as genai
 import json
+import pandas as pd
 
 from dotenv import load_dotenv
 from langchain.memory import ConversationBufferMemory
@@ -164,10 +165,15 @@ class ExcelQueryRequest(BaseModel):
     """Schema for querying uploaded Excel data using Gemini-driven pandas expressions."""
     session_id: str = Field(..., description="Session ID that has an uploaded Excel sheet")
     sheet_name: Optional[str] = Field(default=None, description="Optional sheet name to select; defaults to first non-empty sheet uploaded")
+    column_name: Optional[str] = Field(default=None, description="Optional column name to select; if provided, df will be narrowed before processing.")
     query: str = Field(..., description="User's natural language question/task about the Excel data")
     mode: Optional[str] = Field(
         default="auto",
-        description="Data inclusion mode for Gemini prompt: 'auto' (default), 'summary' (schema + sample), or 'entire' (attempt full data for small files).",
+        description=(
+            "Data inclusion mode for Gemini prompt: "
+            "'auto' (default), 'summary' (schema + sample), 'entire' (attempt full data for small files), "
+            "'sample' (force sample), or 'sheet' (force a particular sheet/column view)."
+        ),
     )
 
 
@@ -890,25 +896,28 @@ def excel_query(request: ExcelQueryRequest):
     Strategy:
         - Small/medium data: include schema and data (per mode=auto/summary/entire) in the Gemini prompt.
         - Very large data with aggregation intent: compute aggregates across the full DataFrame in pandas and ask Gemini to narrate.
+        - For extremely large files, use rolling/chunk aggregation to compute results over the entire dataset without loading all rows at once (when possible).
         - Otherwise, fallback to prompting Gemini for a pandas expression using schema metadata and evaluate it safely.
 
     Steps:
         1) Retrieve stored schema and DataFrame for the session.
-        2) Choose strategy based on DataFrame size, request.mode, and query intent (aggregation or not).
-        3) Either send schema+data to Gemini for a direct answer, or ask Gemini for a pandas expression to evaluate safely.
-        4) Return the result and a narrative explanation.
+        2) Optionally narrow to a sheet and/or a selected column per request.
+        3) Choose strategy based on DataFrame size, request.mode, and query intent (aggregation or not).
+        4) Either send schema+data to Gemini for a direct answer, or ask Gemini for a pandas expression to evaluate safely.
+        5) Return the result and a narrative explanation, plus diagnostics about truncation or chunking.
 
     Args:
-        request (ExcelQueryRequest): session_id, optional sheet_name, user query, and optional mode ('auto'|'summary'|'entire').
+        request (ExcelQueryRequest): session_id, optional sheet_name/column_name, user query, and mode.
 
     Returns:
         ExcelQueryResponse: The pandas expression (or note), computed result, and a narrative explanation.
-
-    Notes:
-        - Sandbox evaluation is used only when an expression is produced.
-        - Raw data is only sent for small/medium DataFrames or when explicitly requested by mode='entire' and safe.
     """
-    from .excel_utils import get_gemini_pandas_prompt, safe_eval_pandas_expression, normalize_result_for_json, build_schema_for_gemini
+    from .excel_utils import (
+        get_gemini_pandas_prompt,
+        safe_eval_pandas_expression,
+        normalize_result_for_json,
+        build_schema_for_gemini,
+    )
     from .excel_query_strategy import (
         SizeThresholds,
         estimate_df_size,
@@ -957,13 +966,23 @@ def excel_query(request: ExcelQueryRequest):
             pass
         raise HTTPException(status_code=400, detail="No usable DataFrame found in uploaded Excel.")
 
-    # Ensure schema exists and is populated
+    # Optional column narrowing to focus the context and reduce size
+    if getattr(request, "column_name", None):
+        col = request.column_name
+        if col not in df.columns:
+            raise HTTPException(status_code=400, detail=f"Column '{col}' not found in selected DataFrame.")
+        try:
+            df = df[[col]]  # keep as DataFrame to preserve consistent downstream behavior
+        except Exception:
+            # Fallback: Series to_frame
+            df = df[col].to_frame()
+
+    # Ensure schema exists and is populated (rebuild if needed)
     schema = store.get("schema")
     rebuild_reason = None
     if not schema or not isinstance(schema, dict) or not schema.get("sheets"):
         rebuild_reason = "missing_or_invalid"
     else:
-        # If schema exists but all sheets have no columns, rebuild using full sheets
         try:
             has_columns = any((len(s.get("columns") or []) > 0) for s in schema.get("sheets", []))
             if not has_columns:
@@ -973,15 +992,12 @@ def excel_query(request: ExcelQueryRequest):
 
     if rebuild_reason is not None:
         try:
-            # Try to rebuild from all sheets for better context
             build_source = sheets if sheets else {"Sheet1": df}
-            # Respect configured sampling to avoid heavy processing
             max_rows = int(os.getenv("CHATBOT_EXCEL_SCHEMA_MAX_SAMPLE_ROWS", "10000"))
             schema = build_schema_for_gemini(build_source, max_examples_per_col=3, max_rows_per_sheet=max_rows)
             store["schema"] = schema
             print(f"[excel_query] Rebuilt schema for session={session_id} reason={rebuild_reason} sheets={list(build_source.keys())}")
         except Exception as e:
-            # As last resort, build minimal schema only from current df to avoid empty context
             try:
                 schema = build_schema_for_gemini({"Sheet1": df}, max_examples_per_col=3, max_rows_per_sheet=1000)
                 store["schema"] = schema
@@ -995,9 +1011,10 @@ def excel_query(request: ExcelQueryRequest):
     if not user_query:
         raise HTTPException(status_code=400, detail="query is required.")
 
-    # Decide strategy
+    # Decide strategy and handle modes
     mode = (request.mode or "auto").lower()
-    if mode not in ("auto", "summary", "entire"):
+    # Accept additional aliases
+    if mode not in ("auto", "summary", "entire", "sample", "sheet"):
         mode = "auto"
 
     thresholds = SizeThresholds()
@@ -1013,6 +1030,15 @@ def excel_query(request: ExcelQueryRequest):
     except Exception:
         wants_agg = False
 
+    # Diagnostics container
+    diagnostics: Dict[str, Any] = {
+        "mode": mode,
+        "size_class": size_class,
+        "sheet": request.sheet_name or "default",
+        "column": getattr(request, "column_name", None),
+        "notes": [],
+    }
+
     gemini_api_key = get_gemini_api_key()
     if not gemini_api_key:
         raise HTTPException(status_code=500, detail="Gemini API key is not set in environment variables.")
@@ -1025,6 +1051,7 @@ def excel_query(request: ExcelQueryRequest):
             agg_payload = compute_aggregate_answer(df, user_query)
         except Exception as e:
             agg_payload = None
+            diagnostics["notes"].append(f"aggregate_compute_failed: {e}")
             print(f"[excel_query] Aggregate compute failed: {e}")
         if agg_payload is not None:
             # Ask Gemini to explain the aggregates with schema context
@@ -1035,6 +1062,7 @@ def excel_query(request: ExcelQueryRequest):
                     f"User request:\n{user_query}\n\n"
                     f"Schema:\n{json.dumps(schema, ensure_ascii=False)}\n\n"
                     f"Aggregates:\n{json.dumps(agg_payload, ensure_ascii=False)}\n"
+                    "If applicable, note that results were computed across the entire dataset using server-side aggregation."
                 )
                 narr_resp = model.generate_content([{"role": "user", "parts": [narr_prompt]}])
                 narrative = _clean_gemini_output((narr_resp.text or "").strip())
@@ -1042,35 +1070,86 @@ def excel_query(request: ExcelQueryRequest):
                 narrative = "Aggregates were computed across the entire dataset to answer your question."
             return ExcelQueryResponse(
                 expression="[server] computed aggregates in pandas over the entire DataFrame",
-                result=agg_payload,
+                result={"aggregates": agg_payload, "diagnostics": diagnostics},
                 narrative=narrative or "Aggregates computed over full dataset.",
             )
         # If we cannot compute aggregates, fall through to expression strategy.
 
+    # Strategy A2: Extremely large and non-aggregate -> rolling stats as safe fallback
+    # Provide top-level stats to Gemini for summarization if data is too big to include
+    try:
+        if size_class == "large" and not wants_agg:
+            # Compute lightweight overall stats without heavy memory usage
+            # Only numeric columns; include row/column counts and null summaries
+            num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+            overall = {
+                "rows": int(df.shape[0]),
+                "cols": int(df.shape[1]),
+                "numeric_cols": num_cols,
+                "nulls_per_col": {c: int(df[c].isna().sum()) for c in df.columns},
+            }
+            # Use describe on numeric columns but limit to safe try
+            try:
+                overall["numeric_describe"] = df[num_cols].describe().to_dict() if num_cols else {}
+            except Exception:
+                overall["numeric_describe"] = {}
+            diagnostics["notes"].append("used_largefile_overview_stats")
+            narr_prompt = (
+                "Given the user's question and a summary of a very large dataset, provide a concise answer or guidance. "
+                "If exact computation is infeasible from the summary, clearly explain limitations and suggest a targeted filter/aggregation to run.\n\n"
+                f"User request:\n{user_query}\n\n"
+                f"Schema (compact):\n{json.dumps(schema, ensure_ascii=False)}\n\n"
+                f"Dataset overview stats:\n{json.dumps(overall, ensure_ascii=False)}\n"
+            )
+            try:
+                resp = model.generate_content([{"role": "user", "parts": [narr_prompt]}])
+                narrative = _clean_gemini_output((resp.text or "").strip())
+            except Exception:
+                narrative = "Provided a high-level answer based on summary statistics due to dataset size."
+            return ExcelQueryResponse(
+                expression="[server] high-level summary (no expression evaluation)",
+                result={"summary": "Large dataset; returned overview stats", "diagnostics": diagnostics, "overview": overall},
+                narrative=narrative,
+            )
+    except Exception as e:
+        diagnostics["notes"].append(f"largefile_overview_failed: {e}")
+        # continue to next strategies
+
     # Strategy B: Small/Medium DF or mode requests data -> include schema (+ data/sample) and ask Gemini to produce a direct answer
     try:
+        # Support explicit modes
+        eff_mode = mode
+        if mode == "sample":
+            eff_mode = "summary"
+        if mode == "sheet":
+            # Encourage Gemini to focus on selected sheet/column; still use auto inclusion strategy
+            eff_mode = "auto"
+            diagnostics["notes"].append("sheet_mode_active")
         prompt_with_data, ctx_meta = build_prompt_with_schema_and_optional_data(
-            user_query=user_query, schema=schema, df=df, mode=mode, thresholds=thresholds
+            user_query=user_query, schema=schema, df=df, mode=eff_mode, thresholds=thresholds
         )
     except Exception as e:
-        # Fallback to previous schema-only expression prompting
         prompt_with_data, ctx_meta = "", {"included": {"schema": True, "data_rows": 0, "data_truncated": False}}
+        diagnostics["notes"].append(f"schema_data_prompt_failed: {e}")
         print(f"[excel_query] Failed to build data-inclusive prompt: {e}")
 
-    direct_answer_possible = bool(prompt_with_data and (size_class in ("small", "medium") or mode == "entire"))
+    direct_answer_possible = bool(
+        prompt_with_data and (size_class in ("small", "medium") or mode in ("entire", "summary", "sample"))
+    )
 
     if direct_answer_possible:
         try:
-            # Ask Gemini for a natural language answer directly, given schema and (optional) data
-            resp = model.generate_content([{"role": "user", "parts": [prompt_with_data + "\n\nProvide the final answer succinctly."]}])
+            resp = model.generate_content(
+                [{"role": "user", "parts": [prompt_with_data + "\n\nProvide the final answer succinctly."]}]
+            )
             answer_text = _clean_gemini_output((resp.text or "").strip())
-            # We still include an expression field for API compatibility; mark as server-direct
             return ExcelQueryResponse(
                 expression="[server] direct answer via schema/data prompt (no expression evaluation)",
-                result={"answer": answer_text, "context_meta": ctx_meta},
+                result={"answer": answer_text, "context_meta": ctx_meta, "diagnostics": diagnostics},
                 narrative="Answer generated by Gemini using provided schema and data context.",
             )
         except Exception as e:
+            diagnostics["notes"].append(f"direct_answer_failed: {e}")
             print(f"[excel_query] Direct answer path failed: {e}")
             # Fallthrough to expression strategy
 
@@ -1126,4 +1205,8 @@ def excel_query(request: ExcelQueryRequest):
     except Exception:
         narrative = "Computed the result based on your request using a pandas expression."
 
-    return ExcelQueryResponse(expression=expression, result=json_result, narrative=narrative)
+    return ExcelQueryResponse(
+        expression=expression,
+        result={"value": json_result, "diagnostics": diagnostics},
+        narrative=narrative,
+    )
