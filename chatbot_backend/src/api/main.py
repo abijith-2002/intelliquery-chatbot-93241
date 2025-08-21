@@ -12,13 +12,15 @@
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple, Union
 import google.generativeai as genai
 
 from dotenv import load_dotenv
 from langchain.memory import ConversationBufferMemory
 import os
 import json
+import pandas as pd
+import textwrap
 
 # Import authentication/database helpers
 from .auth_utils import (
@@ -263,6 +265,143 @@ def _get_embedding_model_name() -> str:
     # text-embedding-004 is the current recommended Gemini embedding model.
     return "models/text-embedding-004"
 
+def _pandas_safe_to_string(obj: Any, max_rows: int = 20, max_chars: int = 4000) -> str:
+    """
+    Convert a pandas result (DataFrame, Series) or scalar to a compact, safe string.
+    Truncates rows and overall characters for safety.
+    """
+    try:
+        if isinstance(obj, pd.DataFrame):
+            s = obj.head(max_rows).to_string(index=False)
+        elif isinstance(obj, pd.Series):
+            s = obj.head(max_rows).to_string()
+        else:
+            s = str(obj)
+        s = str(s)
+        if len(s) > max_chars:
+            s = s[: max_chars - 3] + "..."
+        return s
+    except Exception:
+        return str(obj)
+
+def _build_schema_prompt(session_id: str) -> Tuple[str, Dict[str, Dict[str, pd.DataFrame]]]:
+    """
+    Construct a concise schema description and return also the DataFrame store mapping for evaluation.
+
+    Returns:
+        (schema_text, df_store_for_session)
+    """
+    schema_bundle = XLSX_SCHEMA_STORE.get(session_id) or {}
+    df_bundle = XLSX_DF_STORE.get(session_id) or {}
+    if not schema_bundle or not df_bundle:
+        return "", {}
+
+    lines: List[str] = []
+    lines.append("Available Excel datasets and sheets with columns:")
+    for wb_name, schema in schema_bundle.items():
+        lines.append(f"- Workbook: {wb_name}")
+        try:
+            sheets = schema.get("sheets", [])
+            for s in sheets:
+                sheet_name = s.get("name", "")
+                col_names = [c.get("name", "") for c in s.get("columns", [])]
+                # compact display
+                cols_display = ", ".join(col_names[:50])
+                if len(col_names) > 50:
+                    cols_display += ", ..."
+                lines.append(f"  - Sheet: {sheet_name} | Columns: {cols_display}")
+        except Exception:
+            continue
+
+    schema_text = "\n".join(lines)
+    return schema_text, df_bundle
+
+def _gemini_pandas_code_for_query(user_query: str, schema_text: str) -> str:
+    """
+    Ask Gemini to produce strictly a pandas code string (no markdown, no prose) that answers the query
+    using the provided schema. The code must only return the final expression or assignment to a variable named RESULT.
+
+    Returns:
+        str: code snippet
+    """
+    if not schema_text.strip():
+        return ""
+
+    instruction = textwrap.dedent(
+        """
+        You are given a user question and a data schema describing pandas DataFrames per workbook and sheet.
+
+        Constraints:
+        - Return ONLY Python code as plain text (no backticks, no markdown, no comments, no extra text).
+        - Use pandas operations on provided DataFrames to answer the question.
+        - DataFrames are accessible via a nested mapping: DFS[workbook_name][sheet_name] -> pandas.DataFrame.
+        - Do not import modules or define functions.
+        - Do not read files or access network.
+        - Ensure your code assigns the final answer to a variable named RESULT, e.g., RESULT = <pandas_expression>.
+        - Keep computations simple and safe.
+
+        Examples of acceptable outputs:
+        RESULT = DFS["report.xlsx"]["Sales"].groupby("Region")["Amount"].sum().sort_values(ascending=False).head(10)
+        RESULT = DFS["data.xlsx"]["Employees"]["Department"].value_counts()
+
+        If the question cannot be answered with the available columns, set:
+        RESULT = "Not answerable from provided sheets"
+        """
+    ).strip()
+
+    prompt = f"{instruction}\n\nSchema:\n{schema_text}\n\nUser question:\n{user_query}\n\nReturn only the code:"
+    key = get_gemini_api_key()
+    if not key:
+        return ""
+    try:
+        genai.configure(api_key=key)
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        resp = model.generate_content([{"role": "user", "parts": [prompt]}])
+        code = (resp.text or "").strip()
+        # enforce single-line purity by removing markdown fencing if any slipped in
+        code = code.replace("```python", "").replace("```", "").strip()
+        return code
+    except Exception:
+        return ""
+
+def _safe_eval_pandas(code: str, dfs: Dict[str, Dict[str, pd.DataFrame]]) -> Tuple[bool, Union[str, Any]]:
+    """
+    Safely evaluate a pandas code string where the code must set RESULT variable.
+    We restrict builtins and globals; only DFS and pd are available.
+
+    Returns:
+        (success, result_or_error)
+    """
+    if not code:
+        return False, "No code produced"
+    # refuse dangerous patterns quickly
+    forbidden = ["import ", "__", "os.", "sys.", "open(", "eval(", "exec(", "subprocess", "pickle", "builtins", "globals(", "locals("]
+    lowered = code.lower()
+    for pat in forbidden:
+        if pat in lowered:
+            return False, f"Forbidden token detected in code: {pat}"
+
+    local_env: Dict[str, Any] = {}
+    safe_globals = {
+        "__builtins__": {},
+        "DFS": dfs,
+        "pd": pd,
+    }
+    try:
+        exec(code, safe_globals, local_env)
+        # Check both local and globals for RESULT
+        result = local_env.get("RESULT", safe_globals.get("RESULT"))
+        if result is None:
+            return False, "Code did not assign to RESULT"
+        return True, result
+    except Exception as e:
+        return False, f"Evaluation error: {e}"
+    """
+    Resolve the embedding model name to use with Google Generative AI.
+    """
+    # text-embedding-004 is the current recommended Gemini embedding model.
+    return "models/text-embedding-004"
+
 
 def _embed_one(text: str) -> Optional[List[float]]:
     """
@@ -466,9 +605,33 @@ def chat(request: ChatRequest):
         top_chunks = _vector_search(session_id, request.query, top_k=3)
         retrieved_context = "\n---\n".join(top_chunks).strip()
 
-        # Compose Gemini answer with retrieved context (if any)
+        # Build schema-driven pandas step if XLSX data is available for the session
+        pandas_context_summary = ""
         try:
-            gemini_answer = get_gemini_response(request.query, memory, extra_context=retrieved_context)
+            schema_text, dfs_bundle = _build_schema_prompt(session_id)
+            if schema_text and dfs_bundle:
+                pandas_code = _gemini_pandas_code_for_query(request.query, schema_text)
+                success, result_or_err = _safe_eval_pandas(pandas_code, dfs_bundle)
+                if success:
+                    pandas_context_summary = _pandas_safe_to_string(result_or_err)
+                else:
+                    # include brief notice but avoid leaking internals; keep it compact
+                    pandas_context_summary = f"Pandas step note: {result_or_err}"
+        except Exception:
+            # Ignore pandas step failure silently to not block core chat
+            pandas_context_summary = ""
+
+        # Prepare combined extra context: vector retrieved chunks + pandas result (if any)
+        extra_parts = []
+        if retrieved_context:
+            extra_parts.append(retrieved_context)
+        if pandas_context_summary:
+            extra_parts.append(f"[DataFrames derived result]\n{pandas_context_summary}")
+        combined_extra = "\n\n".join(extra_parts).strip()
+
+        # Compose Gemini answer with combined extra context (if any)
+        try:
+            gemini_answer = get_gemini_response(request.query, memory, extra_context=combined_extra)
         except Exception as e:
             gemini_answer = "[Gemini unavailable: {}]".format(e)
 
