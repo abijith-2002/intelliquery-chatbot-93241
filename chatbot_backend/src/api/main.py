@@ -800,19 +800,23 @@ def ask_excel_question(request: ExcelQuestionRequest):
     """
     PUBLIC_INTERFACE
     Handle questions specifically about Excel data using structured metadata and Parquet files.
-    
+
     This endpoint provides more precise answers for Excel-specific queries by leveraging
     the structured metadata extracted during upload and stored Parquet data.
-    
+
+    Deterministic handling:
+    - If the question asks for the number of distinct customers (or customer names), compute from metadata instead of relying on LLM.
+    - Also handle total row count queries deterministically.
+
     Args:
         request (ExcelQuestionRequest): The Excel question request with session_id and question.
-    
+
     Returns:
         ExcelQuestionResponse: Answer with data context and metadata information.
     """
     session_id = request.session_id
-    question = request.question
-    
+    question = (request.question or "").strip()
+
     # Get Excel metadata for the session
     excel_metadata_list = EXCEL_METADATA_STORE.get(session_id, [])
     # Lazy-load from disk if memory store is empty (e.g., after restart)
@@ -820,32 +824,162 @@ def ask_excel_question(request: ExcelQuestionRequest):
         excel_metadata_list = _load_session_metadata_from_disk(session_id)
     if not excel_metadata_list:
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail="No Excel data found for this session. Please upload Excel files first."
         )
-    
+
+    # Helper: identify likely "customer" columns from cleaned column names
+    import re
+    CUSTOMER_NAME_CANDIDATES = {"customer", "customer_name", "client", "client_name", "account", "buyer"}
+    def _is_customer_like(col: str) -> bool:
+        c = (col or "").lower()
+        if c in CUSTOMER_NAME_CANDIDATES:
+            return True
+        # substrings match
+        return any(tok in c for tok in ["customer", "client", "account", "buyer"])
+
+    # Aggregate distinct values from metadata value_counts if present, falling back to unique_count aggregation
+    def _collect_customer_values_and_counts():
+        values = []
+        values_set = set()
+        counts_total = 0
+        unique_count_total = 0
+        # Try collecting exact values from value_counts across sheets
+        for m in excel_metadata_list:
+            for _, sheet in (m.get("sheets") or {}).items():
+                for col_name, col_meta in (sheet.get("columns") or {}).items():
+                    if _is_customer_like(col_name):
+                        vc = col_meta.get("value_counts") or {}
+                        if vc:
+                            for k, v in vc.items():
+                                key_norm = ("" if k is None else str(k).strip())
+                                # normalize for distinct comparison (case-insensitive)
+                                norm = key_norm.lower()
+                                if norm not in values_set and key_norm != "":
+                                    values.append(key_norm)
+                                    values_set.add(norm)
+                                try:
+                                    counts_total += int(v)
+                                except Exception:
+                                    pass
+                        # Track unique_count for fallback aggregation
+                        try:
+                            unique_count_total += int(col_meta.get("unique_count") or 0)
+                        except Exception:
+                            pass
+        return values, counts_total, unique_count_total
+
+    # Determine deterministic intents from question
+    q_low = question.lower()
+    ask_distinct_customers = bool(re.search(r"\b(how\s+many|number\s+of|count)\b.*\b(customer|customers|client|clients|account|accounts|buyer|buyers)\b", q_low))
+    ask_list_customers = bool(re.search(r"\b(what|which|list|show)\b.*\b(customer|customers|client|clients|account|accounts|buyer|buyers)\b", q_low))
+    ask_total_rows = bool(re.search(r"\b(how\s+many|number\s+of|count|total)\b.*\b(row|rows|records)\b", q_low))
+
     try:
-        # Prepare context from Excel metadata
+        # Prepare a concise context from Excel metadata (summary)
         data_context_parts = []
         metadata_used = []
-        
+
+        # Deterministic answers for supported intents
+        if ask_total_rows:
+            total_rows = sum(int(m.get("total_rows", 0)) for m in excel_metadata_list)
+            for m in excel_metadata_list:
+                metadata_used.append(m.get("filename", "Unknown"))
+            data_context_parts.append(f"Total rows across all uploaded Excel files: {total_rows}")
+            answer = f"There are {total_rows} rows in total across the uploaded Excel data."
+            data_context = "\n".join(data_context_parts)
+            return ExcelQuestionResponse(
+                answer=answer,
+                data_context=data_context,
+                metadata_used=metadata_used
+            )
+
+        if ask_distinct_customers or ask_list_customers:
+            # Collect distinct customer-like values
+            values, counts_total, unique_count_total = _collect_customer_values_and_counts()
+
+            # If value_counts was not available, unique_count_total can give a hint; however, summing unique_count across sheets can overcount.
+            # Prefer actual value names gathered. If none, compute fallback from unique_count by scanning sheets.
+            distinct_values = sorted(values, key=lambda s: s.lower())
+
+            for m in excel_metadata_list:
+                metadata_used.append(m.get("filename", "Unknown"))
+
+            if ask_distinct_customers:
+                # If we have names, use their count; else fall back to max per-sheet unique_count as a conservative estimate
+                if distinct_values:
+                    n = len(distinct_values)
+                    data_context_parts.append(f"Detected customer-like column(s). Distinct values: {distinct_values}")
+                    answer = f"There are {n} distinct customers."
+                else:
+                    # Fallback: combine via set of sample_values if value_counts missing
+                    samples_set = set()
+                    for m in excel_metadata_list:
+                        for _, sheet in (m.get("sheets") or {}).items():
+                            for col_name, col_meta in (sheet.get("columns") or {}).items():
+                                if _is_customer_like(col_name):
+                                    for sv in (col_meta.get("sample_values") or []):
+                                        if sv is not None:
+                                            samples_set.add(str(sv).strip().lower())
+                    if samples_set:
+                        n = len(samples_set)
+                        data_context_parts.append(f"Derived from sample values; unique samples: {sorted(samples_set)}")
+                        answer = f"There are {n} distinct customers (estimated from samples)."
+                    else:
+                        # Last resort: take maximum unique_count across candidate columns
+                        max_unique = 0
+                        for m in excel_metadata_list:
+                            for _, sheet in (m.get("sheets") or {}).items():
+                                for col_name, col_meta in (sheet.get("columns") or {}).items():
+                                    if _is_customer_like(col_name):
+                                        try:
+                                            max_unique = max(max_unique, int(col_meta.get("unique_count") or 0))
+                                        except Exception:
+                                            pass
+                        data_context_parts.append("No explicit value names available; using unique_count metadata.")
+                        answer = f"There are {max_unique} distinct customers."
+                data_context = "\n".join(data_context_parts)
+                return ExcelQuestionResponse(
+                    answer=answer,
+                    data_context=data_context[:2000] if len(data_context) > 2000 else data_context,
+                    metadata_used=metadata_used
+                )
+
+            if ask_list_customers:
+                if distinct_values:
+                    display_list = ", ".join(distinct_values)
+                    data_context_parts.append(f"Customer values: {distinct_values}")
+                    answer = f"Customer names: {display_list}."
+                else:
+                    answer = "I could not find a customer column with explicit values in the uploaded data."
+                data_context = "\n".join(data_context_parts)
+                return ExcelQuestionResponse(
+                    answer=answer,
+                    data_context=data_context[:2000] if len(data_context) > 2000 else data_context,
+                    metadata_used=metadata_used
+                )
+
+        # Default behavior: build rich context and ask Gemini (original flow)
+        data_context_parts = []
+        metadata_used = []
+
         for metadata in excel_metadata_list:
             filename = metadata.get('filename', 'Unknown')
             metadata_used.append(filename)
-            
+
             # Add file summary
             data_context_parts.append(f"\n=== {filename} ===")
             data_context_parts.append(f"Total sheets: {len(metadata.get('sheets', {}))}")
             data_context_parts.append(f"Total rows: {metadata.get('total_rows', 0)}")
             data_context_parts.append(f"Total columns: {metadata.get('total_columns', 0)}")
-            
+
             # Add detailed sheet information
-            for sheet_name, sheet_info in metadata.get('sheets', {}).items():
+            for sheet_name, sheet_info in (metadata.get('sheets', {}) or {}).items():
                 data_context_parts.append(f"\nSheet '{sheet_name}':")
                 data_context_parts.append(f"  - {sheet_info.get('row_count', 0)} rows, {sheet_info.get('column_count', 0)} columns")
-                
+
                 # Add column details
-                columns = sheet_info.get('columns', {})
+                columns = sheet_info.get('columns', {}) or {}
                 if columns:
                     data_context_parts.append("  - Columns:")
                     for col_name, col_data in list(columns.items())[:10]:  # Limit to first 10 columns
@@ -854,14 +988,14 @@ def ask_excel_question(request: ExcelQuestionRequest):
                         sample_str = ', '.join(str(v) for v in sample_vals[:3]) if sample_vals else 'No samples'
                         data_context_parts.append(f"    * {col_name} ({col_type}): {sample_str}")
                 # Include a compact view of first rows if available
-                sample_rows = sheet_info.get('sample_data', {}).get('first_5_rows', [])
+                sample_rows = (sheet_info.get('sample_data', {}) or {}).get('first_5_rows', [])
                 if sample_rows:
                     data_context_parts.append("  - Sample rows (up to 3):")
                     for row in sample_rows[:3]:
                         data_context_parts.append(f"    • {row}")
-        
+
         data_context = '\n'.join(data_context_parts)
-        
+
         # Generate answer using Gemini with Excel-specific context
         excel_prompt = (
             f"You are a data analyst. Answer the following question about Excel data:\n"
@@ -871,11 +1005,11 @@ def ask_excel_question(request: ExcelQuestionRequest):
             f"If the question requires specific data values that aren't shown in the context, "
             f"explain what information is available and suggest how to get the specific data needed."
         )
-        
+
         gemini_api_key = get_gemini_api_key()
         if not gemini_api_key:
             raise HTTPException(status_code=500, detail="Gemini API key not configured")
-        
+
         try:
             import google.generativeai as genai
             genai.configure(api_key=gemini_api_key)
@@ -883,14 +1017,19 @@ def ask_excel_question(request: ExcelQuestionRequest):
             response = model.generate_content([{"role": "user", "parts": [excel_prompt]}])
             answer = response.text.strip()
         except Exception as e:
-            answer = f"Unable to generate answer using AI: {e}. Based on the uploaded Excel data, I can see {len(excel_metadata_list)} file(s) with a total of {sum(m.get('total_rows', 0) for m in excel_metadata_list)} rows across {sum(len(m.get('sheets', {})) for m in excel_metadata_list)} sheets."
-        
+            answer = (
+                f"Unable to generate answer using AI: {e}. Based on the uploaded Excel data, I can see "
+                f"{len(excel_metadata_list)} file(s) with a total of "
+                f"{sum(m.get('total_rows', 0) for m in excel_metadata_list)} rows across "
+                f"{sum(len(m.get('sheets', {})) for m in excel_metadata_list)} sheets."
+            )
+
         return ExcelQuestionResponse(
             answer=answer,
             data_context=data_context[:2000] if len(data_context) > 2000 else data_context,  # Truncate if too long
             metadata_used=metadata_used
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:

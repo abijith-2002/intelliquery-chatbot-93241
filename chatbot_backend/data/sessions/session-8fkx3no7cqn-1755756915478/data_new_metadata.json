@@ -1,0 +1,173 @@
+{
+  "filename": "data_new.xlsx",
+  "session_id": "session-8fkx3no7cqn-1755756915478",
+  "processed_at": "2025-08-21T06:15:45.265362",
+  "sheets": {
+    "Sheet1": {
+      "sheet_name": "Sheet1",
+      "row_count": 7,
+      "column_count": 6,
+      "columns": {
+        "Customer_Name": {
+          "name": "Customer_Name",
+          "dtype": "object",
+          "null_count": 0,
+          "null_percentage": 0.0,
+          "unique_count": 3,
+          "is_numeric": false,
+          "is_datetime": false,
+          "is_categorical": false,
+          "sample_values": [
+            "Best Buy",
+            "Best Buy",
+            "Best Buy",
+            "Vizio",
+            "Vizio"
+          ],
+          "value_counts": {
+            "Best Buy": 3,
+            "Vizio": 3,
+            "BBY": 1
+          }
+        },
+        "Model_Year": {
+          "name": "Model_Year",
+          "dtype": "object",
+          "null_count": 0,
+          "null_percentage": 0.0,
+          "unique_count": 3,
+          "is_numeric": false,
+          "is_datetime": false,
+          "is_categorical": false,
+          "sample_values": [
+            "2024 TPV",
+            "2024 TPV",
+            "2024 TPV",
+            "TPV_2024",
+            "TPV_2024"
+          ],
+          "value_counts": {
+            "2024 TPV": 3,
+            "TPV_2024": 3,
+            "BBY_2025": 1
+          }
+        },
+        "Model_Name": {
+          "name": "Model_Name",
+          "dtype": "object",
+          "null_count": 0,
+          "null_percentage": 0.0,
+          "unique_count": 3,
+          "is_numeric": false,
+          "is_datetime": false,
+          "is_categorical": false,
+          "sample_values": [
+            "\nNS-50F501NA26",
+            "\nNS-50F501NA26",
+            "\nNS-50F501NA26",
+            "V4K43M-0801",
+            "V4K43M-0801"
+          ],
+          "value_counts": {
+            "\nNS-50F501NA26": 3,
+            "V4K43M-0801": 3,
+            "NS-43F501NA26": 1
+          }
+        },
+        "Date": {
+          "name": "Date",
+          "dtype": "object",
+          "null_count": 1,
+          "null_percentage": 14.285714285714285,
+          "unique_count": 2,
+          "is_numeric": false,
+          "is_datetime": false,
+          "is_categorical": false,
+          "sample_values": [
+            "20241129",
+            "20241129",
+            "20241129",
+            "2024-11-27 00:00:00",
+            "2024-11-27 00:00:00"
+          ],
+          "value_counts": {
+            "20241129": 3,
+            "2024-11-27 00:00:00": 3
+          }
+        },
+        "Platform": {
+          "name": "Platform",
+          "dtype": "object",
+          "null_count": 4,
+          "null_percentage": 57.14285714285714,
+          "unique_count": 1,
+          "is_numeric": false,
+          "is_datetime": false,
+          "is_categorical": false,
+          "sample_values": [
+            "MT5586",
+            "MT5586",
+            "MT5586"
+          ],
+          "value_counts": {
+            "MT5586": 3
+          }
+        },
+        "Mode": {
+          "name": "Mode",
+          "dtype": "object",
+          "null_count": 0,
+          "null_percentage": 0.0,
+          "unique_count": 7,
+          "is_numeric": false,
+          "is_datetime": false,
+          "is_categorical": false,
+          "sample_values": [
+            "DTS_VIRTUAL_X_OFF",
+            "TRU_VOLUME_OFF",
+            "TRU_VOLUME_ON",
+            "Standard",
+            "Surround"
+          ],
+          "value_counts": {
+            "DTS_VIRTUAL_X_OFF": 1,
+            "TRU_VOLUME_OFF": 1,
+            "TRU_VOLUME_ON": 1,
+            "Standard": 1,
+            "Surround": 1,
+            "Virtualx": 1,
+            "Default": 1
+          }
+        }
+      },
+      "sample_data": {
+        "first_5_rows": [
+          {
+            "Customer_Name": "Best Buy",
+            "Model_Year": "2024 TPV",
+            "Model_Name": "\nNS-50F501NA26",
+            "Date": 20241129,
+            "Platform": NaN,
+            "Mode": "DTS_VIRTUAL_X_OFF"
+          },
+          {
+            "Customer_Name": "Best Buy",
+            "Model_Year": "2024 TPV",
+            "Model_Name": "\nNS-50F501NA26",
+            "Date": 20241129,
+            "Platform": NaN,
+            "Mode": "TRU_VOLUME_OFF"
+          },
+          {
+            "Customer_Name": "Best Buy",
+            "Model_Year": "2024 TPV",
+            "Model_Name": "\nNS-50F501NA26",
+            "Date": 20241129,
+            "Platform": NaN,
+            "Mode": "TRU_VOLUME_ON"
+          },
+          {
+            "Customer_Name": "Vizio",
+            "Model_Year": "TPV_2024",
+            "Model_Name": "V4K43M-0801",
+            "Date": 
