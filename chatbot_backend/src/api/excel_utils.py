@@ -51,23 +51,34 @@ def parse_xlsx_to_dataframe(content: bytes) -> Dict[str, pd.DataFrame]:
     try:
         return pd.read_excel(io.BytesIO(content), sheet_name=None, engine="openpyxl")
     except Exception:
-        # Fallback: openpyxl manual parsing
+        # Fallback: openpyxl manual parsing with streaming to reduce memory spikes
         wb = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
         sheets: Dict[str, pd.DataFrame] = {}
         for ws in wb.worksheets:
-            rows = list(ws.iter_rows(values_only=True))
-            if not rows:
+            iter_rows = ws.iter_rows(values_only=True)
+            try:
+                first_row = next(iter_rows)
+            except StopIteration:
                 sheets[ws.title] = pd.DataFrame()
                 continue
-            headers = rows[0]
-            data_rows = rows[1:]
+            headers = first_row
+            # Collect rows incrementally; still may be large but avoids holding entire sheet at once
+            data_rows = []
+            max_rows_guard = 1_000_000  # absolute safety guard to avoid unbounded growth
+            for idx, row in enumerate(iter_rows):
+                data_rows.append(row)
+                if idx >= max_rows_guard:
+                    break
             try:
                 df = pd.DataFrame(data_rows, columns=headers)
             except Exception:
                 # If headers are None or duplicated in an unrecoverable manner, auto-generate
                 n_cols = len(headers) if headers else (len(data_rows[0]) if data_rows else 0)
                 cols = [f"col_{i+1}" for i in range(n_cols)]
-                df = pd.DataFrame(rows, columns=cols)
+                try:
+                    df = pd.DataFrame([headers] + data_rows, columns=cols)
+                except Exception:
+                    df = pd.DataFrame(data_rows, columns=cols)
             sheets[ws.title] = df
         return sheets
 

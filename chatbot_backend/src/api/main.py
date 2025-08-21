@@ -20,7 +20,6 @@ from langchain.memory import ConversationBufferMemory
 
 # New: stdlib imports for timeouts/limits and background tasks
 import os
-import asyncio
 from fastapi import BackgroundTasks
 
 # Import authentication/database helpers
@@ -597,6 +596,16 @@ def chat_wsinfo():
         415: {"description": "Unsupported media type"},
     },
 )
+def _log_upload_issue(filename: str, message: str) -> None:
+    """
+    Lightweight logger for upload issues. Keeps logs uniform without external deps.
+    """
+    try:
+        print(f"[upload] file={filename} :: {message}")
+    except Exception:
+        pass
+
+
 def upload_chat_context(
     session_id: str = Form(..., description="Session ID to associate uploaded context with"),
     files: List[UploadFile] = File(..., description="One or more files (.docx, .xlsx, .pdf, .txt)"),
@@ -632,33 +641,69 @@ def upload_chat_context(
     total_chars = 0
     total_bytes_accum = 0
 
-    async def _read_file_enforcing_limits(upload: UploadFile) -> bytes:
+    def _read_file_enforcing_limits_sync(upload: UploadFile) -> bytes:
+        """
+        Read file stream in chunks synchronously, enforcing per-file and total limits.
+        UploadFile.read() is async, but in a sync path under most FastAPI route functions
+        it's safer to access the underlying file to avoid event-loop misuse.
+        """
         nonlocal total_bytes_accum
-        # Read stream in chunks to avoid large memory spikes and enforce size limits
         chunk_size = 1024 * 1024  # 1 MB
         collected: List[bytes] = []
         read_so_far = 0
+        # Prefer underlying file-like object if available (SpooledTemporaryFile)
+        fileobj = getattr(upload, "file", None)
+        if fileobj is None:
+            # Fallback: small single read if .file isn't present
+            data = upload.file.read() if hasattr(upload, "file") else b""
+            if not isinstance(data, (bytes, bytearray)):
+                data = b""
+            if len(data) > 0:
+                read_so_far += len(data)
+                total_bytes_accum += len(data)
+                if read_so_far > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=400, detail=f"File {upload.filename} exceeds max size limit.")
+                if total_bytes_accum > MAX_TOTAL_UPLOAD_BYTES:
+                    raise HTTPException(status_code=400, detail="Total upload size exceeds max limit.")
+                collected.append(bytes(data))
+            return b"".join(collected)
+
+        # Ensure file pointer at start
+        try:
+            fileobj.seek(0)
+        except Exception:
+            pass
+
         while True:
-            chunk = await upload.read(chunk_size)
+            chunk = fileobj.read(chunk_size)
             if not chunk:
                 break
+            if not isinstance(chunk, (bytes, bytearray)):
+                # Safety: coerce or stop
+                chunk = bytes(str(chunk), "utf-8")
             read_so_far += len(chunk)
             total_bytes_accum += len(chunk)
             if read_so_far > MAX_UPLOAD_BYTES:
                 raise HTTPException(status_code=400, detail=f"File {upload.filename} exceeds max size limit.")
             if total_bytes_accum > MAX_TOTAL_UPLOAD_BYTES:
                 raise HTTPException(status_code=400, detail="Total upload size exceeds max limit.")
-            collected.append(chunk)
+            collected.append(bytes(chunk))
         return b"".join(collected)
 
-    start = asyncio.get_event_loop().time()
+    # Use a monotonic time function for wall-clock checks
+    try:
+        import time
+        start = time.monotonic()
+        now_func = time.monotonic
+    except Exception:
+        start = 0.0
+        now_func = (lambda: 0.0)
 
     for f in files:
         filename = f.filename or "unnamed"
         # Enforce wall time for the whole request
-        now = asyncio.get_event_loop().time()
-        if now - start > UPLOAD_PROCESS_TIMEOUT_SECS:
-            # Return early with partial results to avoid upstream 504
+        now = now_func()
+        if start and now - start > UPLOAD_PROCESS_TIMEOUT_SECS:
             partial_msg = "Partial processing due to time limit; larger files will be processed in background (if configured)."
             return UploadContextResponse(
                 session_id=session_id,
@@ -667,12 +712,9 @@ def upload_chat_context(
                 message=partial_msg,
             )
 
-        # Read file bytes (async, chunked)
+        # Read file bytes (chunked) using sync pipeline to avoid event-loop misuse
         try:
-            data = asyncio.get_event_loop().run_until_complete(_read_file_enforcing_limits(f)) if hasattr(f, "read") and asyncio.get_event_loop().is_running() else asyncio.run(_read_file_enforcing_limits(f))  # type: ignore
-        except RuntimeError:
-            # If event loop is already running within FastAPI (uvicorn), use create_task style
-            data = asyncio.get_event_loop().run_until_complete(_read_file_enforcing_limits(f))  # type: ignore
+            data = _read_file_enforcing_limits_sync(f)
         except HTTPException as he:
             results.append(
                 UploadedFileResult(
@@ -695,7 +737,7 @@ def upload_chat_context(
         chars = len(text)
 
         # Excel parsing: optionally defer heavy DataFrame extraction
-        if filename.lower().endswith(".xlsx") and not err and PARSE_EXCEL_ON_UPLOAD:
+        if filename.lower().endswith(".xlsx") and not err and PARSE_EXCEL_ON_UPLOAD and size > 0:
             try:
                 # Build a reduced-size schema by sampling, to avoid large memory/time usage
                 sheets = parse_xlsx_to_dataframe(data or b"")
@@ -705,24 +747,30 @@ def upload_chat_context(
                     if sdf is None:
                         sampled_sheets[sname] = sdf
                     else:
-                        if EXCEL_SCHEMA_MAX_SAMPLE_ROWS > 0 and sdf.shape[0] > EXCEL_SCHEMA_MAX_SAMPLE_ROWS:
+                        if EXCEL_SCHEMA_MAX_SAMPLE_ROWS > 0 and getattr(sdf, "shape", (0, 0))[0] > EXCEL_SCHEMA_MAX_SAMPLE_ROWS:
                             sampled_sheets[sname] = sdf.head(EXCEL_SCHEMA_MAX_SAMPLE_ROWS)
                         else:
                             sampled_sheets[sname] = sdf
                 # Choose default df: first non-empty sheet; otherwise first sheet
                 chosen_df = None
                 for sname, sdf in sheets.items():
-                    if sdf is not None and not sdf.empty:
-                        chosen_df = sdf
-                        break
+                    try:
+                        if sdf is not None and not sdf.empty:
+                            chosen_df = sdf
+                            break
+                    except Exception:
+                        continue
                 if chosen_df is None and sheets:
                     chosen_df = next(iter(sheets.values()))
+                # Build schema; if a sheet is massive with many columns, this can still be heavy, so guard with try/except
                 schema = build_schema_for_gemini(sampled_sheets, max_examples_per_col=3, max_rows_per_sheet=EXCEL_SCHEMA_MAX_SAMPLE_ROWS)
                 EXCEL_STORE[session_id] = {
                     "df": chosen_df,
                     "sheets": sheets,
                     "schema": schema,
                 }
+            except MemoryError as me:
+                preview = (preview + f" [Excel parsing skipped due to memory limits: {me}]").strip()
             except Exception as e:
                 preview = (preview + f" [Excel parsing warning: {e}]").strip()
 
@@ -912,7 +960,13 @@ def excel_query(request: ExcelQueryRequest):
             "Provide a concise explanation (2-4 sentences) of what this code does and how it answers the user's request. "
             "Do not include code in the answer."
         )
-        narr_resp = model.generate_content([{"role": "user", "parts": [narration_prompt]}])
+        # Ensure model exists; if not, instantiate a lightweight model
+        try:
+            _narr_model = model  # reuse if exists
+        except NameError:
+            genai.configure(api_key=gemini_api_key)
+            _narr_model = genai.GenerativeModel("gemini-2.5-flash")
+        narr_resp = _narr_model.generate_content([{"role": "user", "parts": [narration_prompt]}])
         narrative = _clean_gemini_output((narr_resp.text or "").strip())
     except Exception:
         narrative = "Computed the result based on your request using a pandas expression."

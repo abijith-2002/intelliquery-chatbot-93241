@@ -81,12 +81,15 @@ def _extract_docx(content: bytes) -> str:
 
 
 def _extract_xlsx(content: bytes) -> str:
-    """Extract text from XLSX using openpyxl (sheet by sheet, TSV rows)."""
+    """Extract text from XLSX using openpyxl (sheet by sheet, TSV rows), with row limits to avoid memory explosions."""
     bio = io.BytesIO(content)
     wb = load_workbook(bio, data_only=True, read_only=True)
     parts: List[str] = []
+    # Hard cap to avoid building extremely large previews
+    MAX_ROWS_PER_SHEET_PREVIEW = 5000
     for ws in wb.worksheets:
         parts.append(f"[Sheet: {ws.title}]")
+        row_count = 0
         for row in ws.iter_rows(values_only=True):
             vals = []
             for cell in row:
@@ -97,6 +100,10 @@ def _extract_xlsx(content: bytes) -> str:
             # Skip completely empty rows
             if any(v.strip() for v in vals):
                 parts.append("\t".join(vals))
+                row_count += 1
+                if row_count >= MAX_ROWS_PER_SHEET_PREVIEW:
+                    parts.append("[...] (preview truncated)")
+                    break
         parts.append("")  # blank line between sheets
     return "\n".join(parts).strip()
 
