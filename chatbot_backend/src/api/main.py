@@ -781,11 +781,18 @@ def upload_chat_context(
                     if any_truncated:
                         # Add a user-facing note into the preview so large files clearly show up with a warning.
                         preview = (preview + f" [schema built from first {EXCEL_SCHEMA_MAX_SAMPLE_ROWS} rows per sheet; truncated for speed]").strip()
-                    # Store regardless of size (always include schema)
+                    # Store regardless of size (always include schema). Merge with existing session Excel store if present.
+                    existing = EXCEL_STORE.get(session_id, {})
+                    merged_sheets = dict(existing.get("sheets", {}) or {})
+                    # Later uploads with same sheet name overwrite previous; different files append
+                    merged_sheets.update(sheets or {})
+                    # Choose a default df: prefer a non-empty chosen_df; otherwise keep existing df if available
+                    final_df = chosen_df or existing.get("df")
+                    # Keep previous schema notes and rebuild later on query if needed
                     EXCEL_STORE[session_id] = {
-                        "df": chosen_df,
-                        "sheets": sheets,
-                        "schema": schema,
+                        "df": final_df,
+                        "sheets": merged_sheets,
+                        "schema": schema or existing.get("schema"),
                     }
                 except MemoryError as me:
                     preview = (preview + f" [Excel parsing skipped due to memory limits; try reducing file size or sheets. Error: {me}]").strip()
@@ -921,13 +928,22 @@ def excel_query(request: ExcelQueryRequest):
                 df = next(iter(sheets.values()))
 
     if df is None:
+        # Debug aid for large uploads: log available sheets to server console
+        try:
+            available = list((sheets or {}).keys())
+            print(f"[excel_query] No DataFrame resolved for session={session_id}. Available sheets: {available}")
+        except Exception:
+            pass
         raise HTTPException(status_code=400, detail="No usable DataFrame found in uploaded Excel.")
 
     schema = store.get("schema")
-    if not schema:
-        # Rebuild schema just in case
+    if not schema or not isinstance(schema, dict) or not schema.get("sheets"):
+        # Rebuild schema just in case or if empty
         from .excel_utils import build_schema_for_gemini as _build
-        schema = _build(sheets if sheets else {"Sheet1": df})
+        # Prefer all sheets if available; otherwise build from the selected df
+        build_source = sheets if sheets else {"Sheet1": df}
+        schema = _build(build_source)
+        # Persist back to session store
         store["schema"] = schema
 
     # Compose strict prompt
@@ -947,12 +963,15 @@ def excel_query(request: ExcelQueryRequest):
         response = model.generate_content([{"role": "user", "parts": [pandas_prompt]}])
         expression = (response.text or "").strip()
         # Clean code fences or stray formatting
-        if expression.startswith("```"):
-            # remove code fences
-            expression = expression.strip("`").strip()
-            # If model included "python", drop it
-            if expression.startswith("python"):
-                expression = expression[len("python"):].strip()
+        if "```" in expression:
+            # remove common code fence patterns
+            expression = expression.replace("```python", "").replace("```py", "").replace("```", "").strip()
+        # If model included "python" prefix, drop it
+        if expression.lower().startswith("python"):
+            expression = expression[6:].strip()
+        # Remove trailing semicolons which can break eval in our constraints
+        if expression.endswith(";"):
+            expression = expression[:-1].strip()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get pandas expression from Gemini: {e}")
 

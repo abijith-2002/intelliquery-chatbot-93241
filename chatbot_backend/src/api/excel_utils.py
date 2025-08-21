@@ -168,6 +168,15 @@ def build_schema_for_gemini(
         "notes": []
     }
 
+    # If no sheets provided, return a minimal schema to avoid empty context to Gemini
+    if not sheets or len(sheets) == 0:
+        return {
+            "sheets": [
+                {"name": "Sheet1", "rows": 0, "cols": 0, "columns": []}
+            ],
+            "notes": ["No sheets found in the uploaded Excel; using empty schema."]
+        }
+
     for sheet_name, df in sheets.items():
         original_rows = int(getattr(df, "shape", (0, 0))[0]) if isinstance(df, pd.DataFrame) else 0
         sampled = False
@@ -257,7 +266,16 @@ def get_gemini_pandas_prompt(user_query: str, schema: Dict[str, Any]) -> str:
     Returns:
         str: A single text prompt to send to Gemini.
     """
-    schema_preview = json.dumps(schema, ensure_ascii=False)[:12000]
+    # Make sure schema is serializable and trimmed to avoid token overflow
+    full_schema_json = json.dumps(schema, ensure_ascii=False)
+    MAX_SCHEMA_CHARS = 12000
+    schema_truncated = False
+    if len(full_schema_json) > MAX_SCHEMA_CHARS:
+        schema_preview = full_schema_json[:MAX_SCHEMA_CHARS]
+        schema_truncated = True
+    else:
+        schema_preview = full_schema_json
+
     instruction = (
         "You are given a DataFrame 'df' that represents the user's Excel sheet of interest.\n"
         "Your task: Return ONLY a single valid Python pandas expression that computes the answer to the user's request.\n"
@@ -275,6 +293,7 @@ def get_gemini_pandas_prompt(user_query: str, schema: Dict[str, Any]) -> str:
         "\n"
         "Excel schema (for reference only, not for copying values):\n"
         f"{schema_preview}\n"
+        f"{'(schema preview truncated for length)\\n' if schema_truncated else ''}"
         "\n"
         "Return ONLY the expression, nothing else."
     )
