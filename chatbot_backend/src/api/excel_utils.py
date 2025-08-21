@@ -133,6 +133,7 @@ def _describe_non_numeric_series(s: pd.Series) -> Dict[str, Any]:
 def build_schema_for_gemini(
     sheets: Dict[str, pd.DataFrame],
     max_examples_per_col: int = 3,
+    max_rows_per_sheet: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     PUBLIC_INTERFACE
@@ -153,6 +154,9 @@ def build_schema_for_gemini(
     }
 
     for sheet_name, df in sheets.items():
+        # Optionally sample to limit heavy describe() on massive sheets
+        if max_rows_per_sheet is not None and isinstance(df, pd.DataFrame) and df.shape[0] > max_rows_per_sheet:
+            df = df.head(max_rows_per_sheet)
         sheet_info: Dict[str, Any] = {
             "name": sheet_name,
             "rows": int(df.shape[0]),

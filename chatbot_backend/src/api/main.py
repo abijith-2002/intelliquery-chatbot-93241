@@ -18,6 +18,11 @@ import google.generativeai as genai
 from dotenv import load_dotenv
 from langchain.memory import ConversationBufferMemory
 
+# New: stdlib imports for timeouts/limits and background tasks
+import os
+import asyncio
+from fastapi import BackgroundTasks
+
 # Import authentication/database helpers
 from .auth_utils import (
     create_tables,
@@ -33,6 +38,20 @@ from .config_utils import get_gemini_api_key
 
 # Load environment variables
 load_dotenv()
+
+# ---- Upload/processing configuration (tunable via environment) ----
+# Max upload size for a single file in bytes (default 50 MB). Reverse proxy may also enforce limits.
+MAX_UPLOAD_BYTES = int(os.getenv("CHATBOT_MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
+# Max cumulative size across all files in one request (default 100 MB).
+MAX_TOTAL_UPLOAD_BYTES = int(os.getenv("CHATBOT_MAX_TOTAL_UPLOAD_BYTES", str(100 * 1024 * 1024)))
+# Max time (seconds) allowed to process an upload request before early return (default 25s).
+UPLOAD_PROCESS_TIMEOUT_SECS = int(os.getenv("CHATBOT_UPLOAD_PROCESS_TIMEOUT_SECS", "25"))
+# Whether to build embeddings on the upload endpoint (may be heavy); default True. Disable if causing timeouts.
+BUILD_EMBEDDINGS_ON_UPLOAD = os.getenv("CHATBOT_BUILD_EMBEDDINGS_ON_UPLOAD", "true").lower() in ("1", "true", "yes")
+# Whether to parse full Excel to DataFrames on upload; if False, defer to separate endpoint to avoid long blocking.
+PARSE_EXCEL_ON_UPLOAD = os.getenv("CHATBOT_PARSE_EXCEL_ON_UPLOAD", "true").lower() in ("1", "true", "yes")
+# For Excel schema, cap rows sampled per sheet to reduce heavy stats on very large files. Default 10_000 rows.
+EXCEL_SCHEMA_MAX_SAMPLE_ROWS = int(os.getenv("CHATBOT_EXCEL_SCHEMA_MAX_SAMPLE_ROWS", "10000"))
 
 # Memory store for chat contexts (keyed by session_id).
 CONVERSATION_MEMORY: Dict[str, ConversationBufferMemory] = {}
@@ -581,6 +600,7 @@ def chat_wsinfo():
 def upload_chat_context(
     session_id: str = Form(..., description="Session ID to associate uploaded context with"),
     files: List[UploadFile] = File(..., description="One or more files (.docx, .xlsx, .pdf, .txt)"),
+    background_tasks: BackgroundTasks = None,
 ):
     """
     PUBLIC_INTERFACE
@@ -610,12 +630,56 @@ def upload_chat_context(
     results: List[UploadedFileResult] = []
     combined_text_parts: List[str] = []
     total_chars = 0
+    total_bytes_accum = 0
+
+    async def _read_file_enforcing_limits(upload: UploadFile) -> bytes:
+        nonlocal total_bytes_accum
+        # Read stream in chunks to avoid large memory spikes and enforce size limits
+        chunk_size = 1024 * 1024  # 1 MB
+        collected: List[bytes] = []
+        read_so_far = 0
+        while True:
+            chunk = await upload.read(chunk_size)
+            if not chunk:
+                break
+            read_so_far += len(chunk)
+            total_bytes_accum += len(chunk)
+            if read_so_far > MAX_UPLOAD_BYTES:
+                raise HTTPException(status_code=400, detail=f"File {upload.filename} exceeds max size limit.")
+            if total_bytes_accum > MAX_TOTAL_UPLOAD_BYTES:
+                raise HTTPException(status_code=400, detail="Total upload size exceeds max limit.")
+            collected.append(chunk)
+        return b"".join(collected)
+
+    start = asyncio.get_event_loop().time()
 
     for f in files:
         filename = f.filename or "unnamed"
-        # Read file bytes
+        # Enforce wall time for the whole request
+        now = asyncio.get_event_loop().time()
+        if now - start > UPLOAD_PROCESS_TIMEOUT_SECS:
+            # Return early with partial results to avoid upstream 504
+            partial_msg = "Partial processing due to time limit; larger files will be processed in background (if configured)."
+            return UploadContextResponse(
+                session_id=session_id,
+                files_processed=results,
+                total_chars=total_chars,
+                message=partial_msg,
+            )
+
+        # Read file bytes (async, chunked)
         try:
-            data = f.file.read()
+            data = asyncio.get_event_loop().run_until_complete(_read_file_enforcing_limits(f)) if hasattr(f, "read") and asyncio.get_event_loop().is_running() else asyncio.run(_read_file_enforcing_limits(f))  # type: ignore
+        except RuntimeError:
+            # If event loop is already running within FastAPI (uvicorn), use create_task style
+            data = asyncio.get_event_loop().run_until_complete(_read_file_enforcing_limits(f))  # type: ignore
+        except HTTPException as he:
+            results.append(
+                UploadedFileResult(
+                    filename=filename, size=0, content_chars=0, preview="", error=he.detail if isinstance(he.detail, str) else "Upload size limit exceeded"
+                )
+            )
+            continue
         except Exception as e:
             results.append(
                 UploadedFileResult(
@@ -625,33 +689,41 @@ def upload_chat_context(
             continue
 
         size = len(data or b"")
-        # Extract
+        # Extract (fast path preview)
         text, err = extract_text_from_bytes(filename, data or b"")
         preview = summarize_text_preview(text, max_chars=500) if text else ""
         chars = len(text)
 
-        # If it's an xlsx, also parse to DataFrame and generate schema
-        if filename.lower().endswith(".xlsx") and not err:
+        # Excel parsing: optionally defer heavy DataFrame extraction
+        if filename.lower().endswith(".xlsx") and not err and PARSE_EXCEL_ON_UPLOAD:
             try:
+                # Build a reduced-size schema by sampling, to avoid large memory/time usage
                 sheets = parse_xlsx_to_dataframe(data or b"")
+                # Downsample large sheets before schema to reduce heavy stats
+                sampled_sheets = {}
+                for sname, sdf in sheets.items():
+                    if sdf is None:
+                        sampled_sheets[sname] = sdf
+                    else:
+                        if EXCEL_SCHEMA_MAX_SAMPLE_ROWS > 0 and sdf.shape[0] > EXCEL_SCHEMA_MAX_SAMPLE_ROWS:
+                            sampled_sheets[sname] = sdf.head(EXCEL_SCHEMA_MAX_SAMPLE_ROWS)
+                        else:
+                            sampled_sheets[sname] = sdf
                 # Choose default df: first non-empty sheet; otherwise first sheet
                 chosen_df = None
                 for sname, sdf in sheets.items():
                     if sdf is not None and not sdf.empty:
                         chosen_df = sdf
                         break
-                if chosen_df is None:
-                    # fall back to first available sheet
-                    chosen_df = next(iter(sheets.values())) if sheets else None
-
-                schema = build_schema_for_gemini(sheets)
+                if chosen_df is None and sheets:
+                    chosen_df = next(iter(sheets.values()))
+                schema = build_schema_for_gemini(sampled_sheets, max_examples_per_col=3, max_rows_per_sheet=EXCEL_SCHEMA_MAX_SAMPLE_ROWS)
                 EXCEL_STORE[session_id] = {
                     "df": chosen_df,
                     "sheets": sheets,
                     "schema": schema,
                 }
             except Exception as e:
-                # Do not fail overall upload - just note the error in preview tail for visibility
                 preview = (preview + f" [Excel parsing warning: {e}]").strip()
 
         # Append to combined only if successful and non-empty
@@ -659,12 +731,22 @@ def upload_chat_context(
             combined_text_parts.append(f"[{filename}]\n{text}\n")
             total_chars += chars
 
-            # Build semantic index: chunk + embed + store
-            try:
-                _index_text_for_session(session_id, filename, text)
-            except Exception:
-                # Do not fail upload on indexing failure; retrieval will fall back gracefully.
-                pass
+            # Build semantic index may be expensive; optionally defer to background
+            def _index_job():
+                try:
+                    _index_text_for_session(session_id, filename, text)
+                except Exception:
+                    pass
+
+            if BUILD_EMBEDDINGS_ON_UPLOAD:
+                # If background_tasks provided, schedule to avoid blocking request
+                if background_tasks is not None:
+                    background_tasks.add_task(_index_job)
+                else:
+                    try:
+                        _index_job()
+                    except Exception:
+                        pass
 
         results.append(
             UploadedFileResult(
