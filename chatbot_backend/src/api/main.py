@@ -557,6 +557,50 @@ def chat_wsinfo():
     return {"detail": "Current version supports REST API chat only. Real-time WebSocket may be added in future versions."}
 
 
+# PUBLIC_INTERFACE
+@app.get(
+    "/chat/excel/columns",
+    tags=["Chat"],
+    summary="List indexed Excel columns for a session",
+    description="Return a flattened list of (filename, sheet, column) entries that were indexed for the given session's Excel uploads."
+)
+def list_excel_columns(session_id: str):
+    """
+    PUBLIC_INTERFACE
+    Retrieve the list of indexed Excel columns for the provided session.
+
+    Args:
+        session_id (str): The chat session identifier.
+
+    Returns:
+        dict: {
+            "session_id": str,
+            "columns": [
+                {"filename": str, "sheet": str, "column": str},
+                ...
+            ]
+        }
+    """
+    if not session_id or not isinstance(session_id, str):
+        raise HTTPException(status_code=400, detail="session_id must be a non-empty string.")
+
+    # Lazy import to avoid circulars at module import time
+    from .excel_index import EXCEL_COLUMN_INDEX
+
+    # If no index, return empty
+    if session_id not in EXCEL_COLUMN_INDEX:
+        return {"session_id": session_id, "columns": []}
+
+    # Enumerate all columns quickly using a wildcard name query (iterate internally)
+    out = []
+    files_map = EXCEL_COLUMN_INDEX[session_id].get("files", {})
+    for fname, sheets in files_map.items():
+        for sname, meta in sheets.items():
+            for col in meta.get("columns", []):
+                out.append({"filename": fname, "sheet": sname, "column": col})
+    return {"session_id": session_id, "columns": out}
+
+
 # --- FILE UPLOAD ENDPOINTS FOR CONTEXT ---
 
 # PUBLIC_INTERFACE
@@ -644,12 +688,31 @@ def upload_chat_context(
                 os.makedirs(parquet_dir, exist_ok=True)
 
                 preview_chunks = []
+                from .excel_index import upsert_excel_column_index  # integrate column index
+
                 for sheet_name, df in all_sheets.items():
                     # Collect metadata
                     cols = list(df.columns)
                     dtypes = {str(c): str(t) for c, t in zip(cols, df.dtypes.values)}
                     rows = int(df.shape[0])
                     sample = df.head(5).to_dict(orient="records")
+
+                    # Compute small per-column sample values for index preview
+                    column_samples = {}
+                    try:
+                        for c in cols:
+                            # take up to 5 non-null unique sample values
+                            series = df[c].dropna().unique().tolist()
+                            # convert to native python types where possible
+                            preview_vals = []
+                            for v in series[:5]:
+                                try:
+                                    preview_vals.append(v.item() if hasattr(v, "item") else v)
+                                except Exception:
+                                    preview_vals.append(str(v))
+                            column_samples[str(c)] = preview_vals
+                    except Exception:
+                        column_samples = {}
 
                     # Persist Parquet for larger dataframes to avoid memory pressure
                     parquet_path = None
@@ -668,6 +731,18 @@ def upload_chat_context(
                         "sample": sample,
                         "parquet_path": parquet_path,
                     }
+
+                    # Update fast lookup (no embeddings by default; can be toggled later)
+                    upsert_excel_column_index(
+                        session_id=session_id,
+                        filename=filename,
+                        sheet_name=str(sheet_name),
+                        columns=[str(c) for c in cols],
+                        dtypes={str(k): str(v) for k, v in dtypes.items()},
+                        sample_rows=sample,
+                        column_samples=column_samples,
+                        build_embeddings=False,  # set True in future to precompute per-column embeddings
+                    )
 
                     # Build compact preview per sheet
                     preview_chunks.append(
