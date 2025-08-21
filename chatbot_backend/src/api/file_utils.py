@@ -5,10 +5,10 @@ from typing import List, Tuple, Optional
 # - TXT: native decode
 # - PDF: pdfminer.six
 # - DOCX: python-docx
-# - XLSX: openpyxl
+# - XLSX: pandas.read_excel (refactored; no cell flattening)
 from pdfminer.high_level import extract_text as pdf_extract_text
 from docx import Document as DocxDocument
-from openpyxl import load_workbook
+import pandas as pd
 
 
 # PUBLIC_INTERFACE
@@ -21,7 +21,7 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
         - .txt  : UTF-8 decode with errors ignored
         - .pdf  : pdfminer.six text extraction
         - .docx : python-docx extraction (paragraphs and table cells)
-        - .xlsx : openpyxl extraction (sheet name and cells, tab-separated rows)
+        - .xlsx : preview text constructed from DataFrame metadata (no cell flattening)
 
     Args:
         filename (str): Original filename (used for type detection).
@@ -29,7 +29,7 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
 
     Returns:
         Tuple[str, Optional[str]]: (text, error)
-            - text: extracted text content (empty if error)
+            - text: extracted text content or a metadata preview (empty if error)
             - error: error message if extraction failed, otherwise None
     """
     name_lower = (filename or "").lower()
@@ -42,7 +42,10 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
         if name_lower.endswith(".docx"):
             return _extract_docx(content), None
         if name_lower.endswith(".xlsx"):
-            return _extract_xlsx(content), None
+            # For xlsx, do not flatten the entire sheet contents anymore.
+            # Instead, return a compact preview constructed from DataFrame metadata.
+            preview, err = _xlsx_preview_from_metadata(content)
+            return (preview or ""), err
         return "", f"Unsupported file type for '{filename}'. Allowed: .txt, .pdf, .docx, .xlsx"
     except Exception as e:
         return "", f"Failed to extract '{filename}': {e}"
@@ -80,25 +83,32 @@ def _extract_docx(content: bytes) -> str:
     return "\n".join(parts).strip()
 
 
-def _extract_xlsx(content: bytes) -> str:
-    """Extract text from XLSX using openpyxl (sheet by sheet, TSV rows)."""
-    bio = io.BytesIO(content)
-    wb = load_workbook(bio, data_only=True, read_only=True)
-    parts: List[str] = []
-    for ws in wb.worksheets:
-        parts.append(f"[Sheet: {ws.title}]")
-        for row in ws.iter_rows(values_only=True):
-            vals = []
-            for cell in row:
-                if cell is None:
-                    vals.append("")
-                else:
-                    vals.append(str(cell))
-            # Skip completely empty rows
-            if any(v.strip() for v in vals):
-                parts.append("\t".join(vals))
-        parts.append("")  # blank line between sheets
-    return "\n".join(parts).strip()
+def _xlsx_preview_from_metadata(content: bytes) -> Tuple[str, Optional[str]]:
+    """
+    Build a lightweight human-readable preview based on DataFrame metadata
+    using pandas.read_excel. Returns a string suitable for UI previews.
+
+    We intentionally avoid returning flattened cell values to prevent large-context
+    ingestion; actual DataFrame storage is handled by the upload endpoint logic.
+
+    Returns:
+        Tuple[str, Optional[str]]: (preview_text, error)
+    """
+    try:
+        bio = io.BytesIO(content)
+        # Attempt reading first sheet only for a concise preview
+        df = pd.read_excel(bio, sheet_name=0, nrows=5)
+        cols = list(df.columns)
+        dtypes = [str(t) for t in df.dtypes.values]
+        sample_rows = df.head(3).to_dict(orient="records")
+        preview_lines = [
+            f"Columns: {cols}",
+            f"Dtypes: {dtypes}",
+            f"Sample (first 3 rows): {sample_rows}",
+        ]
+        return " | ".join(preview_lines), None
+    except Exception as e:
+        return "", f"Failed to generate xlsx preview: {e}"
 
 
 # PUBLIC_INTERFACE
@@ -108,7 +118,7 @@ def summarize_text_preview(text: str, max_chars: int = 500) -> str:
     Produce a compact preview of extracted content for UI confirmation.
 
     Args:
-        text (str): Full extracted text.
+        text (str): Full extracted text or a metadata preview string.
         max_chars (int): Maximum number of characters to include.
 
     Returns:

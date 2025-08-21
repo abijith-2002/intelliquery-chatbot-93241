@@ -50,6 +50,24 @@ CONTEXT_STORE: Dict[str, Dict[str, Any]] = {}
 #   }
 RAG_INDEX_STORE: Dict[str, Dict[str, Any]] = {}
 
+# Per-session store for uploaded Excel DataFrames and metadata.
+# Structure:
+#   EXCEL_STORE[session_id] = [
+#       {
+#           "filename": str,
+#           "sheets": {
+#               sheet_name: {
+#                   "columns": List[str],
+#                   "dtypes": Dict[str, str],
+#                   "rows": int,
+#                   "sample": List[Dict[str, Any]],   # head(5)
+#                   "parquet_path": Optional[str]     # if persisted as parquet
+#               }, ...
+#           }
+#       }, ...
+#   ]
+EXCEL_STORE: Dict[str, List[Dict[str, Any]]] = {}
+
 app = FastAPI(
     title="IntelliQuery Chatbot API",
     version="1.0.0",
@@ -300,6 +318,9 @@ def _vector_search(session_id: str, query: str, top_k: int = 3) -> List[str]:
     """
     Perform semantic vector search for the top_k relevant chunks using cosine similarity
     against Gemini embeddings. If embeddings are not available, falls back to lexical similarity.
+
+    Note: Excel files are not indexed into the RAG store by design. Excel content is handled
+    through DataFrames and metadata for specialized Excel question answering.
 
     Returns:
         List[str]: The text of the top-k retrieved chunks.
@@ -564,10 +585,9 @@ def upload_chat_context(
     Upload and process files to add user-provided context for a given chat session.
 
     Process:
-        - Extract readable text.
-        - Split into overlapping chunks.
-        - Embed each chunk using Gemini embeddings (if API key available).
-        - Store chunks and embeddings in a per-session in-memory index for retrieval.
+        - For .txt/.pdf/.docx: extract readable text, chunk, embed, and index for retrieval.
+        - For .xlsx: parse with pandas.read_excel, extract metadata (columns, dtypes, sample), and
+          store per-session DataFrame metadata (optionally persisting Parquet), WITHOUT embedding/indexing raw cells.
 
     Args:
         session_id (str): The chat session ID.
@@ -577,6 +597,9 @@ def upload_chat_context(
         UploadContextResponse: Processing results and acknowledgment.
     """
     from .file_utils import extract_text_from_bytes, summarize_text_preview
+    import io
+    import os
+    import pandas as pd
 
     if not session_id or not isinstance(session_id, str):
         raise HTTPException(status_code=400, detail="session_id must be provided as a non-empty string.")
@@ -589,6 +612,7 @@ def upload_chat_context(
 
     for f in files:
         filename = f.filename or "unnamed"
+        lower_name = filename.lower()
         # Read file bytes
         try:
             data = f.file.read()
@@ -601,21 +625,92 @@ def upload_chat_context(
             continue
 
         size = len(data or b"")
-        # Extract
+
+        if lower_name.endswith(".xlsx"):
+            # New behavior for Excel: parse with pandas, extract metadata, store, and create a human-readable preview
+            try:
+                bio = io.BytesIO(data or b"")
+                # Read all sheets into dict of DataFrames
+                all_sheets = pd.read_excel(bio, sheet_name=None)
+                if session_id not in EXCEL_STORE:
+                    EXCEL_STORE[session_id] = []
+                excel_entry = {
+                    "filename": filename,
+                    "sheets": {}
+                }
+
+                # Optional Parquet persistence per sheet (in-memory option retained by omitting path)
+                parquet_dir = os.path.join("tmp_parquet", session_id)
+                os.makedirs(parquet_dir, exist_ok=True)
+
+                preview_chunks = []
+                for sheet_name, df in all_sheets.items():
+                    # Collect metadata
+                    cols = list(df.columns)
+                    dtypes = {str(c): str(t) for c, t in zip(cols, df.dtypes.values)}
+                    rows = int(df.shape[0])
+                    sample = df.head(5).to_dict(orient="records")
+
+                    # Persist Parquet for larger dataframes to avoid memory pressure
+                    parquet_path = None
+                    try:
+                        if rows > 5000:
+                            safe_sheet = str(sheet_name).replace("/", "_")
+                            parquet_path = os.path.join(parquet_dir, f"{os.path.basename(filename)}__{safe_sheet}.parquet")
+                            df.to_parquet(parquet_path, index=False)
+                    except Exception:
+                        parquet_path = None  # If pyarrow missing or write fails, ignore.
+
+                    excel_entry["sheets"][str(sheet_name)] = {
+                        "columns": cols,
+                        "dtypes": dtypes,
+                        "rows": rows,
+                        "sample": sample,
+                        "parquet_path": parquet_path,
+                    }
+
+                    # Build compact preview per sheet
+                    preview_chunks.append(
+                        f"[Sheet: {sheet_name}] Columns: {cols} | Rows: {rows} | Sample(2): {df.head(2).to_dict(orient='records')}"
+                    )
+
+                EXCEL_STORE[session_id].append(excel_entry)
+
+                # For Excel, we do not index or embed; preview is metadata only
+                excel_preview_text = " || ".join(preview_chunks)
+                results.append(
+                    UploadedFileResult(
+                        filename=filename,
+                        size=size,
+                        content_chars=len(excel_preview_text),
+                        preview=summarize_text_preview(excel_preview_text, max_chars=500),
+                        error=None,
+                    )
+                )
+                # We do NOT add to combined_text_parts or index for Excel
+            except Exception as e:
+                results.append(
+                    UploadedFileResult(
+                        filename=filename,
+                        size=size,
+                        content_chars=0,
+                        preview="",
+                        error=f"Failed to parse Excel: {e}",
+                    )
+                )
+            continue  # proceed to next file
+
+        # Non-Excel handling stays the same: extract text and index
         text, err = extract_text_from_bytes(filename, data or b"")
         preview = summarize_text_preview(text, max_chars=500) if text else ""
         chars = len(text)
 
-        # Append to combined only if successful and non-empty
         if text and not err:
             combined_text_parts.append(f"[{filename}]\n{text}\n")
             total_chars += chars
-
-            # Build semantic index: chunk + embed + store
             try:
                 _index_text_for_session(session_id, filename, text)
             except Exception:
-                # Do not fail upload on indexing failure; retrieval will fall back gracefully.
                 pass
 
         results.append(
@@ -628,25 +723,27 @@ def upload_chat_context(
             )
         )
 
-    # If at least one file produced content, update the legacy session context store (for optional previews)
+    # Update legacy context preview only for non-Excel extracted text
     if total_chars > 0:
         combined_text = "\n".join(combined_text_parts).strip()
         prev_ctx = CONTEXT_STORE.get(session_id, {})
         prev_combined = prev_ctx.get("combined", "")
         prev_files = prev_ctx.get("files", [])
 
-        # Merge with previous context if any
         merged_combined = (prev_combined + "\n\n" + combined_text).strip() if prev_combined else combined_text
         CONTEXT_STORE[session_id] = {
             "files": prev_files + [r.model_dump() for r in results],
             "combined": merged_combined,
         }
+    else:
+        # Still record files results even if no non-Excel text; keep files list
+        prev_ctx = CONTEXT_STORE.get(session_id, {"files": [], "combined": ""})
+        CONTEXT_STORE[session_id] = {
+            "files": prev_ctx.get("files", []) + [r.model_dump() for r in results],
+            "combined": prev_ctx.get("combined", ""),
+        }
 
-    message = (
-        "Processed files successfully. Session context updated and indexed."
-        if total_chars > 0
-        else "Processed files, but no readable content was extracted."
-    )
+    message = "Processed files successfully. Session context updated and indexed for non-Excel files; Excel stored with metadata only."
 
     return UploadContextResponse(
         session_id=session_id,
