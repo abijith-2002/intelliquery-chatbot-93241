@@ -579,6 +579,16 @@ def chat_wsinfo():
 
 # --- FILE UPLOAD ENDPOINTS FOR CONTEXT ---
 
+def _log_upload_issue(filename: str, message: str) -> None:
+    """
+    Lightweight logger for upload issues. Keeps logs uniform without external deps.
+    """
+    try:
+        print(f"[upload] file={filename} :: {message}")
+    except Exception:
+        pass
+
+
 # PUBLIC_INTERFACE
 @app.post(
     "/chat/upload-context",
@@ -594,18 +604,9 @@ def chat_wsinfo():
     responses={
         400: {"description": "Validation error or no files provided"},
         415: {"description": "Unsupported media type"},
+        422: {"description": "Validation error (ensure multipart/form-data with 'session_id' and 'files' fields)"},
     },
 )
-def _log_upload_issue(filename: str, message: str) -> None:
-    """
-    Lightweight logger for upload issues. Keeps logs uniform without external deps.
-    """
-    try:
-        print(f"[upload] file={filename} :: {message}")
-    except Exception:
-        pass
-
-
 def upload_chat_context(
     session_id: str = Form(..., description="Session ID to associate uploaded context with"),
     files: List[UploadFile] = File(..., description="One or more files (.docx, .xlsx, .pdf, .txt)"),
@@ -615,18 +616,25 @@ def upload_chat_context(
     PUBLIC_INTERFACE
     Upload and process files to add user-provided context for a given chat session.
 
+    Request:
+        Content-Type: multipart/form-data
+        Fields:
+            - session_id (form field): string, required
+            - files (one or more file fields): allowed types [.txt, .pdf, .docx, .xlsx]
+
     Process:
         - Extract readable text.
         - Split into overlapping chunks.
         - Embed each chunk using Gemini embeddings (if API key available).
         - Store chunks and embeddings in a per-session in-memory index for retrieval.
 
-    Args:
-        session_id (str): The chat session ID.
-        files (List[UploadFile]): Uploaded files (multipart/form-data).
-
     Returns:
         UploadContextResponse: Processing results and acknowledgment.
+
+    Error responses:
+        400: Missing session_id or files; size limit exceeded; or other validation error.
+        415: Unsupported file media type.
+        422: Likely incorrect request format. Ensure multipart/form-data is used with 'session_id' and 'files'.
     """
     from .file_utils import extract_text_from_bytes, summarize_text_preview
     from .excel_utils import parse_xlsx_to_dataframe, build_schema_for_gemini

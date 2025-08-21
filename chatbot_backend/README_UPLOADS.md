@@ -14,3 +14,8 @@ Operational notes:
 - The upload handler now reads files in 1 MB chunks asynchronously and enforces per-file and total limits.
 - If processing exceeds the request wall time, it returns early with partial results to avoid 504. Embedding/index building can be offloaded to background tasks.
 - Excel schema extraction performs sampling to limit heavy statistics on very large sheets. You can set CHATBOT_PARSE_EXCEL_ON_UPLOAD=false to defer full Excel parsing to later endpoints if needed.
+
+Common pitfalls:
+- A 422 Unprocessable Entity typically indicates the request was not sent as multipart/form-data. Ensure you send:
+  - form field 'session_id' (string)
+  - file field(s) 'files' (one or more). Supported: .txt, .pdf, .docx, .xlsx.
