@@ -30,8 +30,6 @@ from .auth_utils import (
 from .chat_title import router as chat_title_router
 # Config utilities
 from .config_utils import get_gemini_api_key
-# Import new Excel processing utilities
-from .file_utils import process_excel_for_session
 
 # Load environment variables
 load_dotenv()
@@ -56,6 +54,7 @@ RAG_INDEX_STORE: Dict[str, Dict[str, Any]] = {}
 # Structure: { session_id: [metadata_dict1, metadata_dict2, ...] }
 EXCEL_METADATA_STORE: Dict[str, List[Dict[str, Any]]] = {}
 
+
 # PUBLIC_INTERFACE
 def _load_session_metadata_from_disk(session_id: str) -> List[Dict[str, Any]]:
     """
@@ -76,6 +75,7 @@ def _load_session_metadata_from_disk(session_id: str) -> List[Dict[str, Any]]:
         return metas
     except Exception:
         return []
+
 
 app = FastAPI(
     title="IntelliQuery Chatbot API",
@@ -222,7 +222,6 @@ def _clean_gemini_output(text: str) -> str:
 
 
 # --- CONTEXT + RAG UTILITIES ---
-
 def _tokenize(s: str) -> List[str]:
     import re
     return [t for t in re.findall(r"[A-Za-z0-9]+", (s or "").lower()) if t]
@@ -657,7 +656,7 @@ def upload_chat_context(
     Returns:
         UploadContextResponse: Processing results and acknowledgment.
     """
-    from .file_utils import extract_text_from_bytes, summarize_text_preview
+    from .file_utils import extract_text_from_bytes, summarize_text_preview, process_excel_for_session
 
     if not session_id or not isinstance(session_id, str):
         raise HTTPException(status_code=400, detail="session_id must be provided as a non-empty string.")
@@ -780,6 +779,83 @@ def upload_chat_context(
     )
 
 
+# Utilities for SQL generation and DuckDB execution over Parquet
+
+def _build_sql_prompt_from_metadata(question: str, excel_metadata_list: List[Dict[str, Any]]) -> str:
+    """
+    Build an instruction prompt for the LLM to write a DuckDB SQL query over Parquet files.
+
+    We provide:
+      - For each sheet: the available columns (clean names), inferred types, and a few sample values.
+      - The parquet file name per sheet (to be used directly as a DuckDB view name).
+    """
+    lines = []
+    lines.append("You are a data analyst who writes precise DuckDB SQL queries to answer questions.")
+    lines.append("Rules:")
+    lines.append("- Only use the provided Parquet-backed tables and their columns.")
+    lines.append("- Prefer SELECT with explicit column names. Avoid SELECT * unless necessary.")
+    lines.append("- If aggregation is requested, use GROUP BY with clear aliases.")
+    lines.append("- Use COUNT(DISTINCT col) for unique counts.")
+    lines.append("- Dates may be strings; cast as needed using TRY_CAST or STRPTIME.")
+    lines.append("- Return only the SQL query. Do not include explanations or Markdown.")
+    lines.append("")
+    lines.append("Available tables (views) and schemas:")
+    for m in excel_metadata_list:
+        file_display = m.get("filename", "unknown.xlsx")
+        for sheet_name, sheet_info in (m.get("sheets") or {}).items():
+            parquet_fn = sheet_info.get("parquet_filename") or ""
+            lines.append(f"- Table: {parquet_fn}  -- from {file_display} / sheet {sheet_name}")
+            for col_name, col_meta in (sheet_info.get("columns") or {}).items():
+                col_type = col_meta.get("dtype", "unknown")
+                samples = col_meta.get("sample_values") or []
+                sample_str = ", ".join(samples[:3]) if samples else ""
+                lines.append(f"    {col_name} ({col_type}) {f'- e.g., {sample_str}' if sample_str else ''}")
+    lines.append("")
+    lines.append(f"Question: {question}")
+    lines.append("Now produce a single DuckDB SQL query that answers the question.")
+    return "\n".join(lines)
+
+
+def _execute_duckdb_sql_over_session_parquet(session_id: str, sql: str, excel_metadata_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Execute DuckDB SQL over session Parquet files in a safe, isolated way.
+
+    We register each Parquet file's path as a view named by its parquet file name,
+    so the generated SQL can reference those names directly.
+    """
+    import duckdb
+    from pathlib import Path as _Path
+
+    # Build a fresh in-memory DuckDB connection per request for isolation
+    con = duckdb.connect(database=':memory:', read_only=False)
+
+    # Register views for each parquet file for this session
+    session_dir = _Path("data/sessions") / session_id
+    for m in excel_metadata_list:
+        for _, sheet_info in (m.get("sheets") or {}).items():
+            parquet_filename = sheet_info.get("parquet_filename")
+            if not parquet_filename:
+                continue
+            full_path = str((session_dir / parquet_filename).resolve())
+            # Create a view with the parquet filename
+            con.execute(f"CREATE VIEW \"{parquet_filename}\" AS SELECT * FROM read_parquet('{full_path}');")
+
+    # Execute provided SQL
+    try:
+        result_df = con.execute(sql).fetchdf()
+        # Convert to JSON-friendly dict
+        return {
+            "columns": list(result_df.columns),
+            "rows": result_df.to_dict(orient="records"),
+            "row_count": int(len(result_df))
+        }
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
 # PUBLIC_INTERFACE
 @app.post(
     "/chat/ask-excel-question",
@@ -801,12 +877,12 @@ def ask_excel_question(request: ExcelQuestionRequest):
     PUBLIC_INTERFACE
     Handle questions specifically about Excel data using structured metadata and Parquet files.
 
-    This endpoint provides more precise answers for Excel-specific queries by leveraging
-    the structured metadata extracted during upload and stored Parquet data.
-
-    Deterministic handling:
-    - If the question asks for the number of distinct customers (or customer names), compute from metadata instead of relying on LLM.
-    - Also handle total row count queries deterministically.
+    Flow:
+      1) Build SQL prompt from available columns/types/sample values and table names (parquet filenames).
+      2) Ask Gemini to produce DuckDB SQL.
+      3) Execute SQL in an isolated, in-memory DuckDB with views mapped to the session's Parquet files.
+      4) Rephrase the result into a natural language answer.
+      5) Return both the rephrased answer and a compact raw context preview (SQL + first rows).
 
     Args:
         request (ExcelQuestionRequest): The Excel question request with session_id and question.
@@ -828,209 +904,73 @@ def ask_excel_question(request: ExcelQuestionRequest):
             detail="No Excel data found for this session. Please upload Excel files first."
         )
 
-    # Helper: identify likely "customer" columns from cleaned column names
-    import re
-    CUSTOMER_NAME_CANDIDATES = {"customer", "customer_name", "client", "client_name", "account", "buyer"}
-    def _is_customer_like(col: str) -> bool:
-        c = (col or "").lower()
-        if c in CUSTOMER_NAME_CANDIDATES:
-            return True
-        # substrings match
-        return any(tok in c for tok in ["customer", "client", "account", "buyer"])
+    # Build SQL prompt from metadata (columns/types/samples and parquet filenames)
+    sql_prompt = _build_sql_prompt_from_metadata(question, excel_metadata_list)
 
-    # Aggregate distinct values from metadata value_counts if present, falling back to unique_count aggregation
-    def _collect_customer_values_and_counts():
-        values = []
-        values_set = set()
-        counts_total = 0
-        unique_count_total = 0
-        # Try collecting exact values from value_counts across sheets
-        for m in excel_metadata_list:
-            for _, sheet in (m.get("sheets") or {}).items():
-                for col_name, col_meta in (sheet.get("columns") or {}).items():
-                    if _is_customer_like(col_name):
-                        vc = col_meta.get("value_counts") or {}
-                        if vc:
-                            for k, v in vc.items():
-                                key_norm = ("" if k is None else str(k).strip())
-                                # normalize for distinct comparison (case-insensitive)
-                                norm = key_norm.lower()
-                                if norm not in values_set and key_norm != "":
-                                    values.append(key_norm)
-                                    values_set.add(norm)
-                                try:
-                                    counts_total += int(v)
-                                except Exception:
-                                    pass
-                        # Track unique_count for fallback aggregation
-                        try:
-                            unique_count_total += int(col_meta.get("unique_count") or 0)
-                        except Exception:
-                            pass
-        return values, counts_total, unique_count_total
-
-    # Determine deterministic intents from question
-    q_low = question.lower()
-    ask_distinct_customers = bool(re.search(r"\b(how\s+many|number\s+of|count)\b.*\b(customer|customers|client|clients|account|accounts|buyer|buyers)\b", q_low))
-    ask_list_customers = bool(re.search(r"\b(what|which|list|show)\b.*\b(customer|customers|client|clients|account|accounts|buyer|buyers)\b", q_low))
-    ask_total_rows = bool(re.search(r"\b(how\s+many|number\s+of|count|total)\b.*\b(row|rows|records)\b", q_low))
-
+    # Generate SQL via Gemini
+    gemini_api_key = get_gemini_api_key()
+    if not gemini_api_key:
+        raise HTTPException(status_code=500, detail="Gemini API key not configured")
     try:
-        # Prepare a concise context from Excel metadata (summary)
-        data_context_parts = []
-        metadata_used = []
-
-        # Deterministic answers for supported intents
-        if ask_total_rows:
-            total_rows = sum(int(m.get("total_rows", 0)) for m in excel_metadata_list)
-            for m in excel_metadata_list:
-                metadata_used.append(m.get("filename", "Unknown"))
-            data_context_parts.append(f"Total rows across all uploaded Excel files: {total_rows}")
-            answer = f"There are {total_rows} rows in total across the uploaded Excel data."
-            data_context = "\n".join(data_context_parts)
-            return ExcelQuestionResponse(
-                answer=answer,
-                data_context=data_context,
-                metadata_used=metadata_used
-            )
-
-        if ask_distinct_customers or ask_list_customers:
-            # Collect distinct customer-like values
-            values, counts_total, unique_count_total = _collect_customer_values_and_counts()
-
-            # If value_counts was not available, unique_count_total can give a hint; however, summing unique_count across sheets can overcount.
-            # Prefer actual value names gathered. If none, compute fallback from unique_count by scanning sheets.
-            distinct_values = sorted(values, key=lambda s: s.lower())
-
-            for m in excel_metadata_list:
-                metadata_used.append(m.get("filename", "Unknown"))
-
-            if ask_distinct_customers:
-                # If we have names, use their count; else fall back to max per-sheet unique_count as a conservative estimate
-                if distinct_values:
-                    n = len(distinct_values)
-                    data_context_parts.append(f"Detected customer-like column(s). Distinct values: {distinct_values}")
-                    answer = f"There are {n} distinct customers."
-                else:
-                    # Fallback: combine via set of sample_values if value_counts missing
-                    samples_set = set()
-                    for m in excel_metadata_list:
-                        for _, sheet in (m.get("sheets") or {}).items():
-                            for col_name, col_meta in (sheet.get("columns") or {}).items():
-                                if _is_customer_like(col_name):
-                                    for sv in (col_meta.get("sample_values") or []):
-                                        if sv is not None:
-                                            samples_set.add(str(sv).strip().lower())
-                    if samples_set:
-                        n = len(samples_set)
-                        data_context_parts.append(f"Derived from sample values; unique samples: {sorted(samples_set)}")
-                        answer = f"There are {n} distinct customers (estimated from samples)."
-                    else:
-                        # Last resort: take maximum unique_count across candidate columns
-                        max_unique = 0
-                        for m in excel_metadata_list:
-                            for _, sheet in (m.get("sheets") or {}).items():
-                                for col_name, col_meta in (sheet.get("columns") or {}).items():
-                                    if _is_customer_like(col_name):
-                                        try:
-                                            max_unique = max(max_unique, int(col_meta.get("unique_count") or 0))
-                                        except Exception:
-                                            pass
-                        data_context_parts.append("No explicit value names available; using unique_count metadata.")
-                        answer = f"There are {max_unique} distinct customers."
-                data_context = "\n".join(data_context_parts)
-                return ExcelQuestionResponse(
-                    answer=answer,
-                    data_context=data_context[:2000] if len(data_context) > 2000 else data_context,
-                    metadata_used=metadata_used
-                )
-
-            if ask_list_customers:
-                if distinct_values:
-                    display_list = ", ".join(distinct_values)
-                    data_context_parts.append(f"Customer values: {distinct_values}")
-                    answer = f"Customer names: {display_list}."
-                else:
-                    answer = "I could not find a customer column with explicit values in the uploaded data."
-                data_context = "\n".join(data_context_parts)
-                return ExcelQuestionResponse(
-                    answer=answer,
-                    data_context=data_context[:2000] if len(data_context) > 2000 else data_context,
-                    metadata_used=metadata_used
-                )
-
-        # Default behavior: build rich context and ask Gemini (original flow)
-        data_context_parts = []
-        metadata_used = []
-
-        for metadata in excel_metadata_list:
-            filename = metadata.get('filename', 'Unknown')
-            metadata_used.append(filename)
-
-            # Add file summary
-            data_context_parts.append(f"\n=== {filename} ===")
-            data_context_parts.append(f"Total sheets: {len(metadata.get('sheets', {}))}")
-            data_context_parts.append(f"Total rows: {metadata.get('total_rows', 0)}")
-            data_context_parts.append(f"Total columns: {metadata.get('total_columns', 0)}")
-
-            # Add detailed sheet information
-            for sheet_name, sheet_info in (metadata.get('sheets', {}) or {}).items():
-                data_context_parts.append(f"\nSheet '{sheet_name}':")
-                data_context_parts.append(f"  - {sheet_info.get('row_count', 0)} rows, {sheet_info.get('column_count', 0)} columns")
-
-                # Add column details
-                columns = sheet_info.get('columns', {}) or {}
-                if columns:
-                    data_context_parts.append("  - Columns:")
-                    for col_name, col_data in list(columns.items())[:10]:  # Limit to first 10 columns
-                        col_type = col_data.get('dtype', 'unknown')
-                        sample_vals = col_data.get('sample_values', [])
-                        sample_str = ', '.join(str(v) for v in sample_vals[:3]) if sample_vals else 'No samples'
-                        data_context_parts.append(f"    * {col_name} ({col_type}): {sample_str}")
-                # Include a compact view of first rows if available
-                sample_rows = (sheet_info.get('sample_data', {}) or {}).get('first_5_rows', [])
-                if sample_rows:
-                    data_context_parts.append("  - Sample rows (up to 3):")
-                    for row in sample_rows[:3]:
-                        data_context_parts.append(f"    • {row}")
-
-        data_context = '\n'.join(data_context_parts)
-
-        # Generate answer using Gemini with Excel-specific context
-        excel_prompt = (
-            f"You are a data analyst. Answer the following question about Excel data:\n"
-            f"Question: {question}\n\n"
-            f"Available Excel Data Context:\n{data_context}\n\n"
-            f"Please provide a clear, specific answer based on the Excel data structure and content shown above. "
-            f"If the question requires specific data values that aren't shown in the context, "
-            f"explain what information is available and suggest how to get the specific data needed."
-        )
-
-        gemini_api_key = get_gemini_api_key()
-        if not gemini_api_key:
-            raise HTTPException(status_code=500, detail="Gemini API key not configured")
-
-        try:
-            import google.generativeai as genai
-            genai.configure(api_key=gemini_api_key)
-            model = genai.GenerativeModel("gemini-2.5-flash")
-            response = model.generate_content([{"role": "user", "parts": [excel_prompt]}])
-            answer = response.text.strip()
-        except Exception as e:
-            answer = (
-                f"Unable to generate answer using AI: {e}. Based on the uploaded Excel data, I can see "
-                f"{len(excel_metadata_list)} file(s) with a total of "
-                f"{sum(m.get('total_rows', 0) for m in excel_metadata_list)} rows across "
-                f"{sum(len(m.get('sheets', {})) for m in excel_metadata_list)} sheets."
-            )
-
-        return ExcelQuestionResponse(
-            answer=answer,
-            data_context=data_context[:2000] if len(data_context) > 2000 else data_context,  # Truncate if too long
-            metadata_used=metadata_used
-        )
-
-    except HTTPException:
-        raise
+        genai.configure(api_key=gemini_api_key)
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        llm_sql_resp = model.generate_content([{"role": "user", "parts": [sql_prompt]}])
+        llm_sql_raw = (llm_sql_resp.text or "").strip()
+        # Clean potential markdown fences/backticks
+        import re as _re
+        llm_sql = _re.sub(r"^```(?:sql)?\s*|\s*```$", "", llm_sql_raw.strip(), flags=_re.IGNORECASE | _re.MULTILINE)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing Excel question: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate SQL via LLM: {e}")
+
+    if not llm_sql:
+        raise HTTPException(status_code=500, detail="LLM did not produce a SQL query.")
+
+    # Execute SQL with DuckDB over session parquet files
+    try:
+        exec_result = _execute_duckdb_sql_over_session_parquet(session_id, llm_sql, excel_metadata_list)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error executing SQL: {e}")
+
+    # Ask LLM to rephrase result in natural language (short)
+    try:
+        # Compose a brief context with limited rows to avoid large prompt
+        preview_rows = exec_result.get("rows", [])[:5]
+        columns = exec_result.get("columns", [])
+        result_preview = {
+            "columns": columns,
+            "rows": preview_rows,
+            "row_count": exec_result.get("row_count", 0),
+        }
+        rephrase_prompt = (
+            "You are a helpful data analyst. "
+            "Given the question and the SQL result preview, provide a short, clear answer:\n\n"
+            f"Question: {question}\n"
+            f"SQL: {llm_sql}\n"
+            f"Result preview (first rows): {result_preview}\n\n"
+            "Answer succinctly in plain language."
+        )
+        genai.configure(api_key=gemini_api_key)
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        reph = model.generate_content([{"role": "user", "parts": [rephrase_prompt]}])
+        natural = _clean_gemini_output((reph.text or "").strip())
+        if not natural:
+            natural = "Query executed successfully."
+    except Exception:
+        natural = "Query executed successfully."
+
+    # Build data_context and metadata_used summary
+    data_context_parts = []
+    metadata_used = [m.get("filename", "Unknown") for m in excel_metadata_list]
+    data_context_parts.append("Generated SQL:")
+    data_context_parts.append(llm_sql)
+    data_context_parts.append("")
+    data_context_parts.append(f"Returned {exec_result.get('row_count', 0)} row(s). Showing up to first 5:")
+    for row in exec_result.get("rows", [])[:5]:
+        data_context_parts.append(str(row))
+    data_context = "\n".join(data_context_parts)
+
+    return ExcelQuestionResponse(
+        answer=natural,
+        data_context=data_context[:2000] if len(data_context) > 2000 else data_context,
+        metadata_used=metadata_used
+    )

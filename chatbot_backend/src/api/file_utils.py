@@ -29,7 +29,7 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
         - .txt  : UTF-8 decode with errors ignored
         - .pdf  : pdfminer.six text extraction
         - .docx : python-docx extraction (paragraphs and table cells)
-        - .xlsx : pandas-based extraction with structured data handling
+        - .xlsx : Return empty text; structured data handled separately (Parquet/metadata)
 
     Args:
         filename (str): Original filename (used for type detection).
@@ -37,7 +37,7 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
 
     Returns:
         Tuple[str, Optional[str]]: (text, error)
-            - text: extracted text content (empty if error)
+            - text: extracted text content (empty for .xlsx which is handled via structured path)
             - error: error message if extraction failed, otherwise None
     """
     name_lower = (filename or "").lower()
@@ -50,7 +50,8 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
         if name_lower.endswith(".docx"):
             return _extract_docx(content), None
         if name_lower.endswith(".xlsx"):
-            return _extract_xlsx(content), None
+            # Structured Excel is processed by process_excel_for_session; do not return large text blobs.
+            return "", None
         return "", f"Unsupported file type for '{filename}'. Allowed: .txt, .pdf, .docx, .xlsx"
     except Exception as e:
         return "", f"Failed to extract '{filename}': {e}"
@@ -472,7 +473,7 @@ def _extract_docx(content: bytes) -> str:
 
 
 def _extract_xlsx(content: bytes) -> str:
-    """Extract text from XLSX using openpyxl (sheet by sheet, TSV rows) - fallback for text extraction."""
+    """Legacy text extraction for .xlsx is no longer used in RAG; kept minimal for preview."""
     try:
         bio = io.BytesIO(content)
         wb = load_workbook(bio, data_only=True, read_only=True)
@@ -483,15 +484,15 @@ def _extract_xlsx(content: bytes) -> str:
     for ws in wb.worksheets:
         parts.append(f"[Sheet: {ws.title}]")
         try:
+            # Capture only the first non-empty row as a header preview
             for row in ws.iter_rows(values_only=True):
-                vals = []
-                for cell in row:
-                    vals.append("" if cell is None else str(cell))
+                vals = ["" if cell is None else str(cell) for cell in row]
                 if any(v.strip() for v in vals):
                     parts.append("\t".join(vals))
+                    break
         except Exception as e:
-            logger.warning(f"Failed iterating rows for sheet '{ws.title}': {e}")
-        parts.append("")  # blank line between sheets
+            logger.warning(f"Failed reading preview row for sheet '{ws.title}': {e}")
+        parts.append("")  # separator
     return "\n".join(parts).strip()
 
 

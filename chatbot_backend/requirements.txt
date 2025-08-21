@@ -55,3 +55,6 @@ pdfminer.six==20231228
 # Excel processing and structured data storage
 pandas==2.1.4
 pyarrow==14.0.2
+
+# SQL execution over Parquet
+duckdb==1.1.3
