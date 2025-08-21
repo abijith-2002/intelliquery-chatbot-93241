@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 from datetime import datetime
@@ -13,6 +14,9 @@ import pandas as pd
 from pdfminer.high_level import extract_text as pdf_extract_text
 from docx import Document as DocxDocument
 from openpyxl import load_workbook
+
+# Configure module-level logger
+logger = logging.getLogger(__name__)
 
 
 # PUBLIC_INTERFACE
@@ -54,8 +58,8 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
 
 # PUBLIC_INTERFACE
 def process_excel_for_session(
-    filename: str, 
-    content: bytes, 
+    filename: str,
+    content: bytes,
     session_id: str
 ) -> Tuple[Dict[str, Any], Optional[str]]:
     """
@@ -76,13 +80,47 @@ def process_excel_for_session(
         # Create session directory
         session_dir = Path("data/sessions") / session_id
         session_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Load Excel file with pandas
-        # Important: create a fresh BytesIO per sheet read; some engines advance the stream position
+
+        # Defensive checks for content
+        if not content or len(content) == 0:
+            return {}, f"Empty Excel file content for '{filename}'."
+
+        # Prefer openpyxl engine for .xlsx explicitly
+        engine = "openpyxl"
+
+        # Use a single master BytesIO to enumerate sheet names
         bio_master = io.BytesIO(content)
-        excel_file = pd.ExcelFile(bio_master)
-        
-        metadata = {
+        try:
+            excel_file = pd.ExcelFile(bio_master, engine=engine)
+        except Exception as e:
+            logger.error(f"pd.ExcelFile failed for '{filename}' with engine={engine}: {e}")
+            # Retry without specifying engine (let pandas detect) as fallback
+            try:
+                bio_master.seek(0)
+                excel_file = pd.ExcelFile(bio_master)
+            except Exception as e2:
+                return {}, f"Unable to open Excel file '{filename}': {e2}"
+
+        sheet_names = list(excel_file.sheet_names or [])
+        if not sheet_names:
+            # As a fallback, try openpyxl directly to confirm sheet existence
+            try:
+                wb = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
+                sheet_names = [ws.title for ws in wb.worksheets]
+            except Exception as e:
+                logger.error(f"openpyxl load_workbook failed for '{filename}': {e}")
+            if not sheet_names:
+                return {
+                    "filename": filename,
+                    "session_id": session_id,
+                    "processed_at": datetime.utcnow().isoformat(),
+                    "sheets": {},
+                    "parquet_files": [],
+                    "total_rows": 0,
+                    "total_columns": 0
+                }, f"No sheets detected in '{filename}'. Ensure the file is a valid .xlsx."
+
+        metadata: Dict[str, Any] = {
             "filename": filename,
             "session_id": session_id,
             "processed_at": datetime.utcnow().isoformat(),
@@ -91,55 +129,70 @@ def process_excel_for_session(
             "total_rows": 0,
             "total_columns": 0
         }
-        
-        # Process each sheet
-        for sheet_name in excel_file.sheet_names:
+
+        # Process each sheet robustly
+        for sheet_name in sheet_names:
             try:
-                # Read sheet into DataFrame
-                # Create a new BytesIO for each read to avoid pointer issues
-                df = pd.read_excel(io.BytesIO(content), sheet_name=sheet_name, engine='openpyxl')
-                
-                # Clean column names (remove spaces, special chars for SQL compatibility)
+                # New BytesIO for each read to avoid stream pointer issues
+                df = pd.read_excel(io.BytesIO(content), sheet_name=sheet_name, engine=engine)
+
+                # Some Excel sheets can be completely empty; skip them
+                if df is None or (hasattr(df, "empty") and df.empty and len(df.columns) == 0):
+                    logger.warning(f"Sheet '{sheet_name}' in '{filename}' appears empty. Skipping.")
+                    continue
+
+                # Clean column names
                 df.columns = [_clean_column_name(str(col)) for col in df.columns]
-                
-                # Generate Parquet filename
+
+                # If the sheet has no rows but has columns, keep it but mark counts appropriately
                 safe_sheet_name = _clean_column_name(sheet_name)
                 safe_filename = _clean_column_name(filename.replace('.xlsx', ''))
                 parquet_filename = f"{safe_filename}_{safe_sheet_name}.parquet"
                 parquet_path = session_dir / parquet_filename
-                
-                # Store as Parquet
-                df.to_parquet(parquet_path, engine='pyarrow', index=False)
-                
+
+                parquet_path_str = ""
+                try:
+                    # Write Parquet only if there are columns (pyarrow cannot write zero-column frames)
+                    if len(df.columns) > 0:
+                        df.to_parquet(parquet_path, engine='pyarrow', index=False)
+                        parquet_path_str = str(parquet_path)
+                        metadata["parquet_files"].append(parquet_path_str)
+                    else:
+                        logger.info(f"Skipping Parquet write for '{sheet_name}' due to zero columns.")
+                except Exception as e_parq:
+                    logger.error(f"Failed to write parquet for '{sheet_name}' in '{filename}': {e_parq}")
+
                 # Extract column metadata
                 sheet_metadata = _extract_column_metadata(df, sheet_name)
-                sheet_metadata["parquet_path"] = str(parquet_path)
-                sheet_metadata["parquet_filename"] = parquet_filename
-                
+                if parquet_path_str:
+                    sheet_metadata["parquet_path"] = parquet_path_str
+                    sheet_metadata["parquet_filename"] = parquet_filename
+
                 metadata["sheets"][sheet_name] = sheet_metadata
-                metadata["parquet_files"].append(str(parquet_path))
-                metadata["total_rows"] += len(df)
-                metadata["total_columns"] += len(df.columns)
-                
-            except Exception as e:
-                print(f"Error processing sheet '{sheet_name}': {e}")
+                metadata["total_rows"] += int(len(df))
+                metadata["total_columns"] += int(len(df.columns))
+
+            except Exception as e_sheet:
+                logger.error(f"Error processing sheet '{sheet_name}' in '{filename}': {e_sheet}")
                 continue
-        
-        # Save metadata as JSON with a deterministic name pattern: <base>_metadata.json
+
+        # Sanity check and only write metadata to disk after processing
         base_name = _clean_column_name(filename.replace('.xlsx', ''))
         metadata_path = session_dir / f"{base_name}_metadata.json"
-        with open(metadata_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
-        
-        metadata["metadata_path"] = str(metadata_path)
-        
-        # Sanity check: ensure at least some structure was detected
+        try:
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            metadata["metadata_path"] = str(metadata_path)
+        except Exception as e_md:
+            logger.error(f"Failed to write metadata JSON for '{filename}': {e_md}")
+
         if metadata.get("total_rows", 0) == 0 and not metadata.get("sheets"):
             return metadata, f"No rows or sheets detected in '{filename}'. Please verify the Excel file contents."
-        
+
         return metadata, None
-        
+
     except Exception as e:
+        logger.exception(f"Unexpected failure processing Excel '{filename}': {e}")
         return {}, f"Failed to process Excel file '{filename}': {e}"
 
 
@@ -158,19 +211,19 @@ def get_session_excel_metadata(session_id: str) -> List[Dict[str, Any]]:
     session_dir = Path("data/sessions") / session_id
     if not session_dir.exists():
         return []
-    
+
     metadata_files = list(session_dir.glob("*_metadata.json"))
     all_metadata = []
-    
+
     for metadata_file in metadata_files:
         try:
             with open(metadata_file, 'r') as f:
                 metadata = json.load(f)
                 all_metadata.append(metadata)
         except Exception as e:
-            print(f"Error reading metadata file {metadata_file}: {e}")
+            logger.warning(f"Error reading metadata file {metadata_file}: {e}")
             continue
-    
+
     return all_metadata
 
 
@@ -190,12 +243,12 @@ def load_session_parquet_data(session_id: str, parquet_filename: str) -> Optiona
     try:
         session_dir = Path("data/sessions") / session_id
         parquet_path = session_dir / parquet_filename
-        
+
         if parquet_path.exists():
             return pd.read_parquet(parquet_path, engine='pyarrow')
         return None
     except Exception as e:
-        print(f"Error loading Parquet file '{parquet_filename}' for session '{session_id}': {e}")
+        logger.error(f"Error loading Parquet file '{parquet_filename}' for session '{session_id}': {e}")
         return None
 
 
@@ -224,22 +277,22 @@ def _extract_column_metadata(df: pd.DataFrame, sheet_name: str) -> Dict[str, Any
         "sample_data": {},
         "data_summary": {}
     }
-    
+
     for col in df.columns:
         col_data = df[col]
-        
+
         # Basic column info
         col_info = {
             "name": col,
             "dtype": str(col_data.dtype),
-            "null_count": col_data.isnull().sum(),
-            "null_percentage": (col_data.isnull().sum() / len(col_data)) * 100,
-            "unique_count": col_data.nunique(),
+            "null_count": int(col_data.isnull().sum()),
+            "null_percentage": float((col_data.isnull().sum() / len(col_data)) * 100) if len(df) > 0 else 0.0,
+            "unique_count": int(col_data.nunique(dropna=True)),
             "is_numeric": pd.api.types.is_numeric_dtype(col_data),
             "is_datetime": pd.api.types.is_datetime64_any_dtype(col_data),
             "is_categorical": pd.api.types.is_categorical_dtype(col_data)
         }
-        
+
         # Sample values (first 5 non-null values)
         non_null_values = col_data.dropna()
         if len(non_null_values) > 0:
@@ -247,32 +300,39 @@ def _extract_column_metadata(df: pd.DataFrame, sheet_name: str) -> Dict[str, Any
             col_info["sample_values"] = [str(v) for v in sample_values]
         else:
             col_info["sample_values"] = []
-        
+
         # Statistical summary for numeric columns
         if col_info["is_numeric"] and len(non_null_values) > 0:
             try:
-                col_info["min_value"] = float(col_data.min())
-                col_info["max_value"] = float(col_data.max())
-                col_info["mean_value"] = float(col_data.mean())
-                col_info["median_value"] = float(col_data.median())
-            except:
+                col_info["min_value"] = float(pd.to_numeric(col_data, errors="coerce").min())
+                col_info["max_value"] = float(pd.to_numeric(col_data, errors="coerce").max())
+                col_info["mean_value"] = float(pd.to_numeric(col_data, errors="coerce").mean())
+                col_info["median_value"] = float(pd.to_numeric(col_data, errors="coerce").median())
+            except Exception:
+                # If conversion fails, skip stats
                 pass
-        
+
         # Value counts for categorical-like columns (if unique count is reasonable)
         if col_info["unique_count"] <= 20 and len(non_null_values) > 0:
             try:
-                value_counts = col_data.value_counts().head(10)
+                value_counts = col_data.value_counts(dropna=True).head(10)
                 col_info["value_counts"] = {str(k): int(v) for k, v in value_counts.items()}
-            except:
+            except Exception:
                 pass
-        
+
         metadata["columns"][col] = col_info
-    
+
     # Overall data summary
     if len(df) > 0:
-        metadata["sample_data"]["first_5_rows"] = df.head(5).to_dict('records')
-        metadata["data_summary"]["memory_usage"] = df.memory_usage(deep=True).sum()
-    
+        try:
+            metadata["sample_data"]["first_5_rows"] = df.head(5).to_dict('records')
+        except Exception:
+            metadata["sample_data"]["first_5_rows"] = []
+        try:
+            metadata["data_summary"]["memory_usage"] = int(df.memory_usage(deep=True).sum())
+        except Exception:
+            pass
+
     return metadata
 
 
@@ -310,21 +370,24 @@ def _extract_docx(content: bytes) -> str:
 
 def _extract_xlsx(content: bytes) -> str:
     """Extract text from XLSX using openpyxl (sheet by sheet, TSV rows) - fallback for text extraction."""
-    bio = io.BytesIO(content)
-    wb = load_workbook(bio, data_only=True, read_only=True)
+    try:
+        bio = io.BytesIO(content)
+        wb = load_workbook(bio, data_only=True, read_only=True)
+    except Exception as e:
+        logger.error(f"openpyxl failed to read xlsx content: {e}")
+        return ""
     parts: List[str] = []
     for ws in wb.worksheets:
         parts.append(f"[Sheet: {ws.title}]")
-        for row in ws.iter_rows(values_only=True):
-            vals = []
-            for cell in row:
-                if cell is None:
-                    vals.append("")
-                else:
-                    vals.append(str(cell))
-            # Skip completely empty rows
-            if any(v.strip() for v in vals):
-                parts.append("\t".join(vals))
+        try:
+            for row in ws.iter_rows(values_only=True):
+                vals = []
+                for cell in row:
+                    vals.append("" if cell is None else str(cell))
+                if any(v.strip() for v in vals):
+                    parts.append("\t".join(vals))
+        except Exception as e:
+            logger.warning(f"Failed iterating rows for sheet '{ws.title}': {e}")
         parts.append("")  # blank line between sheets
     return "\n".join(parts).strip()
 

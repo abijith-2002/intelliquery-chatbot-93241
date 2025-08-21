@@ -692,22 +692,31 @@ def upload_chat_context(
                     if session_id not in EXCEL_METADATA_STORE:
                         EXCEL_METADATA_STORE[session_id] = []
                     EXCEL_METADATA_STORE[session_id].append(excel_metadata)
-                    
+
                     # Create a summary for text indexing
                     text_summary = _create_excel_text_summary(excel_metadata)
                     combined_text_parts.append(f"[{filename} - Excel Data Summary]\n{text_summary}\n")
                     total_chars += len(text_summary)
-                    
+
                     # Index the summary for retrieval
                     try:
                         _index_text_for_session(session_id, filename, text_summary)
                     except Exception:
                         pass
-                    
+
                     preview = f"Excel file with {excel_metadata.get('total_rows', 0)} total rows across {len(excel_metadata.get('sheets', {}))} sheets"
                     chars = len(text_summary)
                     err = None
                 else:
+                    # Log details for debugging empty/failed Excel reads
+                    try:
+                        import logging as _logging
+                        _logging.getLogger(__name__).warning(
+                            "Excel processing yielded no data for '%s' (session %s). Error: %s | Metadata sheets: %s",
+                            filename, session_id, excel_err, list((excel_metadata or {}).get('sheets', {}).keys())
+                        )
+                    except Exception:
+                        pass
                     preview = ""
                     chars = 0
                     err = excel_err
