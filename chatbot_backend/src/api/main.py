@@ -679,7 +679,16 @@ def upload_chat_context(
             try:
                 bio = io.BytesIO(data or b"")
                 # Read all sheets into dict of DataFrames
-                all_sheets = pd.read_excel(bio, sheet_name=None)
+                # Explicitly set engine to openpyxl to avoid engine autodetect failures
+                try:
+                    all_sheets = pd.read_excel(bio, sheet_name=None, engine="openpyxl")
+                except TypeError:
+                    # Older pandas may not accept engine kw; retry without
+                    all_sheets = pd.read_excel(bio, sheet_name=None)
+                except Exception as e:
+                    raise RuntimeError(f"Unable to read Excel workbook with openpyxl: {e}")
+                if not isinstance(all_sheets, dict) or len(all_sheets) == 0:
+                    raise RuntimeError("Excel workbook contains no readable sheets.")
                 if session_id not in EXCEL_STORE:
                     EXCEL_STORE[session_id] = []
                 excel_entry = {
@@ -695,23 +704,47 @@ def upload_chat_context(
                 from .excel_index import upsert_excel_column_index  # integrate column index
 
                 for sheet_name, df in all_sheets.items():
+                    # Ensure a valid DataFrame object
+                    try:
+                        if df is None:
+                            raise ValueError("Sheet DataFrame is None")
+                        # Normalize column names to strings to avoid JSON serialization issues
+                        df.columns = [str(c) for c in df.columns]
+                    except Exception as e:
+                        raise RuntimeError(f"Failed to normalize sheet '{sheet_name}': {e}")
+
                     # Collect metadata
                     cols = list(df.columns)
-                    dtypes = {str(c): str(t) for c, t in zip(cols, df.dtypes.values)}
-                    rows = int(df.shape[0])
-                    sample = df.head(5).to_dict(orient="records")
+                    dtypes = {str(c): str(t) for c, t in zip(cols, getattr(df, "dtypes", []))}
+                    rows = int(getattr(df, "shape", (0, 0))[0])
+                    # If sheet is empty, create an empty sample list for consistency
+                    try:
+                        sample = df.head(5).to_dict(orient="records") if rows > 0 else []
+                    except Exception:
+                        sample = []
 
                     # Compute small per-column sample values for index preview
                     column_samples = {}
                     try:
                         for c in cols:
-                            # take up to 5 non-null unique sample values
-                            series = df[c].dropna().unique().tolist()
+                            series = getattr(df, "__getitem__", lambda *_: None)(c)
+                            if series is None:
+                                continue
+                            try:
+                                uniques = series.dropna().unique().tolist()
+                            except Exception:
+                                # As a fallback for complex dtypes
+                                uniques = series.dropna().astype(str).unique().tolist()
                             # convert to native python types where possible
                             preview_vals = []
-                            for v in series[:5]:
+                            for v in uniques[:5]:
                                 try:
-                                    preview_vals.append(v.item() if hasattr(v, "item") else v)
+                                    if hasattr(v, "item"):
+                                        preview_vals.append(v.item())
+                                    elif isinstance(v, (bytes, bytearray)):
+                                        preview_vals.append(v.decode("utf-8", errors="ignore"))
+                                    else:
+                                        preview_vals.append(v)
                                 except Exception:
                                     preview_vals.append(str(v))
                             column_samples[str(c)] = preview_vals
@@ -722,9 +755,16 @@ def upload_chat_context(
                     parquet_path = None
                     try:
                         if rows > 5000:
-                            safe_sheet = str(sheet_name).replace("/", "_")
-                            parquet_path = os.path.join(parquet_dir, f"{os.path.basename(filename)}__{safe_sheet}.parquet")
-                            df.to_parquet(parquet_path, index=False)
+                            safe_sheet = str(sheet_name).replace("/", "_").replace("\\", "_")
+                            safe_file = os.path.basename(filename).replace("/", "_").replace("\\", "_")
+                            parquet_path = os.path.join(parquet_dir, f"{safe_file}__{safe_sheet}.parquet")
+                            if rows > 0:
+                                # Only attempt if pyarrow is present; otherwise skip silently
+                                try:
+                                    import pyarrow  # noqa: F401
+                                    df.to_parquet(parquet_path, index=False)
+                                except Exception:
+                                    parquet_path = None
                     except Exception:
                         parquet_path = None  # If pyarrow missing or write fails, ignore.
 
@@ -774,7 +814,7 @@ def upload_chat_context(
                         size=size,
                         content_chars=0,
                         preview="",
-                        error=f"Failed to parse Excel: {e}",
+                        error=f"Failed to parse Excel '{filename}': {e}",
                     )
                 )
             continue  # proceed to next file

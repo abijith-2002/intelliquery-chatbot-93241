@@ -97,7 +97,11 @@ def _xlsx_preview_from_metadata(content: bytes) -> Tuple[str, Optional[str]]:
     try:
         bio = io.BytesIO(content)
         # Attempt reading first sheet only for a concise preview
-        df = pd.read_excel(bio, sheet_name=0, nrows=5)
+        try:
+            df = pd.read_excel(bio, sheet_name=0, nrows=5, engine="openpyxl")
+        except TypeError:
+            # Older pandas may not accept engine kw; retry without
+            df = pd.read_excel(bio, sheet_name=0, nrows=5)
         cols = list(df.columns)
         dtypes = [str(t) for t in df.dtypes.values]
         sample_rows = df.head(3).to_dict(orient="records")
