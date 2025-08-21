@@ -27,3 +27,10 @@ Troubleshooting large Excel files not appearing:
 - Check that previews show truncation warnings; large sheets are included even when truncated.
 - If Excel parsing is skipped due to memory or time limits, the file still appears with a warning in the preview; schema is either deferred or partially built from sampled rows.
 - Increase `CHATBOT_EXCEL_SCHEMA_MAX_SAMPLE_ROWS` cautiously if you need deeper schema statistics, or decrease it to reduce CPU/memory pressure.
+
+Additional diagnostics for /chat/excel-query:
+- Server logs now include:
+  - "[excel_query] Rebuilt schema..." when an empty or invalid schema is detected and rebuilt.
+  - "[excel_query] Prompt preview..." showing the first up to 1000 characters of the prompt sent to Gemini (includes a compact per-sheet summary and a safely truncated JSON schema preview).
+  - "[excel_query] Schema summary: sheets=..., cols_per_sheet=[...]" to confirm schema richness.
+- These logs help confirm that the Gemini prompt is never empty and includes representative schema even for very large files (with sampling/truncation noted in schema notes).

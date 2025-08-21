@@ -899,7 +899,7 @@ def excel_query(request: ExcelQueryRequest):
         - We never execute arbitrary LLM output beyond the sandboxed eval of a single expression.
         - We never send raw data to Gemini; only schema/metadata is used.
     """
-    from .excel_utils import get_gemini_pandas_prompt, safe_eval_pandas_expression, normalize_result_for_json
+    from .excel_utils import get_gemini_pandas_prompt, safe_eval_pandas_expression, normalize_result_for_json, build_schema_for_gemini
 
     session_id = (request.session_id or "").strip()
     if not session_id:
@@ -911,19 +911,24 @@ def excel_query(request: ExcelQueryRequest):
 
     # Select df
     df = None
-    sheets = store.get("sheets")
+    sheets = store.get("sheets") or {}
+    # If a specific sheet is requested
     if request.sheet_name:
-        if not sheets or request.sheet_name not in sheets:
+        if request.sheet_name not in sheets:
             raise HTTPException(status_code=400, detail=f"Sheet '{request.sheet_name}' not found.")
         df = sheets[request.sheet_name]
     else:
+        # prefer stored default
         df = store.get("df")
-        if df is None and sheets:
+        if df is None:
             # fallback to first non-empty or first
             for sname, sdf in sheets.items():
-                if not sdf.empty:
-                    df = sdf
-                    break
+                try:
+                    if isinstance(sdf, type(df)) and getattr(sdf, "empty", True) is False:
+                        df = sdf
+                        break
+                except Exception:
+                    continue
             if df is None and len(sheets) > 0:
                 df = next(iter(sheets.values()))
 
@@ -936,15 +941,38 @@ def excel_query(request: ExcelQueryRequest):
             pass
         raise HTTPException(status_code=400, detail="No usable DataFrame found in uploaded Excel.")
 
+    # Ensure schema exists and is populated
     schema = store.get("schema")
+    rebuild_reason = None
     if not schema or not isinstance(schema, dict) or not schema.get("sheets"):
-        # Rebuild schema just in case or if empty
-        from .excel_utils import build_schema_for_gemini as _build
-        # Prefer all sheets if available; otherwise build from the selected df
-        build_source = sheets if sheets else {"Sheet1": df}
-        schema = _build(build_source)
-        # Persist back to session store
-        store["schema"] = schema
+        rebuild_reason = "missing_or_invalid"
+    else:
+        # If schema exists but all sheets have no columns, rebuild using full sheets
+        try:
+            has_columns = any((len(s.get("columns") or []) > 0) for s in schema.get("sheets", []))
+            if not has_columns:
+                rebuild_reason = "empty_columns"
+        except Exception:
+            rebuild_reason = "schema_inspection_failed"
+
+    if rebuild_reason is not None:
+        try:
+            # Try to rebuild from all sheets for better context
+            build_source = sheets if sheets else {"Sheet1": df}
+            # Respect configured sampling to avoid heavy processing
+            max_rows = int(os.getenv("CHATBOT_EXCEL_SCHEMA_MAX_SAMPLE_ROWS", "10000"))
+            schema = build_schema_for_gemini(build_source, max_examples_per_col=3, max_rows_per_sheet=max_rows)
+            store["schema"] = schema
+            print(f"[excel_query] Rebuilt schema for session={session_id} reason={rebuild_reason} sheets={list(build_source.keys())}")
+        except Exception as e:
+            # As last resort, build minimal schema only from current df to avoid empty context
+            try:
+                schema = build_schema_for_gemini({"Sheet1": df}, max_examples_per_col=3, max_rows_per_sheet=1000)
+                store["schema"] = schema
+                print(f"[excel_query] Minimal schema built due to error: {e}")
+            except Exception as e2:
+                print(f"[excel_query] Failed to build any schema: {e2}")
+                raise HTTPException(status_code=500, detail="Failed to build schema for Gemini prompt.")
 
     # Compose strict prompt
     user_query = (request.query or "").strip()
@@ -952,6 +980,20 @@ def excel_query(request: ExcelQueryRequest):
         raise HTTPException(status_code=400, detail="query is required.")
 
     pandas_prompt = get_gemini_pandas_prompt(user_query, schema)
+
+    # Lightweight logging for diagnostics to ensure prompt has schema info (truncated safely)
+    try:
+        preview_len = min(len(pandas_prompt), 1000)
+        print(f"[excel_query] Prompt preview (first {preview_len} chars) for session={session_id}:\n{pandas_prompt[:preview_len]}")
+        # Also log a compact schema summary
+        try:
+            schema_sheets = len(schema.get("sheets", []))
+            col_counts = [len(s.get("columns", [])) for s in schema.get("sheets", [])]
+            print(f"[excel_query] Schema summary: sheets={schema_sheets} cols_per_sheet={col_counts}")
+        except Exception:
+            pass
+    except Exception:
+        pass
 
     # Generate expression via Gemini
     gemini_api_key = get_gemini_api_key()
@@ -964,19 +1006,15 @@ def excel_query(request: ExcelQueryRequest):
         expression = (response.text or "").strip()
         # Clean code fences or stray formatting
         if "```" in expression:
-            # remove common code fence patterns
             expression = expression.replace("```python", "").replace("```py", "").replace("```", "").strip()
-        # If model included "python" prefix, drop it
         if expression.lower().startswith("python"):
             expression = expression[6:].strip()
-        # Remove trailing semicolons which can break eval in our constraints
         if expression.endswith(";"):
             expression = expression[:-1].strip()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to get pandas expression from Gemini: {e}")
 
     if not expression or "\n" in expression:
-        # Force single line
         expression = " ".join((expression or "").split())
     if not expression:
         raise HTTPException(status_code=500, detail="Gemini did not return a valid pandas expression.")
@@ -997,9 +1035,8 @@ def excel_query(request: ExcelQueryRequest):
             "Provide a concise explanation (2-4 sentences) of what this code does and how it answers the user's request. "
             "Do not include code in the answer."
         )
-        # Ensure model exists; if not, instantiate a lightweight model
         try:
-            _narr_model = model  # reuse if exists
+            _narr_model = model  # reuse model if exists
         except NameError:
             genai.configure(api_key=gemini_api_key)
             _narr_model = genai.GenerativeModel("gemini-2.5-flash")

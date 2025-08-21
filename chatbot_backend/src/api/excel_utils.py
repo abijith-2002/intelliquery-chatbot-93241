@@ -159,6 +159,7 @@ def build_schema_for_gemini(
     Args:
         sheets: Mapping of sheet name -> DataFrame.
         max_examples_per_col: Number of example values stored for each column.
+        max_rows_per_sheet: Optional cap for per-sheet rows when computing schema.
 
     Returns:
         Dict[str, Any]: Structured schema description suitable for prompting Gemini.
@@ -177,13 +178,28 @@ def build_schema_for_gemini(
             "notes": ["No sheets found in the uploaded Excel; using empty schema."]
         }
 
-    for sheet_name, df in sheets.items():
+    # Defensive copy to avoid mutating caller's DataFrames
+    safe_sheets = {}
+    for sname, sdf in sheets.items():
+        safe_sheets[sname] = sdf if isinstance(sdf, pd.DataFrame) else pd.DataFrame()
+
+    for sheet_name, df in safe_sheets.items():
         original_rows = int(getattr(df, "shape", (0, 0))[0]) if isinstance(df, pd.DataFrame) else 0
         sampled = False
+
+        # Ensure we keep some representative rows even if df appears empty after cleaning
+        if not isinstance(df, pd.DataFrame):
+            df = pd.DataFrame()
+
+        if df.shape[0] == 0 and df.shape[1] > 0:
+            # If there are columns but zero rows, synthesize up to 1 example row of NaNs so schema has column names.
+            df = pd.DataFrame(columns=list(df.columns))
+
         # Optionally sample to limit heavy describe() on massive sheets
         if max_rows_per_sheet is not None and isinstance(df, pd.DataFrame) and df.shape[0] > max_rows_per_sheet:
             df = df.head(max_rows_per_sheet)
             sampled = True
+
         sheet_info: Dict[str, Any] = {
             "name": sheet_name,
             "rows": int(df.shape[0]) if isinstance(df, pd.DataFrame) else 0,
@@ -198,16 +214,25 @@ def build_schema_for_gemini(
                 f"Sheet '{sheet_name}' truncated to {max_rows_per_sheet} rows for schema/stats to avoid long processing."
             )
 
-        if not isinstance(df, pd.DataFrame) or df.empty:
+        # Always include columns if present, even when df is empty
+        if not isinstance(df, pd.DataFrame) or (df.empty and df.shape[1] == 0):
             schema["sheets"].append(sheet_info)
             continue
 
-        for col in df.columns:
-            series = df[col]
-            dtype = str(series.dtype)
-            non_null = series.notna().sum()
-            nulls = int(df.shape[0] - non_null)
-            null_pct = _percent(nulls, df.shape[0])
+        # Use dtypes from DataFrame even if empty to avoid losing column info
+        for col in list(df.columns):
+            try:
+                series = df[col]
+            except Exception:
+                # If column access fails, skip but add minimal column info
+                sheet_info["columns"].append({"name": str(col), "dtype": "unknown", "non_null": 0, "nulls": 0, "null_pct": 0.0})
+                continue
+
+            dtype = str(series.dtype) if hasattr(series, "dtype") else "unknown"
+            non_null = int(series.notna().sum()) if hasattr(series, "notna") else 0
+            total_rows = int(df.shape[0]) if hasattr(df, "shape") else 0
+            nulls = int(max(total_rows - non_null, 0))
+            null_pct = _percent(nulls, total_rows)
 
             col_info: Dict[str, Any] = {
                 "name": str(col),
@@ -217,30 +242,43 @@ def build_schema_for_gemini(
                 "null_pct": null_pct,
             }
 
-            # Gather example values (non-null head)
+            # Gather example values (non-null head); if empty, try raw head without dropna to preserve some representative values
             examples = []
-            for v in series.dropna().head(max_examples_per_col).tolist():
-                try:
-                    # Ensure JSON serializable
-                    if isinstance(v, (int, float, str, bool)) or v is None:
-                        examples.append(v)
-                    else:
+            try:
+                sample_series = series.dropna().head(max_examples_per_col)
+                if sample_series.empty:
+                    sample_series = series.head(max_examples_per_col)
+                for v in sample_series.tolist():
+                    try:
+                        if isinstance(v, (int, float, str, bool)) or v is None:
+                            examples.append(v)
+                        else:
+                            examples.append(str(v))
+                    except Exception:
                         examples.append(str(v))
-                except Exception:
-                    examples.append(str(v))
+            except Exception:
+                pass
             if examples:
                 col_info["examples"] = examples
 
             # Stats based on dtype
-            if _safe_is_numeric_dtype(series.dtype):
-                col_info["stats"] = _describe_numeric_series(series)
-            else:
-                col_info["stats"] = _describe_non_numeric_series(series)
+            try:
+                if _safe_is_numeric_dtype(series.dtype):
+                    col_info["stats"] = _describe_numeric_series(series)
+                else:
+                    col_info["stats"] = _describe_non_numeric_series(series)
+            except Exception:
+                # If stats fail (e.g., on empty), provide minimal stats
+                col_info["stats"] = {"count": int(non_null)}
 
             sheet_info["columns"].append(col_info)
 
         schema["sheets"].append(sheet_info)
 
+    # As a final guard, ensure we have at least one sheet with columns to avoid empty prompt context
+    has_columns = any((len(s.get("columns") or []) > 0) for s in schema["sheets"])
+    if not has_columns:
+        schema["notes"].append("No columns detected across sheets; schema is minimal and may limit Gemini capabilities.")
     return schema
 
 
@@ -268,10 +306,31 @@ def get_gemini_pandas_prompt(user_query: str, schema: Dict[str, Any]) -> str:
     """
     # Make sure schema is serializable and trimmed to avoid token overflow
     full_schema_json = json.dumps(schema, ensure_ascii=False)
+    # Provide a compact summary header that is always present and useful even if deep truncation occurs
+    try:
+        sheet_count = len(schema.get("sheets", []))
+        sheet_summ = []
+        for s in schema.get("sheets", [])[:5]:
+            nm = s.get("name", "Sheet")
+            cols = len(s.get("columns", []) or [])
+            rows = s.get("rows", 0)
+            sheet_summ.append(f"{nm}(rows={rows}, cols={cols})")
+        compact_summary = f"Sheets: {sheet_count}; summary: " + ", ".join(sheet_summ)
+    except Exception:
+        compact_summary = "Sheets: unknown; summary unavailable"
+
     MAX_SCHEMA_CHARS = 12000
     schema_truncated = False
     if len(full_schema_json) > MAX_SCHEMA_CHARS:
-        schema_preview = full_schema_json[:MAX_SCHEMA_CHARS]
+        # Attempt to truncate at the last complete object boundary to avoid malformed JSON preview
+        cut = MAX_SCHEMA_CHARS
+        # back up to a comma or brace for safer cut
+        while cut > 0 and full_schema_json[cut - 1] not in [",", "}", "]"]:
+            cut -= 1
+        if cut < 4000:
+            # ensure we still include a reasonable chunk even if boundary search failed
+            cut = MAX_SCHEMA_CHARS
+        schema_preview = full_schema_json[:cut]
         schema_truncated = True
     else:
         schema_preview = full_schema_json
@@ -291,7 +350,9 @@ def get_gemini_pandas_prompt(user_query: str, schema: Dict[str, Any]) -> str:
         "User request:\n"
         f"{user_query}\n"
         "\n"
-        "Excel schema (for reference only, not for copying values):\n"
+        "Excel schema summary (reference only):\n"
+        f"{compact_summary}\n"
+        "Detailed schema (may be truncated for length):\n"
         f"{schema_preview}\n"
         f"{'(schema preview truncated for length)\\n' if schema_truncated else ''}"
         "\n"
