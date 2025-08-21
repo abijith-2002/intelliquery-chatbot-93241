@@ -17,6 +17,8 @@ import google.generativeai as genai
 
 from dotenv import load_dotenv
 from langchain.memory import ConversationBufferMemory
+import os
+import json
 
 # Import authentication/database helpers
 from .auth_utils import (
@@ -615,6 +617,7 @@ def upload_chat_context(
         extract_text_from_bytes,
         summarize_text_preview,
         extract_xlsx_wide_chunks,
+        extract_xlsx_schema_and_dfs,
     )
 
     if not session_id or not isinstance(session_id, str):
@@ -646,7 +649,28 @@ def upload_chat_context(
         indexed_any = False
         if name_lower.endswith(".xlsx"):
             try:
-                # Extract wide-aware chunks
+                # First, extract schema and DataFrames for the workbook
+                schema, dfs = extract_xlsx_schema_and_dfs(data or b"")
+
+                # Initialize per-session stores if not present
+                if session_id not in XLSX_SCHEMA_STORE:
+                    XLSX_SCHEMA_STORE[session_id] = {}
+                if session_id not in XLSX_DF_STORE:
+                    XLSX_DF_STORE[session_id] = {}
+
+                # Store in-memory per filename
+                XLSX_SCHEMA_STORE[session_id][filename] = schema
+                XLSX_DF_STORE[session_id][filename] = dfs
+
+                # Persist schema JSON to filesystem under data/session_schemas/{session_id}/{filename}.schema.json
+                target_dir = os.path.join("data", "session_schemas", session_id)
+                os.makedirs(target_dir, exist_ok=True)
+                safe_fname = f"{filename}.schema.json"
+                schema_path = os.path.join(target_dir, safe_fname)
+                with open(schema_path, "w", encoding="utf-8") as fp:
+                    json.dump(schema, fp, indent=2, ensure_ascii=False)
+
+                # Extract wide-aware chunks for indexing and preview
                 wide_chunks = extract_xlsx_wide_chunks(
                     data or b"",
                     max_tokens_per_chunk=1200,
@@ -667,8 +691,9 @@ def upload_chat_context(
                             # Indexing failure for one chunk should not break the entire upload
                             pass
 
-                    # Preview from first chunk for UI purposes
-                    preview = summarize_text_preview(wide_chunks[0], max_chars=500)
+                    # Preview notes include schema success
+                    base_preview = summarize_text_preview(wide_chunks[0], max_chars=460)
+                    preview = f"{base_preview} [XLSX schema extracted and stored]"
                     results.append(
                         UploadedFileResult(
                             filename=filename,
@@ -679,9 +704,22 @@ def upload_chat_context(
                         )
                     )
                     continue  # move to next file after wide handling
+                else:
+                    # If no chunks, still report schema success in preview
+                    preview = "[XLSX schema extracted and stored] No chunkable content found."
+                    results.append(
+                        UploadedFileResult(
+                            filename=filename,
+                            size=size,
+                            content_chars=0,
+                            preview=preview,
+                            error=None,
+                        )
+                    )
+                    continue
             except Exception:
-                # Fall back to legacy extraction if wide processing fails
-                # proceed to legacy path below while recording error in results at end
+                # Fall back to legacy extraction if XLSX specialized processing fails.
+                # Proceed to legacy path below; will set err in results if needed.
                 pass
 
         # Legacy extraction path (txt, pdf, docx, or xlsx fallback)
