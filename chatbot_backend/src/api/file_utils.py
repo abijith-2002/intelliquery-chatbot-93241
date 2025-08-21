@@ -56,6 +56,94 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
         return "", f"Failed to extract '{filename}': {e}"
 
 
+# Helper to trim empty rows/cols and promote header if missing
+def _normalize_dataframe(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """
+    Clean DataFrame by:
+      - Dropping fully-empty rows/columns
+      - Stripping whitespace-only column names
+    Returns None if df is None.
+    """
+    if df is None:
+        return None
+    try:
+        # Drop fully empty rows and columns
+        df = df.dropna(how="all")
+        df = df.dropna(axis=1, how="all")
+        # If all columns are unnamed or blank, keep structure but rename to generic
+        if len(df.columns) > 0:
+            new_cols = []
+            for i, c in enumerate(df.columns):
+                s = str(c).strip()
+                new_cols.append(s if s != "" else f"col_{i+1}")
+            df.columns = new_cols
+    except Exception:
+        pass
+    return df
+
+
+def _try_read_excel_sheet(content: bytes, sheet_name: str, engine: Optional[str] = "openpyxl") -> Optional[pd.DataFrame]:
+    """
+    Attempt robust reads of a single sheet using pandas with multiple strategies:
+      1. engine specified
+      2. pandas default engine
+      3. header=None then promote first non-empty row to header
+    Returns a DataFrame (possibly empty) or None if all attempts fail.
+    """
+    # 1) engine specified
+    try:
+        df = pd.read_excel(io.BytesIO(content), sheet_name=sheet_name, engine=engine)
+        df = _normalize_dataframe(df)
+        if df is not None and (len(df.columns) == 0):
+            # Retry with header=None
+            raise ValueError("No columns detected; retry with header=None")
+        return df
+    except Exception as e1:
+        logger.debug(f"read_excel(engine={engine}) failed for sheet '{sheet_name}': {e1}")
+
+    # 2) default engine
+    try:
+        df = pd.read_excel(io.BytesIO(content), sheet_name=sheet_name)
+        df = _normalize_dataframe(df)
+        if df is not None and (len(df.columns) == 0):
+            raise ValueError("No columns detected; retry with header=None")
+        return df
+    except Exception as e2:
+        logger.debug(f"read_excel(default engine) failed for sheet '{sheet_name}': {e2}")
+
+    # 3) header=None then promote first non-empty row as header
+    try:
+        df = pd.read_excel(io.BytesIO(content), sheet_name=sheet_name, header=None)
+        df = _normalize_dataframe(df)
+        if df is not None and len(df) > 0:
+            # find first non-empty row to serve as header
+            first_non_empty_idx = None
+            for idx, row in df.iterrows():
+                if not row.isna().all():
+                    first_non_empty_idx = idx
+                    break
+            if first_non_empty_idx is not None:
+                header_row = df.iloc[first_non_empty_idx].astype(str).str.strip().tolist()
+                df = df.iloc[first_non_empty_idx + 1 :].reset_index(drop=True)
+                # Ensure unique, cleaned headers
+                cleaned_headers = []
+                seen = set()
+                for i, h in enumerate(header_row):
+                    h_clean = _clean_column_name(h or f"col_{i+1}")
+                    if h_clean in seen or h_clean == "":
+                        h_clean = f"col_{i+1}"
+                    cleaned_headers.append(h_clean)
+                    seen.add(h_clean)
+                df.columns = cleaned_headers
+                df = _normalize_dataframe(df)
+                return df
+        return df
+    except Exception as e3:
+        logger.debug(f"read_excel(header=None) failed for sheet '{sheet_name}': {e3}")
+
+    return None
+
+
 # PUBLIC_INTERFACE
 def process_excel_for_session(
     filename: str,
@@ -99,9 +187,24 @@ def process_excel_for_session(
                 bio_master.seek(0)
                 excel_file = pd.ExcelFile(bio_master)
             except Exception as e2:
-                return {}, f"Unable to open Excel file '{filename}': {e2}"
+                # As a last resort, try openpyxl to get sheet names
+                try:
+                    wb = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
+                    sheet_names = [ws.title for ws in wb.worksheets]
+                except Exception as e3:
+                    return {}, f"Unable to open Excel file '{filename}': {e2}; openpyxl fallback error: {e3}"
+                else:
+                    excel_file = None  # we will use sheet_names only
+                    logger.warning(f"Using openpyxl-derived sheet names for '{filename}' due to pandas failure.")
+                    # Proceed with sheet_names below
+                    pass
 
-        sheet_names = list(excel_file.sheet_names or [])
+        sheet_names = []
+        if 'excel_file' in locals() and excel_file is not None:
+            try:
+                sheet_names = list(excel_file.sheet_names or [])
+            except Exception as e:
+                logger.warning(f"Failed reading sheet_names via pandas for '{filename}': {e}")
         if not sheet_names:
             # As a fallback, try openpyxl directly to confirm sheet existence
             try:
@@ -133,18 +236,17 @@ def process_excel_for_session(
         # Process each sheet robustly
         for sheet_name in sheet_names:
             try:
-                # New BytesIO for each read to avoid stream pointer issues
-                df = pd.read_excel(io.BytesIO(content), sheet_name=sheet_name, engine=engine)
+                # Robust, multi-strategy sheet read
+                df = _try_read_excel_sheet(content, sheet_name, engine=engine)
 
-                # Some Excel sheets can be completely empty; skip them
-                if df is None or (hasattr(df, "empty") and df.empty and len(df.columns) == 0):
-                    logger.warning(f"Sheet '{sheet_name}' in '{filename}' appears empty. Skipping.")
+                # If still None or truly no structure, skip sheet
+                if df is None or (len(df.columns) == 0 and (len(df) == 0 or df.empty)):
+                    logger.warning(f"Sheet '{sheet_name}' in '{filename}' has no detectable columns/rows. Skipping.")
                     continue
 
                 # Clean column names
                 df.columns = [_clean_column_name(str(col)) for col in df.columns]
 
-                # If the sheet has no rows but has columns, keep it but mark counts appropriately
                 safe_sheet_name = _clean_column_name(sheet_name)
                 safe_filename = _clean_column_name(filename.replace('.xlsx', ''))
                 parquet_filename = f"{safe_filename}_{safe_sheet_name}.parquet"
@@ -186,7 +288,8 @@ def process_excel_for_session(
         except Exception as e_md:
             logger.error(f"Failed to write metadata JSON for '{filename}': {e_md}")
 
-        if metadata.get("total_rows", 0) == 0 and not metadata.get("sheets"):
+        # If no sheets dictionary populated at all, report error; but if sheets exist with zero rows, that's still valid
+        if not metadata.get("sheets"):
             return metadata, f"No rows or sheets detected in '{filename}'. Please verify the Excel file contents."
 
         return metadata, None
