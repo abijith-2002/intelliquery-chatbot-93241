@@ -339,7 +339,7 @@ def get_gemini_nl_answer_from_pandas(query: str, pandas_result_text: str) -> str
         str: A concise, plain-language answer phrased by Gemini.
     """
     if not pandas_result_text or not pandas_result_text.strip():
-        return ""
+        pandas_result_text = "no matching data found"
 
     key = get_gemini_api_key()
     if not key:
@@ -717,15 +717,67 @@ def chat(request: ChatRequest):
             schema_text, dfs_bundle = _build_schema_prompt(session_id)
             if schema_text and dfs_bundle:
                 pandas_code = _gemini_pandas_code_for_query(request.query, schema_text)
+
+                # Evaluate generated pandas safely
                 success, result_or_err = _safe_eval_pandas(pandas_code, dfs_bundle)
+
+                def _normalize_pandas_result_for_nl(res: Any) -> str:
+                    """
+                    Normalize a pandas evaluation output into a compact, user-friendly string
+                    that is safe for NL phrasing. Handles empty results gracefully.
+
+                    - If DataFrame/Series is empty, return 'no matching data found'.
+                    - If scalar/other type is None/NaN/empty-like, return the same placeholder.
+                    - Otherwise, render via _pandas_safe_to_string with defensive truncation.
+                    """
+                    try:
+                        import numpy as _np
+                    except Exception:
+                        _np = None  # type: ignore
+
+                    PLACEHOLDER = "no matching data found"
+
+                    # Empty DataFrame
+                    if isinstance(res, pd.DataFrame):
+                        if res.empty:
+                            return PLACEHOLDER
+                        return _pandas_safe_to_string(res)
+
+                    # Series or Index-like
+                    if isinstance(res, pd.Series):
+                        if res.empty:
+                            return PLACEHOLDER
+                        # If scalar-like selection sometimes returns a length-1 series, still display it
+                        return _pandas_safe_to_string(res)
+
+                    # Scalar or other objects
+                    # Explicitly treat None/NaN/NaT/empty string as no data
+                    if res is None:
+                        return PLACEHOLDER
+                    try:
+                        if _np is not None and (res is _np.nan or (_np.isnan(res) if isinstance(res, (float, int)) else False)):
+                            return PLACEHOLDER
+                    except Exception:
+                        pass
+                    if isinstance(res, str) and res.strip() == "":
+                        return PLACEHOLDER
+
+                    # Lists/dicts: try to detect emptiness
+                    if isinstance(res, (list, tuple, set, dict)) and len(res) == 0:
+                        return PLACEHOLDER
+
+                    # Default stringification with truncation
+                    s = _pandas_safe_to_string(res)
+                    return s if s.strip() else PLACEHOLDER
+
                 if success:
-                    pandas_context_summary = _pandas_safe_to_string(result_or_err)
+                    pandas_context_summary = _normalize_pandas_result_for_nl(result_or_err)
                 else:
-                    # include brief notice but avoid leaking internals; keep it compact
+                    # Include a compact note for Gemini phrasing and avoid leaking internals
                     pandas_context_summary = f"Pandas step note: {result_or_err}"
-        except Exception:
-            # Ignore pandas step failure silently to not block core chat
-            pandas_context_summary = ""
+        except Exception as e:
+            # Capture exceptions so flow never crashes; include brief note to aid NL phrasing
+            pandas_context_summary = f"Pandas step note: {e}"
 
         # If we have a pandas-derived result, ask Gemini to phrase a concise, direct answer from it.
         if pandas_context_summary:

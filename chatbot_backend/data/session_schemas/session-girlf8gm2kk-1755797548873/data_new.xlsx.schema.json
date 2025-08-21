@@ -1,0 +1,269 @@
+{
+  "sheets": [
+    {
+      "name": "Sheet1",
+      "columns": [
+        {
+          "name": "Customer Name",
+          "dtype": "string",
+          "top_values": [
+            "Best Buy",
+            "BBY",
+            "Xiaomi TV & SoundBar",
+            "Sony",
+            "Vizio"
+          ]
+        },
+        {
+          "name": "Model Year",
+          "dtype": "string",
+          "top_values": [
+            "2024 TPV",
+            "BBY_2025",
+            "Xiaomi TV 2025",
+            "Sony_2024",
+            "TPV_2024"
+          ]
+        },
+        {
+          "name": "Model Name",
+          "dtype": "string",
+          "top_values": [
+            "NS-50F501NA26",
+            "NS-43F501NA26",
+            "L43MB-FPEU",
+            "K-65S25M2_SR",
+            "V4K43M-0801"
+          ]
+        },
+        {
+          "name": "Date",
+          "dtype": "datetime",
+          "top_values": [
+            "20241129",
+            "2024-11-27 00:00:00"
+          ]
+        },
+        {
+          "name": "Platform",
+          "dtype": "string",
+          "top_values": [
+            "MT5586"
+          ]
+        },
+        {
+          "name": "Mode",
+          "dtype": "string",
+          "top_values": [
+            "Default",
+            "DIALOG_CLARITY_HIGH",
+            "DIALOG_CLARITY_LOW",
+            "DTS_VIRTUAL_X_MEDIUM",
+            "DIALOG_CLARITY_OFF"
+          ]
+        },
+        {
+          "name": "--virtualx-en",
+          "dtype": "string",
+          "top_values": [
+            "1",
+            "DEF",
+            "0"
+          ]
+        },
+        {
+          "name": "--virtualx-headroom-gain",
+          "dtype": "string",
+          "top_values": [
+            "DEF",
+            "1.000000000",
+            "1",
+            "0.8000",
+            "1.0"
+          ]
+        },
+        {
+          "name": "--virtualx-out-mode",
+          "dtype": "string",
+          "top_values": [
+            "0",
+            "DEF"
+          ]
+        },
+        {
+          "name": "--virtualx-processing-output-gain",
+          "dtype": "string",
+          "top_values": [
+            "DEF",
+            "1",
+            "1.2",
+            "1.0",
+            "0.8"
+          ]
+        },
+        {
+          "name": "--virtualx-in-mode",
+          "dtype": "string",
+          "top_values": [
+            "0",
+            "DEF"
+          ]
+        },
+        {
+          "name": "--virtualx-reference-level",
+          "dtype": "string",
+          "top_values": [
+            "DEF",
+            "1.000000000",
+            "1",
+            "1.0000",
+            "1.0"
+          ]
+        },
+        {
+          "name": "--virtualx-gain-compensation",
+          "dtype": "string",
+          "top_values": [
+            "DEF"
+          ]
+        },
+        {
+          "name": "--virtualx-discard",
+          "dtype": "string",
+          "top_values": [
+            "0",
+            "DEF"
+          ]
+        },
+        {
+          "name": "--virtualx-tsx-en",
+          "dtype": "string",
+          "top_values": [
+            "1",
+            "DEF",
+            "0"
+          ]
+        },
+        {
+          "name": "--virtualx-tsx-pssv-mtrx-en",
+          "dtype": "string",
+          "top_values": [
+            "1",
+            "DEF",
+            "0"
+          ]
+        },
+        {
+          "name": "--virtualx-tsx-horiznt-effect-ctrl",
+          "dtype": "string",
+          "top_values": [
+            "DEF",
+            "1",
+            "0"
+          ]
+        },
+        {
+          "name": "--virtualx-tsx-phantom-ctrgain",
+          "dtype": "string",
+          "top_values": [
+            "DEF",
+            "1.0",
+            "1",
+            "0",
+            "1.00000000"
+          ]
+        },
+        {
+          "name": "--virtualx-tsx-ctrgain",
+          "dtype": "string",
+          "top_values": [
+            "DEF",
+            "0.5",
+            "1.7",
+            "1.6",
+            "1.49619997"
+          ]
+        },
+        {
+          "name": "--virtualx-tsx-heightmix-coeff",
+          "dtype": "string",
+          "top_values": [
+            "DEF",
+            "1.0",
+            "0.5",
+            "1.00000000",
+            "0.85"
+          ]
+        },
+        {
+          "name": "--virtualx-tsx-height-out-gain",
+          "dtype": "string",
+          "top_values": [
+            "DEF",
+            "1.00000000",
+            "1",
+            "1.0000",
+            "1.0"
+          ]
+        },
+        {
+          "name": "--virtualx-tsx-precond-front",
+          "dtype": "string",
+          "top_values": [
+            "DEF",
+            "1",
+            "-0.200000003",
+            "-0.5",
+            "0.8"
+          ]
+        },
+        {
+          "name": "--virtualx-tsx-precond-surnd",
+          "dtype": "string",
+          "top_values": [
+            "DEF",
+            "1",
+            "0.100000001",
+            "-0.5",
+            "0.6"
+          ]
+        },
+        {
+          "name": "--virtualx-tsx-vxtopspk-loc",
+          "dtype": "string",
+          "top_values": [
+            "0",
+            "DEF"
+          ]
+        },
+        {
+          "name": "--virtualx-tsx-frnt-wide-en",
+          "dtype": "string",
+          "top_values": [
+            "1",
+            "DEF",
+            "0"
+          ]
+        },
+        {
+          "name": "--virtualx-tsx-hght-virtualizer-en",
+          "dtype": "string",
+          "top_values": [
+            "1",
+            "DEF",
+            "0"
+          ]
+        },
+        {
+          "name": "--virtualx-tsx-frnt-srnd-en",
+          "dtype": "string",
+          "top_values": [
+            "0",
+            "DEF",
+            "1"
+          ]
+        }
+      ]
+    }
+  ]
+}
