@@ -241,10 +241,12 @@ def extract_xlsx_wide_chunks(
         # Construct chunks by iterating rows in windows
         current_rows: List[List[Any]] = []
         start_row_idx = 2  # assuming row 1 is header
-        # Determine last row dynamically via the final buffer when flushing.
-        # Avoid storing ws.max_row to prevent linter warnings and ensure accurate metadata.
 
         def flush_chunk(rows: List[List[Any]], start_idx: int, end_idx: int):
+            """
+            Flushes the current buffer to a chunk with accurate metadata.
+            Ensures inclusive [Rows: start-end] and correct rX labels.
+            """
             if not rows:
                 return
             # Core metadata
@@ -260,8 +262,10 @@ def extract_xlsx_wide_chunks(
             for ridx, r in enumerate(rows):
                 row_vals = []
                 for ci in sampled_cols_idx:
+                    # Ensure we do not index beyond row width (normalize blank if short)
                     val = _stringify(r[ci] if ci < len(r) else "")
                     row_vals.append(f"{headers[ci]}={val}")
+                # Row label is the real Excel row number (1-based), e.g., r2..rN
                 body_lines.append(f"- r{start_idx + ridx}: " + "; ".join(row_vals))
 
             # Append condensed per-column stats (metadata-level)
@@ -280,14 +284,15 @@ def extract_xlsx_wide_chunks(
                     stats_lines.append(f"- {h}: " + ", ".join(_stringify(x) for x in stats_desc_parts))
 
             # Combine and enforce token budget by trimming body if needed
-            # Start with everything, then remove body rows until under budget.
             assembled = "\n".join(meta_lines + [""] + body_lines + [""] + stats_lines)
             tokens = _estimate_tokens(assembled)
             if tokens > max_tokens_per_chunk:
-                # Trim rows gradually
+                # Trim rows gradually but never produce an empty body
                 prunable = list(rows)
+                # Keep proportionally based on token budget; minimum of 5 rows to preserve tail visibility
                 keep = max(5, int(len(prunable) * max_tokens_per_chunk / max(tokens, 1)))
                 prunable = prunable[:keep]
+
                 body_lines_trim = []
                 body_lines_trim.append(f"[Sampled Columns: {', '.join(sampled_headers)}]")
                 body_lines_trim.append("Rows:")
@@ -298,33 +303,34 @@ def extract_xlsx_wide_chunks(
                         row_vals.append(f"{headers[ci]}={val}")
                     body_lines_trim.append(f"- r{start_idx + ridx}: " + "; ".join(row_vals))
                 body_lines_trim.append(f"... (trimmed; total rows in window: {len(rows)})")
+
                 assembled = "\n".join(meta_lines + [""] + body_lines_trim + [""] + stats_lines)
 
-                # final safety check
+                # final safety check: if still too large, drop stats lines
                 if _estimate_tokens(assembled) > max_tokens_per_chunk:
-                    # As last resort, drop stats lines
                     assembled = "\n".join(meta_lines + [""] + body_lines_trim)
 
             chunks.append(assembled)
 
         # Iterate through all data rows
         for row_number, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=2):
-            # Normalize row to header width
+            # Normalize row to header width (pad or trim to consistent column count)
             normalized = list(row or [])
             if len(normalized) < num_cols:
                 normalized.extend([""] * (num_cols - len(normalized)))
+            elif len(normalized) > num_cols:
+                normalized = normalized[:num_cols]
             current_rows.append(normalized)
 
+            # When buffer hits the configured window size, flush with inclusive end row = row_number
             if len(current_rows) >= row_chunk_size:
                 flush_chunk(current_rows, start_row_idx, row_number)
                 current_rows = []
-                start_row_idx = row_number + 1
+                start_row_idx = row_number + 1  # Next chunk starts on the very next row
 
-        # Flush remaining
+        # Flush remaining rows buffer.
+        # Compute the true inclusive end index from start_row_idx and buffered length.
         if current_rows:
-            # Use actual last row number included in the final buffer instead of ws.max_row.
-            # This ensures the [Rows: a-b] metadata reflects the true last indexed row and helps verify that
-            # rows beyond earlier windows (e.g., row 40) are indeed processed and indexed.
             final_end_row_number = start_row_idx + len(current_rows) - 1
             flush_chunk(current_rows, start_row_idx, final_end_row_number)
 
