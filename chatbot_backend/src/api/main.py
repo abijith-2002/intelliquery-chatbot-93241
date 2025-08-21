@@ -30,6 +30,8 @@ from .auth_utils import (
 from .chat_title import router as chat_title_router
 # Config utilities
 from .config_utils import get_gemini_api_key
+# Import new Excel processing utilities
+from .file_utils import process_excel_for_session
 
 # Load environment variables
 load_dotenv()
@@ -49,6 +51,10 @@ CONTEXT_STORE: Dict[str, Dict[str, Any]] = {}
 #       "embedding_model": str
 #   }
 RAG_INDEX_STORE: Dict[str, Dict[str, Any]] = {}
+
+# Per-session Excel metadata and Parquet file storage.
+# Structure: { session_id: [metadata_dict1, metadata_dict2, ...] }
+EXCEL_METADATA_STORE: Dict[str, List[Dict[str, Any]]] = {}
 
 app = FastAPI(
     title="IntelliQuery Chatbot API",
@@ -132,6 +138,19 @@ class UploadContextResponse(BaseModel):
     message: str = Field(..., description="Status message/acknowledgment")
 
 
+class ExcelQuestionRequest(BaseModel):
+    """Schema for Excel-specific question requests."""
+    session_id: str = Field(..., description="Session ID containing uploaded Excel files")
+    question: str = Field(..., description="Question about the Excel data")
+
+
+class ExcelQuestionResponse(BaseModel):
+    """Schema for Excel question responses."""
+    answer: str = Field(..., description="Answer based on Excel data analysis")
+    data_context: Optional[str] = Field(default=None, description="Relevant data context used for the answer")
+    metadata_used: List[str] = Field(default=[], description="List of Excel files/sheets used in the analysis")
+
+
 def _clean_gemini_output(text: str) -> str:
     """
     Removes leading/trailing meta, KB source, or disclaimer information from Gemini output.
@@ -152,7 +171,7 @@ def _clean_gemini_output(text: str) -> str:
     ]
     # Remove trailing variants
     TRAIL_PATTERNS = [
-        r"(?i)\(? *(?:based on (?:the )?(?:provided )?(?:knowledge ?base|context|sources)[^)]*)\)?[.!]? *$",
+        r"(?i)\(? *(?:based on (?:the )?(?:provided )?(?:knowledge ?base|context|sources)[^)]*\)?[.!]? *$",
         r"(?i)\(? *(?:from the knowledge base)[^)]*\)?[.!]? *$",
         r"(?i)\(? *(?:provided context)[^)]*\)?[.!]? *$",
     ]
@@ -294,6 +313,29 @@ def _index_text_for_session(session_id: str, filename: str, text: str):
     for chunk, vec in zip(chunks, vectors):
         store["chunks"].append({"text": chunk, "filename": filename})
         store["embeddings"].append(vec)  # vec could be None; retrieval handles fallback
+
+
+def _create_excel_text_summary(metadata: Dict[str, Any]) -> str:
+    """Create a text summary from Excel metadata for embedding and retrieval."""
+    summary_parts = [f"Excel file: {metadata.get('filename', 'Unknown')}"]
+    
+    for sheet_name, sheet_info in metadata.get('sheets', {}).items():
+        summary_parts.append(f"\nSheet: {sheet_name}")
+        summary_parts.append(f"Rows: {sheet_info.get('row_count', 0)}, Columns: {sheet_info.get('column_count', 0)}")
+        
+        # Add column information
+        columns_info = []
+        for col_name, col_data in sheet_info.get('columns', {}).items():
+            col_desc = f"{col_name} ({col_data.get('dtype', 'unknown')})"
+            if col_data.get('sample_values'):
+                sample_str = ', '.join(str(v) for v in col_data['sample_values'][:3])
+                col_desc += f" - examples: {sample_str}"
+            columns_info.append(col_desc)
+        
+        if columns_info:
+            summary_parts.append(f"Columns: {'; '.join(columns_info[:10])}")  # Limit to first 10 columns
+    
+    return '\n'.join(summary_parts)
 
 
 def _vector_search(session_id: str, query: str, top_k: int = 3) -> List[str]:
@@ -548,6 +590,7 @@ def chat_wsinfo():
         "Accepts one or more files via multipart/form-data and extracts readable text from supported types "
         "(.docx, .xlsx, .pdf, .txt). The extracted content is stored per session and used as additional context "
         "when answering subsequent chat queries. Builds a vector index (Gemini embeddings) for semantic retrieval. "
+        "Excel files are processed with pandas and stored as Parquet for structured querying. "
         "Returns an acknowledgment with per-file processing results and a preview."
     ),
     responses={
@@ -568,6 +611,7 @@ def upload_chat_context(
         - Split into overlapping chunks.
         - Embed each chunk using Gemini embeddings (if API key available).
         - Store chunks and embeddings in a per-session in-memory index for retrieval.
+        - For Excel files: process with pandas, store as Parquet, extract metadata.
 
     Args:
         session_id (str): The chat session ID.
@@ -601,22 +645,56 @@ def upload_chat_context(
             continue
 
         size = len(data or b"")
-        # Extract
-        text, err = extract_text_from_bytes(filename, data or b"")
-        preview = summarize_text_preview(text, max_chars=500) if text else ""
-        chars = len(text)
-
-        # Append to combined only if successful and non-empty
-        if text and not err:
-            combined_text_parts.append(f"[{filename}]\n{text}\n")
-            total_chars += chars
-
-            # Build semantic index: chunk + embed + store
+        
+        # Handle Excel files with structured processing
+        if filename.lower().endswith('.xlsx'):
             try:
-                _index_text_for_session(session_id, filename, text)
-            except Exception:
-                # Do not fail upload on indexing failure; retrieval will fall back gracefully.
-                pass
+                excel_metadata, excel_err = process_excel_for_session(filename, data or b"", session_id)
+                if excel_metadata and not excel_err:
+                    # Store Excel metadata for the session
+                    if session_id not in EXCEL_METADATA_STORE:
+                        EXCEL_METADATA_STORE[session_id] = []
+                    EXCEL_METADATA_STORE[session_id].append(excel_metadata)
+                    
+                    # Create a summary for text indexing
+                    text_summary = _create_excel_text_summary(excel_metadata)
+                    combined_text_parts.append(f"[{filename} - Excel Data Summary]\n{text_summary}\n")
+                    total_chars += len(text_summary)
+                    
+                    # Index the summary for retrieval
+                    try:
+                        _index_text_for_session(session_id, filename, text_summary)
+                    except Exception:
+                        pass
+                    
+                    preview = f"Excel file with {excel_metadata.get('total_rows', 0)} total rows across {len(excel_metadata.get('sheets', {}))} sheets"
+                    chars = len(text_summary)
+                    err = None
+                else:
+                    preview = ""
+                    chars = 0
+                    err = excel_err
+            except Exception as e:
+                preview = ""
+                chars = 0
+                err = f"Excel processing failed: {e}"
+        else:
+            # Regular text extraction for non-Excel files
+            text, err = extract_text_from_bytes(filename, data or b"")
+            preview = summarize_text_preview(text, max_chars=500) if text else ""
+            chars = len(text)
+
+            # Append to combined only if successful and non-empty
+            if text and not err:
+                combined_text_parts.append(f"[{filename}]\n{text}\n")
+                total_chars += chars
+
+                # Build semantic index: chunk + embed + store
+                try:
+                    _index_text_for_session(session_id, filename, text)
+                except Exception:
+                    # Do not fail upload on indexing failure; retrieval will fall back gracefully.
+                    pass
 
         results.append(
             UploadedFileResult(
@@ -654,3 +732,111 @@ def upload_chat_context(
         total_chars=total_chars,
         message=message,
     )
+
+
+# PUBLIC_INTERFACE
+@app.post(
+    "/chat/ask-excel-question",
+    response_model=ExcelQuestionResponse,
+    tags=["Chat"],
+    summary="Ask questions about uploaded Excel data",
+    description=(
+        "Submit questions specifically about Excel data uploaded for the session. "
+        "Uses structured metadata and Parquet data for precise analysis. "
+        "Returns answers based on the actual Excel data structure and content."
+    ),
+    responses={
+        400: {"description": "No Excel data found for session or invalid request"},
+        500: {"description": "Error processing Excel question"},
+    },
+)
+def ask_excel_question(request: ExcelQuestionRequest):
+    """
+    PUBLIC_INTERFACE
+    Handle questions specifically about Excel data using structured metadata and Parquet files.
+    
+    This endpoint provides more precise answers for Excel-specific queries by leveraging
+    the structured metadata extracted during upload and stored Parquet data.
+    
+    Args:
+        request (ExcelQuestionRequest): The Excel question request with session_id and question.
+    
+    Returns:
+        ExcelQuestionResponse: Answer with data context and metadata information.
+    """
+    session_id = request.session_id
+    question = request.question
+    
+    # Get Excel metadata for the session
+    excel_metadata_list = EXCEL_METADATA_STORE.get(session_id, [])
+    if not excel_metadata_list:
+        raise HTTPException(
+            status_code=400, 
+            detail="No Excel data found for this session. Please upload Excel files first."
+        )
+    
+    try:
+        # Prepare context from Excel metadata
+        data_context_parts = []
+        metadata_used = []
+        
+        for metadata in excel_metadata_list:
+            filename = metadata.get('filename', 'Unknown')
+            metadata_used.append(filename)
+            
+            # Add file summary
+            data_context_parts.append(f"\n=== {filename} ===")
+            data_context_parts.append(f"Total sheets: {len(metadata.get('sheets', {}))}")
+            data_context_parts.append(f"Total rows: {metadata.get('total_rows', 0)}")
+            data_context_parts.append(f"Total columns: {metadata.get('total_columns', 0)}")
+            
+            # Add detailed sheet information
+            for sheet_name, sheet_info in metadata.get('sheets', {}).items():
+                data_context_parts.append(f"\nSheet '{sheet_name}':")
+                data_context_parts.append(f"  - {sheet_info.get('row_count', 0)} rows, {sheet_info.get('column_count', 0)} columns")
+                
+                # Add column details
+                columns = sheet_info.get('columns', {})
+                if columns:
+                    data_context_parts.append("  - Columns:")
+                    for col_name, col_data in list(columns.items())[:10]:  # Limit to first 10 columns
+                        col_type = col_data.get('dtype', 'unknown')
+                        sample_vals = col_data.get('sample_values', [])
+                        sample_str = ', '.join(str(v) for v in sample_vals[:3]) if sample_vals else 'No samples'
+                        data_context_parts.append(f"    * {col_name} ({col_type}): {sample_str}")
+        
+        data_context = '\n'.join(data_context_parts)
+        
+        # Generate answer using Gemini with Excel-specific context
+        excel_prompt = (
+            f"You are a data analyst. Answer the following question about Excel data:\n"
+            f"Question: {question}\n\n"
+            f"Available Excel Data Context:\n{data_context}\n\n"
+            f"Please provide a clear, specific answer based on the Excel data structure and content shown above. "
+            f"If the question requires specific data values that aren't shown in the context, "
+            f"explain what information is available and suggest how to get the specific data needed."
+        )
+        
+        gemini_api_key = get_gemini_api_key()
+        if not gemini_api_key:
+            raise HTTPException(status_code=500, detail="Gemini API key not configured")
+        
+        try:
+            import google.generativeai as genai
+            genai.configure(api_key=gemini_api_key)
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            response = model.generate_content([{"role": "user", "parts": [excel_prompt]}])
+            answer = response.text.strip()
+        except Exception as e:
+            answer = f"Unable to generate answer using AI: {e}. Based on the uploaded Excel data, I can see {len(excel_metadata_list)} file(s) with a total of {sum(m.get('total_rows', 0) for m in excel_metadata_list)} rows across {sum(len(m.get('sheets', {})) for m in excel_metadata_list)} sheets."
+        
+        return ExcelQuestionResponse(
+            answer=answer,
+            data_context=data_context[:2000] if len(data_context) > 2000 else data_context,  # Truncate if too long
+            metadata_used=metadata_used
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing Excel question: {e}")
