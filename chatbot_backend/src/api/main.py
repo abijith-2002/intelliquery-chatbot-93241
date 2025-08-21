@@ -564,10 +564,17 @@ def upload_chat_context(
     Upload and process files to add user-provided context for a given chat session.
 
     Process:
-        - Extract readable text.
-        - Split into overlapping chunks.
+        - Extract readable text or token-limited chunks (for wide Excel).
+        - Split text into overlapping chunks (non-wide) OR use row-based chunks (wide Excel).
         - Embed each chunk using Gemini embeddings (if API key available).
         - Store chunks and embeddings in a per-session in-memory index for retrieval.
+
+    Wide Excel handling:
+        For .xlsx files with large number of columns (e.g., >700), this endpoint will:
+          - Produce chunk texts that include full column metadata, but only sample a subset
+            of columns for detailed row values.
+          - Optionally append per-column statistics.
+          - Ensure each chunk remains within a target token budget for LLM prompt safety.
 
     Args:
         session_id (str): The chat session ID.
@@ -576,7 +583,11 @@ def upload_chat_context(
     Returns:
         UploadContextResponse: Processing results and acknowledgment.
     """
-    from .file_utils import extract_text_from_bytes, summarize_text_preview
+    from .file_utils import (
+        extract_text_from_bytes,
+        summarize_text_preview,
+        extract_xlsx_wide_chunks,
+    )
 
     if not session_id or not isinstance(session_id, str):
         raise HTTPException(status_code=400, detail="session_id must be provided as a non-empty string.")
@@ -589,6 +600,7 @@ def upload_chat_context(
 
     for f in files:
         filename = f.filename or "unnamed"
+        name_lower = (filename or "").lower()
         # Read file bytes
         try:
             data = f.file.read()
@@ -601,30 +613,70 @@ def upload_chat_context(
             continue
 
         size = len(data or b"")
-        # Extract
+
+        # Specialized wide-Excel flow
+        indexed_any = False
+        if name_lower.endswith(".xlsx"):
+            try:
+                # Extract wide-aware chunks
+                wide_chunks = extract_xlsx_wide_chunks(
+                    data or b"",
+                    max_tokens_per_chunk=1200,
+                    row_chunk_size=100,
+                    base_sample_columns=5,
+                    random_sample_columns=3,
+                    stats_sample_rows=200,
+                )
+                if wide_chunks:
+                    # Index each chunk
+                    for idx, ch in enumerate(wide_chunks, start=1):
+                        try:
+                            _index_text_for_session(session_id, f"{filename}#chunk{idx}", ch)
+                            combined_text_parts.append(f"[{filename}#chunk{idx}]\n{ch}\n")
+                            total_chars += len(ch)
+                            indexed_any = True
+                        except Exception:
+                            # Indexing failure for one chunk should not break the entire upload
+                            pass
+
+                    # Preview from first chunk for UI purposes
+                    preview = summarize_text_preview(wide_chunks[0], max_chars=500)
+                    results.append(
+                        UploadedFileResult(
+                            filename=filename,
+                            size=size,
+                            content_chars=sum(len(c) for c in wide_chunks),
+                            preview=preview,
+                            error=None,
+                        )
+                    )
+                    continue  # move to next file after wide handling
+            except Exception:
+                # Fall back to legacy extraction if wide processing fails
+                # proceed to legacy path below while recording error in results at end
+                pass
+
+        # Legacy extraction path (txt, pdf, docx, or xlsx fallback)
         text, err = extract_text_from_bytes(filename, data or b"")
         preview = summarize_text_preview(text, max_chars=500) if text else ""
         chars = len(text)
 
-        # Append to combined only if successful and non-empty
         if text and not err:
             combined_text_parts.append(f"[{filename}]\n{text}\n")
             total_chars += chars
-
-            # Build semantic index: chunk + embed + store
             try:
                 _index_text_for_session(session_id, filename, text)
+                indexed_any = True
             except Exception:
-                # Do not fail upload on indexing failure; retrieval will fall back gracefully.
                 pass
 
         results.append(
             UploadedFileResult(
                 filename=filename,
                 size=size,
-                content_chars=chars,
+                content_chars=(sum(len(c) for c in wide_chunks) if name_lower.endswith(".xlsx") and indexed_any else chars),
                 preview=preview,
-                error=err,
+                error=(None if indexed_any and not err else err),
             )
         )
 
