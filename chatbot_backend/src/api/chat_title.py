@@ -62,7 +62,7 @@ async def generate_title(request: TitleRequest) -> str:
         title = response.text.strip()
         # Clean up output: remove extra punctuation/quotes, ensure single line
         import re
-        title = re.sub(r"^[\"'`]+|[\"'`]+$", "", title)
+        title = re.sub(r'^["\'\`]+|["\'\`]+$', "", title)
         title = title.replace("\n", " ").replace("\r", " ")
         if not title or len(title) < 3:
             raise ValueError("Gemini did not return a valid title")
