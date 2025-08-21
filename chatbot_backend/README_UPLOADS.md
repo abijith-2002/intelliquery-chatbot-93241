@@ -11,11 +11,19 @@ Environment variables (set in .env):
 - CHATBOT_EXCEL_SCHEMA_MAX_SAMPLE_ROWS: Cap for rows per sheet used when building schema/stats to avoid heavy memory/time usage. Default: 10000.
 
 Operational notes:
-- The upload handler now reads files in 1 MB chunks asynchronously and enforces per-file and total limits.
+- The upload handler reads files in 1 MB chunks and enforces per-file and total limits.
 - If processing exceeds the request wall time, it returns early with partial results to avoid 504. Embedding/index building can be offloaded to background tasks.
-- Excel schema extraction performs sampling to limit heavy statistics on very large sheets. You can set CHATBOT_PARSE_EXCEL_ON_UPLOAD=false to defer full Excel parsing to later endpoints if needed.
+- Excel schema extraction performs sampling to limit heavy statistics on very large sheets. The generated schema includes "notes" and per-sheet "truncated" flags when sampling is applied.
+- Excel text previews add explicit warnings like "[...] (preview truncated...)" and "[warning] Large sheet preview was truncated..." so users know when data is partially shown for performance.
+- If `CHATBOT_PARSE_EXCEL_ON_UPLOAD` is `false`, Excel parsing is deferred but the UI preview includes a notice that schema will be built at query time.
 
 Common pitfalls:
 - A 422 Unprocessable Entity typically indicates the request was not sent as multipart/form-data. Ensure you send:
   - form field 'session_id' (string)
   - file field(s) 'files' (one or more). Supported: .txt, .pdf, .docx, .xlsx.
+
+Troubleshooting large Excel files not appearing:
+- Ensure total request size and per-file size are below the configured limits and any reverse proxy limits.
+- Check that previews show truncation warnings; large sheets are included even when truncated.
+- If Excel parsing is skipped due to memory or time limits, the file still appears with a warning in the preview; schema is either deferred or partially built from sampled rows.
+- Increase `CHATBOT_EXCEL_SCHEMA_MAX_SAMPLE_ROWS` cautiously if you need deeper schema statistics, or decrease it to reduce CPU/memory pressure.

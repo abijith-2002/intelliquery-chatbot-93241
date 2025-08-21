@@ -81,13 +81,18 @@ def _extract_docx(content: bytes) -> str:
 
 
 def _extract_xlsx(content: bytes) -> str:
-    """Extract text from XLSX using openpyxl (sheet by sheet, TSV rows), with row limits to avoid memory explosions."""
+    """Extract text from XLSX using openpyxl (sheet by sheet, TSV rows), with row limits to avoid memory explosions.
+
+    Adds explicit user-facing warnings when previews are truncated due to size limits so large files are still visible
+    in the context list with a clear notice.
+    """
     bio = io.BytesIO(content)
     wb = load_workbook(bio, data_only=True, read_only=True)
     parts: List[str] = []
     # Hard cap to avoid building extremely large previews
     MAX_ROWS_PER_SHEET_PREVIEW = 5000
     for ws in wb.worksheets:
+        truncated = False
         parts.append(f"[Sheet: {ws.title}]")
         row_count = 0
         for row in ws.iter_rows(values_only=True):
@@ -102,8 +107,14 @@ def _extract_xlsx(content: bytes) -> str:
                 parts.append("\t".join(vals))
                 row_count += 1
                 if row_count >= MAX_ROWS_PER_SHEET_PREVIEW:
-                    parts.append("[...] (preview truncated)")
+                    truncated = True
+                    parts.append(f"[...] (preview truncated after {MAX_ROWS_PER_SHEET_PREVIEW} rows for this sheet)")
                     break
+        if truncated:
+            parts.append(
+                "[warning] Large sheet preview was truncated to avoid slowing uploads. "
+                "This does not affect stored data; full data is available for Excel queries."
+            )
         parts.append("")  # blank line between sheets
     return "\n".join(parts).strip()
 

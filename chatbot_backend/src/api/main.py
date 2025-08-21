@@ -745,42 +745,52 @@ def upload_chat_context(
         chars = len(text)
 
         # Excel parsing: optionally defer heavy DataFrame extraction
-        if filename.lower().endswith(".xlsx") and not err and PARSE_EXCEL_ON_UPLOAD and size > 0:
-            try:
-                # Build a reduced-size schema by sampling, to avoid large memory/time usage
-                sheets = parse_xlsx_to_dataframe(data or b"")
-                # Downsample large sheets before schema to reduce heavy stats
-                sampled_sheets = {}
-                for sname, sdf in sheets.items():
-                    if sdf is None:
-                        sampled_sheets[sname] = sdf
-                    else:
-                        if EXCEL_SCHEMA_MAX_SAMPLE_ROWS > 0 and getattr(sdf, "shape", (0, 0))[0] > EXCEL_SCHEMA_MAX_SAMPLE_ROWS:
-                            sampled_sheets[sname] = sdf.head(EXCEL_SCHEMA_MAX_SAMPLE_ROWS)
-                        else:
+        if filename.lower().endswith(".xlsx") and not err and size > 0:
+            if not PARSE_EXCEL_ON_UPLOAD:
+                # We still want the UI to know there is Excel content even if deferring parse.
+                preview = (preview + " [Excel parsing deferred by server configuration; schema will be built when querying.]").strip()
+            else:
+                try:
+                    # Build a reduced-size schema by sampling, to avoid large memory/time usage
+                    sheets = parse_xlsx_to_dataframe(data or b"")
+                    # Downsample large sheets before schema to reduce heavy stats
+                    sampled_sheets = {}
+                    any_truncated = False
+                    for sname, sdf in sheets.items():
+                        if sdf is None:
                             sampled_sheets[sname] = sdf
-                # Choose default df: first non-empty sheet; otherwise first sheet
-                chosen_df = None
-                for sname, sdf in sheets.items():
-                    try:
-                        if sdf is not None and not sdf.empty:
-                            chosen_df = sdf
-                            break
-                    except Exception:
-                        continue
-                if chosen_df is None and sheets:
-                    chosen_df = next(iter(sheets.values()))
-                # Build schema; if a sheet is massive with many columns, this can still be heavy, so guard with try/except
-                schema = build_schema_for_gemini(sampled_sheets, max_examples_per_col=3, max_rows_per_sheet=EXCEL_SCHEMA_MAX_SAMPLE_ROWS)
-                EXCEL_STORE[session_id] = {
-                    "df": chosen_df,
-                    "sheets": sheets,
-                    "schema": schema,
-                }
-            except MemoryError as me:
-                preview = (preview + f" [Excel parsing skipped due to memory limits: {me}]").strip()
-            except Exception as e:
-                preview = (preview + f" [Excel parsing warning: {e}]").strip()
+                        else:
+                            if EXCEL_SCHEMA_MAX_SAMPLE_ROWS > 0 and getattr(sdf, "shape", (0, 0))[0] > EXCEL_SCHEMA_MAX_SAMPLE_ROWS:
+                                sampled_sheets[sname] = sdf.head(EXCEL_SCHEMA_MAX_SAMPLE_ROWS)
+                                any_truncated = True
+                            else:
+                                sampled_sheets[sname] = sdf
+                    # Choose default df: first non-empty sheet; otherwise first sheet
+                    chosen_df = None
+                    for sname, sdf in sheets.items():
+                        try:
+                            if sdf is not None and not sdf.empty:
+                                chosen_df = sdf
+                                break
+                        except Exception:
+                            continue
+                    if chosen_df is None and sheets:
+                        chosen_df = next(iter(sheets.values()))
+                    # Build schema with truncation notes
+                    schema = build_schema_for_gemini(sampled_sheets, max_examples_per_col=3, max_rows_per_sheet=EXCEL_SCHEMA_MAX_SAMPLE_ROWS)
+                    if any_truncated:
+                        # Add a user-facing note into the preview so large files clearly show up with a warning.
+                        preview = (preview + f" [schema built from first {EXCEL_SCHEMA_MAX_SAMPLE_ROWS} rows per sheet; truncated for speed]").strip()
+                    # Store regardless of size (always include schema)
+                    EXCEL_STORE[session_id] = {
+                        "df": chosen_df,
+                        "sheets": sheets,
+                        "schema": schema,
+                    }
+                except MemoryError as me:
+                    preview = (preview + f" [Excel parsing skipped due to memory limits; try reducing file size or sheets. Error: {me}]").strip()
+                except Exception as e:
+                    preview = (preview + f" [Excel parsing warning: {e}]").strip()
 
         # Append to combined only if successful and non-empty
         if text and not err:

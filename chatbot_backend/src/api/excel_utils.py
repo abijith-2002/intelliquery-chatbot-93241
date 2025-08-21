@@ -153,6 +153,9 @@ def build_schema_for_gemini(
     The schema includes sheets, column names, dtypes (generalized), count, null counts,
     null percentages, and basic statistics per column. Includes a few sample values.
 
+    Adds a 'notes' list to the schema and per-sheet entries indicating when sampling/truncation
+    was applied due to size limits so that the UI can warn users clearly.
+
     Args:
         sheets: Mapping of sheet name -> DataFrame.
         max_examples_per_col: Number of example values stored for each column.
@@ -161,20 +164,32 @@ def build_schema_for_gemini(
         Dict[str, Any]: Structured schema description suitable for prompting Gemini.
     """
     schema: Dict[str, Any] = {
-        "sheets": []
+        "sheets": [],
+        "notes": []
     }
 
     for sheet_name, df in sheets.items():
+        original_rows = int(getattr(df, "shape", (0, 0))[0]) if isinstance(df, pd.DataFrame) else 0
+        sampled = False
         # Optionally sample to limit heavy describe() on massive sheets
         if max_rows_per_sheet is not None and isinstance(df, pd.DataFrame) and df.shape[0] > max_rows_per_sheet:
             df = df.head(max_rows_per_sheet)
+            sampled = True
         sheet_info: Dict[str, Any] = {
             "name": sheet_name,
-            "rows": int(df.shape[0]),
-            "cols": int(df.shape[1]),
+            "rows": int(df.shape[0]) if isinstance(df, pd.DataFrame) else 0,
+            "cols": int(df.shape[1]) if isinstance(df, pd.DataFrame) else 0,
             "columns": []
         }
-        if df.empty:
+        if sampled:
+            sheet_info["truncated"] = True
+            sheet_info["truncated_at_rows"] = int(max_rows_per_sheet or 0)
+            sheet_info["original_rows_estimate"] = original_rows
+            schema["notes"].append(
+                f"Sheet '{sheet_name}' truncated to {max_rows_per_sheet} rows for schema/stats to avoid long processing."
+            )
+
+        if not isinstance(df, pd.DataFrame) or df.empty:
             schema["sheets"].append(sheet_info)
             continue
 
