@@ -284,6 +284,57 @@ def _pandas_safe_to_string(obj: Any, max_rows: int = 20, max_chars: int = 4000) 
     except Exception:
         return str(obj)
 
+
+# PUBLIC_INTERFACE
+def get_gemini_nl_answer_from_pandas(query: str, pandas_result_text: str) -> str:
+    """
+    PUBLIC_INTERFACE
+    Given the user's original query and the textual representation of a pandas result,
+    ask Gemini to produce a concise, direct natural-language answer without referencing code,
+    schemas, or internal processing steps.
+
+    Args:
+        query (str): The original user question.
+        pandas_result_text (str): The pandas result converted to a readable text table/value.
+
+    Returns:
+        str: A concise, plain-language answer phrased by Gemini.
+
+    Notes:
+        - The prompt explicitly forbids mentioning the schema, code generation, or pandas.
+        - The function returns a cleaned answer (meta text removed); if Gemini fails,
+          a minimal fallback is returned using the plain pandas result text.
+    """
+    if not pandas_result_text or not pandas_result_text.strip():
+        return ""
+
+    key = get_gemini_api_key()
+    if not key:
+        # If we don't have Gemini available, just return the tabular summary as-is
+        return pandas_result_text.strip()
+
+    instruction = (
+        "Using ONLY the result table/value below and the user's question, produce a brief, direct answer. "
+        "Do NOT reference code, pandas, dataframes, or schemas. "
+        "Avoid meta explanations or caveats. Keep it concise and to the point."
+    )
+    prompt = (
+        f"{instruction}\n\n"
+        f"User question:\n{query}\n\n"
+        f"Result:\n{pandas_result_text}\n\n"
+        f"Answer:"
+    )
+
+    try:
+        genai.configure(api_key=key)
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        resp = model.generate_content([{"role": "user", "parts": [prompt]}])
+        text = (resp.text or "").strip()
+        return _clean_gemini_output(text) if text else pandas_result_text.strip()
+    except Exception:
+        # On any Gemini error, degrade gracefully to the computed result text
+        return pandas_result_text.strip()
+
 def _build_schema_prompt(session_id: str) -> Tuple[str, Dict[str, Dict[str, pd.DataFrame]]]:
     """
     Construct a concise schema description and return also the DataFrame store mapping for evaluation.
@@ -621,28 +672,28 @@ def chat(request: ChatRequest):
             # Ignore pandas step failure silently to not block core chat
             pandas_context_summary = ""
 
-        # Prepare combined extra context: vector retrieved chunks + pandas result (if any)
-        extra_parts = []
-        if retrieved_context:
-            extra_parts.append(retrieved_context)
+        # If we have a pandas-derived result, ask Gemini to phrase a concise, direct answer from it.
         if pandas_context_summary:
-            extra_parts.append(f"[DataFrames derived result]\n{pandas_context_summary}")
-        combined_extra = "\n\n".join(extra_parts).strip()
-
-        # Compose Gemini answer with combined extra context (if any)
-        try:
-            gemini_answer = get_gemini_response(request.query, memory, extra_context=combined_extra)
-        except Exception as e:
-            gemini_answer = "[Gemini unavailable: {}]".format(e)
+            final_answer = get_gemini_nl_answer_from_pandas(request.query, pandas_context_summary)
+        else:
+            # Otherwise, prepare combined extra context from vector retrieval and ask Gemini directly.
+            extra_parts = []
+            if retrieved_context:
+                extra_parts.append(retrieved_context)
+            combined_extra = "\n\n".join(extra_parts).strip()
+            try:
+                final_answer = get_gemini_response(request.query, memory, extra_context=combined_extra)
+            except Exception as e:
+                final_answer = "[Gemini unavailable: {}]".format(e)
 
         # Final output cleaning and save in memory
-        gemini_answer = _clean_gemini_output(_safe_str_output(gemini_answer))
+        final_answer = _clean_gemini_output(_safe_str_output(final_answer))
         try:
-            memory.save_context({"input": request.query}, {"output": _safe_str_output(gemini_answer)})
+            memory.save_context({"input": request.query}, {"output": _safe_str_output(final_answer)})
         except Exception:
             pass  # Do not raise for failed memory update
 
-        return ChatAnswerResponse(answer=gemini_answer)
+        return ChatAnswerResponse(answer=final_answer)
 
     except HTTPException:
         raise  # Allow FastAPI HTTPExceptions to propagate
