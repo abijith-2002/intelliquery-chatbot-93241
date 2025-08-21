@@ -155,33 +155,49 @@ def _clean_gemini_output(text: str) -> str:
     """
     Removes leading/trailing meta, KB source, or disclaimer information from Gemini output.
     Ensures only direct answers are delivered to the user.
+    This implementation safely compiles regex patterns to avoid crashes from malformed patterns.
     """
     import re
-    META_PATTERNS = [
-        # Remove variants at start of the answer
-        r"(?i)^ *(?:based on (?:the )?(?:provided )?(?:knowledge ?base|context|sources)[^:]*:?)",
-        r"(?i)^(?:as an?\s+[^\s:,]+ [^\s:,]+,?)[\s:.-]*",
-        r"(?i)^ *(?:this information[^:]*:?)",
-        r"(?i)^ *(?:note:)[^\n\r]*",
-        r"(?i)^ *(?:please note)[^\n\r]*",
-        r"(?i)^ *(?:source[sd]?:)[^\n\r]*",
-        r"(?i)^ *(?:from the knowledge base[^:]*:?)",
-        r"(?i)^ *(?:provided context[^:]*:?)",
-        r"(?i)^\(?(?:based on|as an ai language model|this information|provided context)[^\)]*\)?",
+
+    def _safe_compile(pattern: str, flags=0):
+        try:
+            return re.compile(pattern, flags)
+        except re.error:
+            # If a pattern is malformed, skip it rather than raising at runtime.
+            return None
+
+    # Define patterns as raw strings, carefully escaping parentheses when used literally.
+    meta_pattern_strs = [
+        r"^ *(?:based on (?:the )?(?:provided )?(?:knowledge ?base|context|sources)[^:]*:?)",
+        r"^(?:as an?\s+[^\s:,]+ [^\s:,]+,?)[\s:.\-]*",
+        r"^ *(?:this information[^:]*:?)",
+        r"^ *(?:note:)[^\n\r]*",
+        r"^ *(?:please note)[^\n\r]*",
+        r"^ *(?:source[sd]?:)[^\n\r]*",
+        r"^ *(?:from the knowledge base[^:]*:?)",
+        r"^ *(?:provided context[^:]*:?)",
+        # Leading parenthetical meta like "(based on ...)" or "(as an ai language model ...)"
+        r"^\(?(?:based on|as an ai language model|this information|provided context)[^\)]*\)?",
     ]
-    # Remove trailing variants
-    TRAIL_PATTERNS = [
-        r"(?i)\(? *(?:based on (?:the )?(?:provided )?(?:knowledge ?base|context|sources)[^)]*\)?[.!]? *$",
-        r"(?i)\(? *(?:from the knowledge base)[^)]*\)?[.!]? *$",
-        r"(?i)\(? *(?:provided context)[^)]*\)?[.!]? *$",
+    trail_pattern_strs = [
+        r"\(? *(?:based on (?:the )?(?:provided )?(?:knowledge ?base|context|sources)[^)]*\)?[.!]? *$",
+        r"\(? *(?:from the knowledge base)[^)]*\)?[.!]? *$",
+        r"\(? *(?:provided context)[^)]*\)?[.!]? *$",
     ]
+
+    meta_patterns = [
+        p for p in ( _safe_compile(s, re.IGNORECASE | re.MULTILINE) for s in meta_pattern_strs ) if p is not None
+    ]
+    trail_patterns = [
+        p for p in ( _safe_compile(s, re.IGNORECASE | re.MULTILINE) for s in trail_pattern_strs ) if p is not None
+    ]
+
     clean_text = text
-    for pat in META_PATTERNS:
-        clean_text = re.sub(pat, "", clean_text, flags=re.IGNORECASE | re.MULTILINE)
-    for pat in TRAIL_PATTERNS:
-        clean_text = re.sub(pat, "", clean_text, flags=re.IGNORECASE | re.MULTILINE)
-    clean_text = clean_text.strip()
-    return clean_text
+    for pat in meta_patterns:
+        clean_text = pat.sub("", clean_text)
+    for pat in trail_patterns:
+        clean_text = pat.sub("", clean_text)
+    return clean_text.strip()
 
 
 # --- CONTEXT + RAG UTILITIES ---
