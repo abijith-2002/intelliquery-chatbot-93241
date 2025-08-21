@@ -50,6 +50,34 @@ CONTEXT_STORE: Dict[str, Dict[str, Any]] = {}
 #   }
 RAG_INDEX_STORE: Dict[str, Dict[str, Any]] = {}
 
+# Per-session in-memory XLSX schema store.
+# Structure:
+#   XLSX_SCHEMA_STORE[session_id] = {
+#       "<workbook_id or filename>": {
+#           "sheets": [
+#               {
+#                   "name": str,
+#                   "columns": [
+#                       {"name": str, "dtype": str, "top_values": [Any, ...]}
+#                   ]
+#               }, ...
+#           ]
+#       }, ...
+#   }
+XLSX_SCHEMA_STORE: Dict[str, Dict[str, Any]] = {}
+
+# Per-session in-memory pandas DataFrame store.
+# Structure:
+#   XLSX_DF_STORE[session_id] = {
+#       "<workbook_id or filename>": {
+#           "<sheet_name>": pandas.DataFrame,
+#           ...
+#       },
+#       ...
+#   }
+# Note: Populated on XLSX upload in future steps; currently acts as a placeholder for workflow.
+XLSX_DF_STORE: Dict[str, Dict[str, Any]] = {}
+
 app = FastAPI(
     title="IntelliQuery Chatbot API",
     version="1.0.0",
