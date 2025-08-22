@@ -190,7 +190,8 @@ def enqueue_embedding_job(job_id: str, session_id: str, namespace: str, rows: Li
     job = JOBS.get(job_id)
     if job:
         if "embedding_progress" not in job.catalog:
-            job.catalog["embedding_progress"] = {"done": 0, "error": 0, "queued": total}
+            job.catalog["embedding_progress"] = {"done": 0, "error": 0, "queued": total, "rows_enqueued": 0}
         else:
             job.catalog["embedding_progress"]["queued"] = job.catalog["embedding_progress"].get("queued", 0) + total
+            job.catalog["embedding_progress"].setdefault("rows_enqueued", 0)
     return total
