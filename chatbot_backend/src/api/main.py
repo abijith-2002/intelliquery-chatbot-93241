@@ -130,6 +130,8 @@ class UploadContextResponse(BaseModel):
     files_processed: List[UploadedFileResult] = Field(..., description="Per-file processing results")
     total_chars: int = Field(..., description="Total number of characters added to session context")
     message: str = Field(..., description="Status message/acknowledgment")
+    job_id: Optional[str] = Field(default=None, description="Background job identifier for status tracking")
+    catalog: Optional[Dict[str, Any]] = Field(default=None, description="Generated catalog/metadata for uploaded spreadsheets")
 
 
 def _clean_gemini_output(text: str) -> str:
@@ -536,6 +538,34 @@ def chat_wsinfo():
     return {"detail": "Current version supports REST API chat only. Real-time WebSocket may be added in future versions."}
 
 
+# PUBLIC_INTERFACE
+@app.get(
+    "/chat/context-status/{job_id}",
+    tags=["Chat"],
+    summary="Get context upload job status and metadata",
+    description="Retrieve the status and spreadsheet catalog metadata for a previously started context upload job.",
+    responses={
+        404: {"description": "Job not found"},
+    },
+)
+def get_context_status(job_id: str):
+    """
+    PUBLIC_INTERFACE
+    Get status for an upload job initiated by /chat/upload-context.
+
+    Args:
+        job_id (str): The job identifier returned by the upload endpoint.
+
+    Returns:
+        dict: Job status and metadata including per-file results and any generated spreadsheet catalogs.
+    """
+    from .job_tracker import get_job
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
 # --- FILE UPLOAD ENDPOINTS FOR CONTEXT ---
 
 # PUBLIC_INTERFACE
@@ -577,45 +607,88 @@ def upload_chat_context(
         UploadContextResponse: Processing results and acknowledgment.
     """
     from .file_utils import extract_text_from_bytes, summarize_text_preview
+    from .xlsx_ingest import stream_xlsx_catalog
+    from .job_tracker import start_job, finalize_job, JOBS  # type: ignore
 
     if not session_id or not isinstance(session_id, str):
         raise HTTPException(status_code=400, detail="session_id must be provided as a non-empty string.")
     if not files or len(files) == 0:
         raise HTTPException(status_code=400, detail="At least one file must be provided.")
 
+    # Initialize job tracking
+    filenames = [(f.filename or "unnamed") for f in files]
+    job = start_job(session_id, filenames)
+
     results: List[UploadedFileResult] = []
     combined_text_parts: List[str] = []
     total_chars = 0
+    session_catalog: Dict[str, Any] = {"files": []}
 
-    for f in files:
+    for idx, f in enumerate(files):
         filename = f.filename or "unnamed"
+        # mark processing
+        try:
+            JOBS[job.job_id].files[idx].status = "processing"
+        except Exception:
+            pass
+
         # Read file bytes
         try:
             data = f.file.read()
+            size = len(data or b"")
+            if idx < len(JOBS[job.job_id].files):
+                JOBS[job.job_id].files[idx].size = size
         except Exception as e:
             results.append(
                 UploadedFileResult(
                     filename=filename, size=0, content_chars=0, preview="", error=f"Failed to read file: {e}"
                 )
             )
+            # record job error
+            try:
+                JOBS[job.job_id].files[idx].status = "error"
+                JOBS[job.job_id].files[idx].error = f"Failed to read file: {e}"
+            except Exception:
+                pass
             continue
 
-        size = len(data or b"")
-        # Extract
+        # If xlsx: stream and build catalog
+        file_catalog: Optional[Dict[str, Any]] = None
+        if (filename or "").lower().endswith(".xlsx"):
+            try:
+                file_catalog = stream_xlsx_catalog(data, header_row=1, sample_rows_for_types=5000)
+                session_catalog["files"].append({"filename": filename, "catalog": file_catalog})
+            except Exception as e:
+                # Non-fatal; continue with text extraction pipeline
+                session_catalog["files"].append({"filename": filename, "catalog_error": str(e)})
+
+        # Extract text (for RAG) using existing universal extractor
         text, err = extract_text_from_bytes(filename, data or b"")
         preview = summarize_text_preview(text, max_chars=500) if text else ""
         chars = len(text)
+
+        # store to job record
+        try:
+            rec = JOBS[job.job_id].files[idx]
+            rec.preview = preview
+            rec.content_chars = chars
+            rec.message = "Processed"
+            if err:
+                rec.status = "error"
+                rec.error = err
+            else:
+                rec.status = "done"
+        except Exception:
+            pass
 
         # Append to combined only if successful and non-empty
         if text and not err:
             combined_text_parts.append(f"[{filename}]\n{text}\n")
             total_chars += chars
-
             # Build semantic index: chunk + embed + store
             try:
                 _index_text_for_session(session_id, filename, text)
             except Exception:
-                # Do not fail upload on indexing failure; retrieval will fall back gracefully.
                 pass
 
         results.append(
@@ -642,6 +715,14 @@ def upload_chat_context(
             "combined": merged_combined,
         }
 
+    # finalize job
+    try:
+        JOBS[job.job_id].total_chars = total_chars
+        JOBS[job.job_id].catalog = session_catalog
+        finalize_job(job.job_id)
+    except Exception:
+        pass
+
     message = (
         "Processed files successfully. Session context updated and indexed."
         if total_chars > 0
@@ -653,4 +734,6 @@ def upload_chat_context(
         files_processed=results,
         total_chars=total_chars,
         message=message,
+        job_id=job.job_id,
+        catalog=session_catalog if session_catalog.get("files") else None,
     )
