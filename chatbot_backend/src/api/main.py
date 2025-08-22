@@ -30,6 +30,8 @@ from .auth_utils import (
 from .chat_title import router as chat_title_router
 # Config utilities
 from .config_utils import get_gemini_api_key
+# Pinecone vector store
+from .vector_store_pinecone import PineconeVectorStore
 
 # Load environment variables
 load_dotenv()
@@ -49,6 +51,10 @@ CONTEXT_STORE: Dict[str, Dict[str, Any]] = {}
 #       "embedding_model": str
 #   }
 RAG_INDEX_STORE: Dict[str, Dict[str, Any]] = {}
+
+# Initialize Pinecone vector store (optional; acts as a no-op if not configured)
+# This store will be used for both ingestion (upsert) and retrieval (query) when available.
+PINECONE_STORE = PineconeVectorStore.from_env()
 
 app = FastAPI(
     title="IntelliQuery Chatbot API",
@@ -432,9 +438,37 @@ def chat(request: ChatRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
 
-        # Retrieve top-k relevant chunks from vector index
-        top_chunks = _vector_search(session_id, request.query, top_k=3)
-        retrieved_context = "\n---\n".join(top_chunks).strip()
+        # Retrieve top-k relevant chunks from Pinecone if configured; fallback to in-memory index
+        retrieved_context = ""
+        try:
+            if PINECONE_STORE and getattr(PINECONE_STORE, "is_configured", False):
+                qvec = _embed_one(request.query)
+                if qvec:
+                    top_k_env = None
+                    try:
+                        import os as _os
+                        _tk = _os.getenv("PINECONE_TOP_K")
+                        if _tk:
+                            top_k_env = int(_tk)
+                    except Exception:
+                        top_k_env = None
+                    pinecone_matches = PINECONE_STORE.query_top_k(session_id, qvec, top_k=top_k_env)
+                    if pinecone_matches:
+                        # Assemble context from retrieved metadata text
+                        retrieved_texts = []
+                        for m in pinecone_matches:
+                            md = m.get("metadata", {}) or {}
+                            t = md.get("text") or ""
+                            if t:
+                                retrieved_texts.append(t)
+                        if retrieved_texts:
+                            retrieved_context = "\n---\n".join(retrieved_texts).strip()
+        except Exception:
+            # Ignore Pinecone errors and rely on fallback
+            retrieved_context = ""
+        if not retrieved_context:
+            top_chunks = _vector_search(session_id, request.query, top_k=3)
+            retrieved_context = "\n---\n".join(top_chunks).strip()
 
         # Compose Gemini answer with retrieved context (if any)
         try:
@@ -613,9 +647,24 @@ def upload_chat_context(
 
             # Build semantic index: chunk + embed + store
             try:
+                # 1) Always maintain legacy in-memory index (fallback)
                 _index_text_for_session(session_id, filename, text)
             except Exception:
-                # Do not fail upload on indexing failure; retrieval will fall back gracefully.
+                # Do not fail upload on in-memory indexing failure; retrieval will fall back gracefully.
+                pass
+
+            # 2) Upsert to Pinecone when configured
+            try:
+                if PINECONE_STORE and getattr(PINECONE_STORE, "is_configured", False):
+                    # Re-chunk to align with stored vectors and avoid duplication of chunking logic
+                    _chunks = _split_into_chunks(text, chunk_size_words=180, overlap_words=40)
+                    if _chunks:
+                        _vectors = _embed_texts(_chunks)
+                        # Only upsert if we have at least some embeddings
+                        if any(v for v in _vectors if v):
+                            PINECONE_STORE.upsert_chunks(session_id, filename, _chunks, _vectors)
+            except Exception:
+                # Silently continue; the in-memory store remains usable
                 pass
 
         results.append(
