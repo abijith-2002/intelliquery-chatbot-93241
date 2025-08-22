@@ -51,3 +51,9 @@ SQLAlchemy==2.0.29
 python-docx==1.1.2
 openpyxl==3.1.5
 pdfminer.six==20231228
+
+# Vector database: Pinecone client
+pinecone-client==5.0.1
+
+# Optional: backoff for API retries to handle rate limiting
+backoff==2.2.1
