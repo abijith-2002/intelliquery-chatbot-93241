@@ -90,8 +90,12 @@ class ChatRequest(BaseModel):
 
 
 class ChatAnswerResponse(BaseModel):
-    """Schema for the chat response that returns only the final Gemini answer."""
+    """Schema for the chat response that returns the final answer and relevant data context."""
     answer: str = Field(..., description="Final natural language answer returned by Gemini.")
+    data_context: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Relevant data used during answering, e.g., matched rows and fields for frontend display."
+    )
 
 
 # --- AUTH SCHEMAS FOR REGISTRATION & LOGIN ---
@@ -413,11 +417,18 @@ def health_check():
 def chat(request: ChatRequest):
     """
     PUBLIC_INTERFACE
-    Handles user's chat request. All answers come directly from Gemini.
-    If the user has uploaded files for this session, the most relevant snippets from those files are retrieved
-    via semantic vector search and provided as additional context to Gemini. The API returns only Gemini's final answer.
+    Handles user's chat request using hybrid retrieval:
+      1) Semantic search over background vector embeddings (top-K rows).
+      2) Lightweight extraction of referenced column filters (e.g., `status: open`, `amount > 1000`)
+         and application via vector store metadata filtering/SQL where possible for precise queries.
+      3) Returns Gemini's answer and a structured data_context to power frontend display.
+
+    Notes:
+    - If embeddings are not available yet, falls back to legacy in-memory RAG chunks.
+    - Filtering supports simple equality and contains semantics; numeric comparisons are matched when values look numeric.
     """
     import traceback
+    import re
 
     try:
         session_id = request.session_id
@@ -442,24 +453,129 @@ def chat(request: ChatRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
 
-        # Retrieve top-k relevant chunks from vector index
-        top_chunks = _vector_search(session_id, request.query, top_k=3)
-        retrieved_context = "\n---\n".join(top_chunks).strip()
+        query_text = request.query or ""
+
+        # Extract simple "field: value" pairs (case-insensitive keys) and numeric comparisons from the query
+        # Examples matched: "status: open", "department: Sales", "amount > 1000", "qty <= 5"
+        field_value_pairs: Dict[str, Any] = {}
+        numeric_conditions: List[Dict[str, Any]] = []
+        # field: value
+        for m in re.finditer(r"([A-Za-z0-9_ ]+)\s*:\s*([^\n,;]+)", query_text):
+            key = m.group(1).strip()
+            val = m.group(2).strip()
+            if key:
+                field_value_pairs[key] = val
+        # numeric comparators
+        for m in re.finditer(r"([A-Za-z0-9_ ]+)\s*(>=|<=|>|<|=)\s*([0-9]+(?:\.[0-9]+)?)", query_text):
+            key = m.group(1).strip()
+            op = m.group(2)
+            num = float(m.group(3))
+            numeric_conditions.append({"field": key, "op": op, "value": num})
+
+        # Normalize keys to match normalized headers when possible (lowercase snakeish)
+        def _norm_key(k: str) -> str:
+            return re.sub(r"[^a-z0-9_]", "", re.sub(r"\s+", "_", k.strip().lower()))
+
+        normalized_where = { _norm_key(k): v for k, v in field_value_pairs.items() if k.strip() }
+
+        # Build semantic retrieval using background vector store if available
+        from .vector_store import get_vector_store
+        from .config_utils import get_gemini_api_key as _get_key
+
+        data_context: Dict[str, Any] = {"retrieval": {"top_k": 5, "used": "vector_store"}, "hits": []}
+        retrieved_context_text = ""
+
+        # Attempt vector-store retrieval if we can embed the query
+        query_vec = None
+        try:
+            key = _get_key()
+            if key:
+                genai.configure(api_key=key)
+                result = genai.embed_content(model="models/text-embedding-004", content=query_text)
+                qv = result.get("embedding", {}).get("values")
+                if isinstance(qv, list) and qv:
+                    query_vec = [float(x) for x in qv]
+        except Exception:
+            query_vec = None
+
+        store = None
+        try:
+            store = get_vector_store()
+        except Exception:
+            store = None
+
+        vector_hits: List[Dict[str, Any]] = []
+        if store and query_vec:
+            try:
+                vector_hits = store.search(session_id=session_id, query_vector=query_vec, top_k=5)
+            except Exception:
+                vector_hits = []
+
+        # Apply lightweight field filters via keyword_filter when we have any field constraints
+        filtered_hits: List[Dict[str, Any]] = []
+        if store and normalized_where:
+            try:
+                filtered_hits = store.keyword_filter(session_id=session_id, where=normalized_where, limit=100)
+                # Post-filter numeric conditions
+                def _passes_numeric(meta: Dict[str, Any]) -> bool:
+                    for cond in numeric_conditions:
+                        field = _norm_key(cond["field"])
+                        val = meta.get(field)
+                        try:
+                            fval = float(val)
+                        except Exception:
+                            return False
+                        op = cond["op"]
+                        c = cond["value"]
+                        if op == ">=" and not (fval >= c): return False
+                        if op == "<=" and not (fval <= c): return False
+                        if op == ">" and not (fval > c): return False
+                        if op == "<" and not (fval < c): return False
+                        if op == "=" and not (fval == c): return False
+                    return True
+                filtered_hits = [h for h in filtered_hits if _passes_numeric(h.get("metadata", {}))]
+            except Exception:
+                filtered_hits = []
+
+        # Merge results: if filtered hits exist, prefer them; otherwise use vector hits.
+        hits = filtered_hits if filtered_hits else vector_hits
+
+        # As a fallback if no vector store or embeddings, use legacy in-memory chunk retrieval
+        if not hits:
+            top_chunks = _vector_search(session_id, query_text, top_k=3)
+            retrieved_context_text = "\n---\n".join(top_chunks).strip()
+            data_context["retrieval"]["used"] = "legacy_chunk_index"
+            data_context["hits"] = [{"text": t} for t in top_chunks]
+        else:
+            # Build text by concatenating selected fields if present; otherwise, format metadata pairs
+            contexts = []
+            for h in hits:
+                meta = h.get("metadata", {}) or {}
+                # Reconstruct row text from metadata (the background worker constructed texts "header: value | ...")
+                # We'll join known informative fields first if available
+                # If the original "text" is not stored, we derive from metadata
+                parts = []
+                for k, v in meta.items():
+                    parts.append(f"{k}: {v}")
+                row_text = " | ".join(parts)
+                contexts.append(row_text)
+            retrieved_context_text = "\n---\n".join(contexts[:5]).strip()
+            data_context["hits"] = hits
 
         # Compose Gemini answer with retrieved context (if any)
         try:
-            gemini_answer = get_gemini_response(request.query, memory, extra_context=retrieved_context)
+            gemini_answer = get_gemini_response(query_text, memory, extra_context=retrieved_context_text)
         except Exception as e:
             gemini_answer = "[Gemini unavailable: {}]".format(e)
 
         # Final output cleaning and save in memory
         gemini_answer = _clean_gemini_output(_safe_str_output(gemini_answer))
         try:
-            memory.save_context({"input": request.query}, {"output": _safe_str_output(gemini_answer)})
+            memory.save_context({"input": query_text}, {"output": _safe_str_output(gemini_answer)})
         except Exception:
             pass  # Do not raise for failed memory update
 
-        return ChatAnswerResponse(answer=gemini_answer)
+        return ChatAnswerResponse(answer=gemini_answer, data_context=data_context)
 
     except HTTPException:
         raise  # Allow FastAPI HTTPExceptions to propagate
