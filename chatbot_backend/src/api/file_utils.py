@@ -5,10 +5,8 @@ from typing import List, Tuple, Optional
 # - TXT: native decode
 # - PDF: pdfminer.six
 # - DOCX: python-docx
-# - XLSX: openpyxl
 from pdfminer.high_level import extract_text as pdf_extract_text
 from docx import Document as DocxDocument
-from openpyxl import load_workbook
 
 
 # PUBLIC_INTERFACE
@@ -21,7 +19,6 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
         - .txt  : UTF-8 decode with errors ignored
         - .pdf  : pdfminer.six text extraction
         - .docx : python-docx extraction (paragraphs and table cells)
-        - .xlsx : openpyxl extraction (sheet name and cells, tab-separated rows)
 
     Args:
         filename (str): Original filename (used for type detection).
@@ -41,9 +38,8 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
             return _extract_pdf(content), None
         if name_lower.endswith(".docx"):
             return _extract_docx(content), None
-        if name_lower.endswith(".xlsx"):
-            return _extract_xlsx(content), None
-        return "", f"Unsupported file type for '{filename}'. Allowed: .txt, .pdf, .docx, .xlsx"
+        # XLSX support removed
+        return "", f"Unsupported file type for '{filename}'. Allowed: .txt, .pdf, .docx"
     except Exception as e:
         return "", f"Failed to extract '{filename}': {e}"
 
@@ -77,27 +73,6 @@ def _extract_docx(content: bytes) -> str:
                 row_vals.append(cell.text.strip())
             if any(v for v in row_vals):
                 parts.append("\t".join(row_vals))
-    return "\n".join(parts).strip()
-
-
-def _extract_xlsx(content: bytes) -> str:
-    """Extract text from XLSX using openpyxl (sheet by sheet, TSV rows)."""
-    bio = io.BytesIO(content)
-    wb = load_workbook(bio, data_only=True, read_only=True)
-    parts: List[str] = []
-    for ws in wb.worksheets:
-        parts.append(f"[Sheet: {ws.title}]")
-        for row in ws.iter_rows(values_only=True):
-            vals = []
-            for cell in row:
-                if cell is None:
-                    vals.append("")
-                else:
-                    vals.append(str(cell))
-            # Skip completely empty rows
-            if any(v.strip() for v in vals):
-                parts.append("\t".join(vals))
-        parts.append("")  # blank line between sheets
     return "\n".join(parts).strip()
 
 

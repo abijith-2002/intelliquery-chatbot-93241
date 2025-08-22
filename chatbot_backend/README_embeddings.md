@@ -2,7 +2,7 @@ Background embeddings pipeline
 
 Overview
 - The backend now includes a background worker (src/api/background_worker.py) that batches requests for Gemini embeddings and persists vectors to a configured vector store implementation (FAISS in-memory or pgvector).
-- XLSX uploads are cataloged and then per-row informative text is constructed and enqueued for embeddings.
+- Spreadsheet (.xlsx) ingestion has been removed. Only .txt, .pdf, and .docx uploads contribute to context and embeddings.
 - Progress is tracked inside the UploadJob.catalog under the key "embedding_progress" and surfaced via /chat/context-status/{job_id}.
 
 Configuration (.env)

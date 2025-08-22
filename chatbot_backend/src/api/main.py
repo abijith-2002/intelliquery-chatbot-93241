@@ -783,7 +783,7 @@ def get_context_status(job_id: str):
     summary="Upload context files for a chat session",
     description=(
         "Accepts one or more files via multipart/form-data and extracts readable text from supported types "
-        "(.docx, .xlsx, .pdf, .txt). The extracted content is stored per session and used as additional context "
+        "(.docx, .pdf, .txt). The extracted content is stored per session and used as additional context "
         "when answering subsequent chat queries. Builds a vector index (Gemini embeddings) for semantic retrieval. "
         "Returns an acknowledgment with per-file processing results and a preview."
     ),
@@ -794,7 +794,7 @@ def get_context_status(job_id: str):
 )
 def upload_chat_context(
     session_id: str = Form(..., description="Session ID to associate uploaded context with"),
-    files: List[UploadFile] = File(..., description="One or more files (.docx, .xlsx, .pdf, .txt)"),
+    files: List[UploadFile] = File(..., description="One or more files (.docx, .pdf, .txt)"),
 ):
     """
     PUBLIC_INTERFACE
@@ -814,13 +814,17 @@ def upload_chat_context(
         UploadContextResponse: Processing results and acknowledgment.
     """
     from .file_utils import extract_text_from_bytes, summarize_text_preview
-    from .xlsx_ingest import stream_xlsx_catalog
     from .job_tracker import start_job, finalize_job, JOBS  # type: ignore
 
     if not session_id or not isinstance(session_id, str):
         raise HTTPException(status_code=400, detail="session_id must be provided as a non-empty string.")
     if not files or len(files) == 0:
         raise HTTPException(status_code=400, detail="At least one file must be provided.")
+
+    # Reject .xlsx files explicitly
+    for f in files:
+        if (f.filename or "").lower().endswith(".xlsx"):
+            raise HTTPException(status_code=415, detail="Unsupported media type: .xlsx files are no longer supported.")
 
     # Initialize job tracking
     filenames = [(f.filename or "unnamed") for f in files]
@@ -829,11 +833,9 @@ def upload_chat_context(
     results: List[UploadedFileResult] = []
     combined_text_parts: List[str] = []
     total_chars = 0
-    session_catalog: Dict[str, Any] = {"files": []}
 
     for idx, f in enumerate(files):
         filename = f.filename or "unnamed"
-        # mark processing
         try:
             JOBS[job.job_id].files[idx].status = "processing"
         except Exception:
@@ -851,7 +853,6 @@ def upload_chat_context(
                     filename=filename, size=0, content_chars=0, preview="", error=f"Failed to read file: {e}"
                 )
             )
-            # record job error
             try:
                 JOBS[job.job_id].files[idx].status = "error"
                 JOBS[job.job_id].files[idx].error = f"Failed to read file: {e}"
@@ -859,94 +860,7 @@ def upload_chat_context(
                 pass
             continue
 
-        # If xlsx: stream and build catalog
-        file_catalog: Optional[Dict[str, Any]] = None
-        if (filename or "").lower().endswith(".xlsx"):
-            try:
-                file_catalog = stream_xlsx_catalog(data, header_row=1, sample_rows_for_types=5000)
-                session_catalog.setdefault("files", [])
-                session_catalog["files"].append({"filename": filename, "catalog": file_catalog})
-                # After cataloging, stream the file again to build per-row texts for embedding
-                try:
-                    from openpyxl import load_workbook
-                    import io as _io
-                    from .background_worker import enqueue_embedding_job
-                    bio2 = _io.BytesIO(data)
-                    wb2 = load_workbook(bio2, data_only=True, read_only=True)
-                    # Create informative text per row from columns inferred as informative (non-null, not purely IDs).
-                    # Heuristic: choose columns with inferred_type in {"string","number"} and non_null > 0,
-                    # and ignore columns whose normalized name looks like pure id keys (e.g., 'id', 'uid')
-                    def _is_informative(col: dict) -> bool:
-                        name = (col.get("normalized_name") or "").lower()
-                        if name in {"id", "uid", "uuid", "pk", "primary_key"}:
-                            return False
-                        t = (col.get("inferred_type") or "string").lower()
-                        return t in {"string", "number"} and (col.get("non_null") or 0) > 0
-
-                    # Build a quick lookup of informative columns per sheet index
-                    informative_cols_by_sheet: dict[int, List[int]] = {}
-                    for si, sheet_meta in enumerate((file_catalog or {}).get("sheets", [])):
-                        cols = sheet_meta.get("columns", []) or []
-                        idxs = [i for i, c in enumerate(cols) if _is_informative(c)]
-                        if idxs:
-                            informative_cols_by_sheet[si] = idxs
-
-                    total_rows_enqueued = 0
-                    for si, ws in enumerate(wb2.worksheets):
-                        # skip if no informative cols
-                        if si not in informative_cols_by_sheet:
-                            continue
-                        idxs = informative_cols_by_sheet[si]
-                        headers = [str(h) if h is not None else "" for h in (file_catalog.get("sheets", [])[si].get("headers_original") or [])]
-                        ns = f"xlsx:{filename}:{ws.title}"
-                        # iterate rows, skipping header row (assumed at 1)
-                        # Use explicit bounds to avoid premature truncation.
-                        max_r = ws.max_row or 0
-                        if max_r > 1:
-                            for row_idx, row in enumerate(
-                                ws.iter_rows(min_row=2, max_row=max_r, values_only=True),
-                                start=2
-                            ):
-                                values = list(row) if row is not None else []
-                                # Build text from informative columns
-                                parts = []
-                                meta: Dict[str, Any] = {"row_num": row_idx}
-                                for col_idx in idxs:
-                                    if col_idx < len(values):
-                                        val = values[col_idx]
-                                        if val is None or (isinstance(val, str) and str(val).strip() == ""):
-                                            continue
-                                        header = headers[col_idx] if col_idx < len(headers) else f"col_{col_idx}"
-                                        parts.append(f"{header}: {val}")
-                                        meta[header] = val if isinstance(val, (str, int, float, bool)) else str(val)
-                                text = " | ".join(parts).strip()
-                                if text:
-                                    total_rows_enqueued += 1
-                                    # For id, we can use session_id + filename + sheet + row number
-                                    payload = {
-                                        "id": f"{session_id}:{filename}:{ws.title}:{row_idx}",
-                                        "text": text,
-                                        "metadata": meta,
-                                    }
-                                    # Batch enqueued via function which slices into EMBEDDING_BATCH_SIZE
-                                    enqueue_embedding_job(job.job_id, session_id, ns, [payload])
-                    # record enqueued rows into job catalog
-                    try:
-                        from .job_tracker import JOBS as _JOBS
-                        if job.job_id in _JOBS:
-                            _JOBS[job.job_id].catalog.setdefault("embedding_progress", {"queued": 0, "rows_enqueued": 0, "done": 0, "error": 0})
-                            _JOBS[job.job_id].catalog["embedding_progress"]["rows_enqueued"] = total_rows_enqueued
-                    except Exception:
-                        pass
-                except Exception as _e:
-                    # embedding prep failed; record but do not stop file ingestion
-                    session_catalog["files"][-1]["embedding_prep_error"] = str(_e)
-            except Exception as e:
-                # Non-fatal; continue with text extraction pipeline
-                session_catalog.setdefault("files", [])
-                session_catalog["files"].append({"filename": filename, "catalog_error": str(e)})
-
-        # Extract text (for RAG) using existing universal extractor
+        # Extract text for supported types
         text, err = extract_text_from_bytes(filename, data or b"")
         preview = summarize_text_preview(text, max_chars=500) if text else ""
         chars = len(text)
@@ -992,7 +906,6 @@ def upload_chat_context(
         prev_combined = prev_ctx.get("combined", "")
         prev_files = prev_ctx.get("files", [])
 
-        # Merge with previous context if any
         merged_combined = (prev_combined + "\n\n" + combined_text).strip() if prev_combined else combined_text
         CONTEXT_STORE[session_id] = {
             "files": prev_files + [r.model_dump() for r in results],
@@ -1002,7 +915,8 @@ def upload_chat_context(
     # finalize job
     try:
         JOBS[job.job_id].total_chars = total_chars
-        JOBS[job.job_id].catalog = session_catalog
+        # No XLSX catalog; ensure catalog is empty or minimal
+        JOBS[job.job_id].catalog = {}
         finalize_job(job.job_id)
     except Exception:
         pass
@@ -1019,5 +933,5 @@ def upload_chat_context(
         total_chars=total_chars,
         message=message,
         job_id=job.job_id,
-        catalog=session_catalog if session_catalog.get("files") else None,
+        catalog=None,
     )
