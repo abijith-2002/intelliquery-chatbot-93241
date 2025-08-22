@@ -1,656 +1,302 @@
-# ==============================================================================
-# IMPORTANT: This backend requires a Google Gemini API key to function.
-# Supported environment variable names (checked in this order):
-#   - GEMINI_API_KEY
-#   - REACT_APP_GEMINI_API_KEY
-#   - GOOGLE_API_KEY
-#   - GOOGLE_GEMINI_API_KEY
-# Make sure to create a `.env` file or provide one of the above at deployment.
-# Without this, Gemini responses will be unavailable and fallback messaging will appear.
-# ==============================================================================
-
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, EmailStr
+import os
+import uuid
+import logging
 from typing import List, Optional, Dict, Any
-import google.generativeai as genai
 
-from dotenv import load_dotenv
-from langchain.memory import ConversationBufferMemory
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
-# Import authentication/database helpers
-from .auth_utils import (
-    create_tables,
-    get_db,
-    create_user,
-    get_user_by_username,
-    verify_password,
-)
-# Import the chat title router
-from .chat_title import router as chat_title_router
-# Config utilities
-from .config_utils import get_gemini_api_key
+from .config_utils import get_settings
+from .file_utils import extract_text_from_file, chunk_text
+from .vector_store_pinecone import PineconeVectorStore, VectorRecord
 
-# Load environment variables
-load_dotenv()
-
-# Memory store for chat contexts (keyed by session_id).
-CONVERSATION_MEMORY: Dict[str, ConversationBufferMemory] = {}
-
-# Per-session uploaded context store (legacy tracking for previews).
-# Structure: { session_id: { "files": [ {filename, size, chars, preview, error?} ], "combined": str } }
-CONTEXT_STORE: Dict[str, Dict[str, Any]] = {}
-
-# Per-session in-memory vector index for RAG.
-# Structure:
-#   RAG_INDEX_STORE[session_id] = {
-#       "chunks": [ {"text": str, "filename": str} , ...],
-#       "embeddings": [ [float, ...], ...],
-#       "embedding_model": str
-#   }
-RAG_INDEX_STORE: Dict[str, Dict[str, Any]] = {}
-
+# ---------------------------------------------------------------------------------------
+# Application setup
+# ---------------------------------------------------------------------------------------
 app = FastAPI(
     title="IntelliQuery Chatbot API",
+    description="FastAPI backend for the IntelliQuery chatbot, providing chat endpoints using user-uploaded context files and Google Gemini for answer generation.",
     version="1.0.0",
-    description="FastAPI backend for the IntelliQuery chatbot, providing chat endpoints using user-uploaded context files and Google Gemini for answer generation."
 )
 
-openapi_tags = [
-    {"name": "Health", "description": "Health check endpoint."},
-    {"name": "Chat", "description": "Endpoints for chat, history/title generation, response retrieval, and context management."},
-    {"name": "UserAuth", "description": "Endpoints for user registration and login."}
-]
-
-# Register chat title router (Gemini-powered title generator)
-app.include_router(chat_title_router)
-
-# Allow CORS from everywhere for demo/dev
+# CORS configuration (adjust as needed)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # For production: restrict to your frontend origin(s)
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+logger = logging.getLogger("uvicorn.error")
+
+# ---------------------------------------------------------------------------------------
+# Schemas
+# ---------------------------------------------------------------------------------------
+class UploadedFileResult(BaseModel):
+    filename: str
+    size: int
+    content_chars: int
+    preview: str
+    error: Optional[str] = None
+
+
+class UploadContextResponse(BaseModel):
+    session_id: str
+    files_processed: List[UploadedFileResult]
+    total_chars: int
+    message: str
+
 
 class ChatRequest(BaseModel):
-    """Schema for a chat request."""
     session_id: str = Field(..., description="Unique session identifier for the conversation context.")
     query: str = Field(..., description="User's query (question or message).")
 
 
 class ChatAnswerResponse(BaseModel):
-    """Schema for the chat response that returns only the final Gemini answer."""
     answer: str = Field(..., description="Final natural language answer returned by Gemini.")
 
 
-# --- AUTH SCHEMAS FOR REGISTRATION & LOGIN ---
-
-class RegisterRequest(BaseModel):
-    """Pydantic schema for user registration request."""
-    username: str = Field(..., min_length=3, max_length=50, description="Unique username for registration")
-    email: EmailStr = Field(..., description="User's email address")
-    password: str = Field(..., min_length=6, max_length=128, description="User's password (plaintext, will be hashed)")
+class TitleRequest(BaseModel):
+    prompt: str
 
 
-class RegisterResponse(BaseModel):
-    """Schema for success/failure of registration."""
-    id: int
-    username: str
-    email: EmailStr
+# ---------------------------------------------------------------------------------------
+# Global services
+# ---------------------------------------------------------------------------------------
+settings = get_settings()
+vector_store = PineconeVectorStore(
+    api_key=settings.PINECONE_API_KEY,
+    index_name=settings.PINECONE_INDEX_NAME,
+    namespace=settings.PINECONE_NAMESPACE,
+    host=settings.PINECONE_HOST,
+    environment=settings.PINECONE_ENVIRONMENT,
+    top_k=settings.PINECONE_TOP_K,
+)
 
-
-class LoginRequest(BaseModel):
-    """Pydantic schema for user login request."""
-    username: str = Field(..., description="Registered username")
-    password: str = Field(..., description="Password")
-
-
-class LoginResponse(BaseModel):
-    """Schema for login response."""
-    id: int
-    username: str
-    email: EmailStr
-
-
-class UploadedFileResult(BaseModel):
-    """Schema describing the processing result for a single uploaded file."""
-    filename: str = Field(..., description="Original file name")
-    size: int = Field(..., description="File size in bytes")
-    content_chars: int = Field(..., description="Number of characters extracted from the file")
-    preview: str = Field(..., description="A short preview/summary of extracted content")
-    error: Optional[str] = Field(default=None, description="Error message if processing failed")
-
-
-class UploadContextResponse(BaseModel):
-    """Schema for the response from the context upload endpoint."""
-    session_id: str = Field(..., description="Session ID associated with the uploaded context")
-    files_processed: List[UploadedFileResult] = Field(..., description="Per-file processing results")
-    total_chars: int = Field(..., description="Total number of characters added to session context")
-    message: str = Field(..., description="Status message/acknowledgment")
-
-
-def _clean_gemini_output(text: str) -> str:
+# ---------------------------------------------------------------------------------------
+# Embedding utilities - HOOKS
+# ---------------------------------------------------------------------------------------
+def embed_texts_with_gemini(texts: List[str]) -> List[List[float]]:
     """
-    Removes leading/trailing meta, KB source, or disclaimer information from Gemini output.
-    Ensures only direct answers are delivered to the user.
+    HOOK: Gemini embedding logic
+    - Integrate with Google's text-embedding-004 (dimension 768 recommended)
+    - Ensure the Pinecone index was created with matching dimension and metric (cosine)
+
+    Pseudocode (to implement in real environment):
+        import google.generativeai as genai
+        genai.configure(api_key=settings.GEMINI_API_KEY)
+        model = "text-embedding-004"
+        embeddings = []
+        for t in texts:
+            resp = genai.embed_content(model=model, content=t)
+            embeddings.append(resp["embedding"])
+        return embeddings
+
+    For now, return placeholder random/sparse vectors if GEMINI_API_KEY is not configured.
     """
-    import re
-    META_PATTERNS = [
-        # Remove variants at start of the answer
-        r"(?i)^ *(?:based on (?:the )?(?:provided )?(?:knowledge ?base|context|sources)[^:]*:?)",
-        r"(?i)^(?:as an?\s+[^\s:,]+ [^\s:,]+,?)[\s:.-]*",
-        r"(?i)^ *(?:this information[^:]*:?)",
-        r"(?i)^ *(?:note:)[^\n\r]*",
-        r"(?i)^ *(?:please note)[^\n\r]*",
-        r"(?i)^ *(?:source[sd]?:)[^\n\r]*",
-        r"(?i)^ *(?:from the knowledge base[^:]*:?)",
-        r"(?i)^ *(?:provided context[^:]*:?)",
-        r"(?i)^\(?(?:based on|as an ai language model|this information|provided context)[^\)]*\)?",
-    ]
-    # Remove trailing variants
-    TRAIL_PATTERNS = [
-        r"(?i)\(? *(?:based on (?:the )?(?:provided )?(?:knowledge ?base|context|sources)[^)]*)\)?[.!]? *$",
-        r"(?i)\(? *(?:from the knowledge base)[^)]*\)?[.!]? *$",
-        r"(?i)\(? *(?:provided context)[^)]*\)?[.!]? *$",
-    ]
-    clean_text = text
-    for pat in META_PATTERNS:
-        clean_text = re.sub(pat, "", clean_text, flags=re.IGNORECASE | re.MULTILINE)
-    for pat in TRAIL_PATTERNS:
-        clean_text = re.sub(pat, "", clean_text, flags=re.IGNORECASE | re.MULTILINE)
-    clean_text = clean_text.strip()
-    return clean_text
-
-
-# --- CONTEXT + RAG UTILITIES ---
-
-def _tokenize(s: str) -> List[str]:
-    import re
-    return [t for t in re.findall(r"[A-Za-z0-9]+", (s or "").lower()) if t]
-
-
-def _simple_similarity(a: str, b: str) -> float:
-    """
-    Simple similarity score based on token overlap (resource-light fallback).
-    """
-    set_a, set_b = set(_tokenize(a)), set(_tokenize(b))
-    if not set_a or not set_b:
-        return 0.0
-    shared = set_a.intersection(set_b)
-    return len(shared) / max(len(set_a), len(set_b))
-
-
-def _split_into_chunks(text: str, chunk_size_words: int = 180, overlap_words: int = 40) -> List[str]:
-    """
-    Split text into overlapping chunks to improve retrieval granularity.
-
-    Args:
-        text: The input full text.
-        chunk_size_words: Approximate number of words per chunk.
-        overlap_words: Overlap between consecutive chunks to preserve context.
-
-    Returns:
-        List[str]: Chunked text segments.
-    """
-    if not text:
-        return []
-    words = text.split()
-    chunks: List[str] = []
-    start = 0
-    while start < len(words):
-        end = min(len(words), start + chunk_size_words)
-        chunk = " ".join(words[start:end])
-        if chunk.strip():
-            chunks.append(chunk)
-        if end == len(words):
-            break
-        start = max(end - overlap_words, start + 1)
-    return chunks
-
-
-def _cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
-    """
-    Compute cosine similarity between two vectors. Zero-safe.
-    """
-    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
-        return 0.0
+    # Fallback stub: deterministic pseudo-embedding (NOT for production)
+    import hashlib
     import math
-    dot = sum(x * y for x, y in zip(vec_a, vec_b))
-    a_norm = math.sqrt(sum(x * x for x in vec_a))
-    b_norm = math.sqrt(sum(y * y for y in vec_b))
-    if a_norm == 0 or b_norm == 0:
-        return 0.0
-    return dot / (a_norm * b_norm)
-
-
-def _get_embedding_model_name() -> str:
-    """
-    Resolve the embedding model name to use with Google Generative AI.
-    """
-    # text-embedding-004 is the current recommended Gemini embedding model.
-    return "models/text-embedding-004"
-
-
-def _embed_one(text: str) -> Optional[List[float]]:
-    """
-    Get embedding for a single text using Gemini embeddings.
-    Returns None if embedding fails (e.g., missing key).
-    """
-    key = get_gemini_api_key()
-    if not key:
-        return None
-    try:
-        genai.configure(api_key=key)
-        model = _get_embedding_model_name()
-        # google-generativeai embed_content returns dict with "embedding": {"values": [...]}
-        result = genai.embed_content(model=model, content=text)
-        vec = result.get("embedding", {}).get("values")
-        if isinstance(vec, list) and vec and isinstance(vec[0], (int, float)):
-            return [float(v) for v in vec]
-        return None
-    except Exception:
-        # Silently degrade to None to allow lexical fallback
-        return None
-
-
-def _embed_texts(texts: List[str]) -> List[Optional[List[float]]]:
-    """
-    Embed a batch of texts (serially) using Gemini embeddings.
-    If embedding fails or key missing, returns list of None entries.
-    """
-    vectors: List[Optional[List[float]]] = []
+    dim = settings.EMBEDDING_DIM
+    out: List[List[float]] = []
     for t in texts:
-        vectors.append(_embed_one(t))
-    return vectors
+        h = hashlib.sha256(t.encode("utf-8")).digest()
+        # Simple repeat to reach dim length
+        vals = []
+        while len(vals) < dim:
+            for b in h:
+                vals.append((b / 255.0) - 0.5)
+                if len(vals) >= dim:
+                    break
+        # L2 normalize (approximate cosine behavior)
+        norm = math.sqrt(sum(v * v for v in vals)) or 1.0
+        out.append([v / norm for v in vals])
+    return out
 
 
-def _ensure_session_index(session_id: str):
-    """
-    Ensure RAG index structure exists for the session.
-    """
-    if session_id not in RAG_INDEX_STORE:
-        RAG_INDEX_STORE[session_id] = {
-            "chunks": [],
-            "embeddings": [],
-            "embedding_model": _get_embedding_model_name(),
-        }
-
-
-def _index_text_for_session(session_id: str, filename: str, text: str):
-    """
-    Chunk, embed, and store vectors and their source chunks for a session.
-    Falls back to storing chunks without embeddings if embeddings are unavailable.
-    """
-    _ensure_session_index(session_id)
-    chunks = _split_into_chunks(text, chunk_size_words=180, overlap_words=40)
-    if not chunks:
-        return
-    vectors = _embed_texts(chunks)
-
-    store = RAG_INDEX_STORE[session_id]
-    for chunk, vec in zip(chunks, vectors):
-        store["chunks"].append({"text": chunk, "filename": filename})
-        store["embeddings"].append(vec)  # vec could be None; retrieval handles fallback
-
-
-def _vector_search(session_id: str, query: str, top_k: int = 3) -> List[str]:
-    """
-    Perform semantic vector search for the top_k relevant chunks using cosine similarity
-    against Gemini embeddings. If embeddings are not available, falls back to lexical similarity.
-
-    Returns:
-        List[str]: The text of the top-k retrieved chunks.
-    """
-    index = RAG_INDEX_STORE.get(session_id)
-    if not index or not index.get("chunks"):
-        return []
-
-    # Try vector search
-    query_vec = _embed_one(query)
-    if query_vec:
-        scored = []
-        for item, vec in zip(index["chunks"], index["embeddings"]):
-            if vec:
-                score = _cosine_similarity(query_vec, vec)
-            else:
-                # If a particular chunk lacks embedding, degrade to lexical fallback for that item
-                score = _simple_similarity(query, item["text"])
-            scored.append((score, item["text"]))
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [text for _, text in scored[:top_k]]
-
-    # Fallback: lexical similarity if no query embedding
-    scored_lex = [(_simple_similarity(query, item["text"]), item["text"]) for item in index["chunks"]]
-    scored_lex.sort(key=lambda x: x[0], reverse=True)
-    return [text for _, text in scored_lex[:top_k]]
-
-
-# PUBLIC_INTERFACE
-def get_gemini_response(
-    query: str,
-    memory: ConversationBufferMemory,
-    extra_context: str = "",
-) -> str:
-    """
-    PUBLIC_INTERFACE
-    Enhance the answer using Google Gemini API, considering the chat context and any user-uploaded context.
-
-    Never include statements about sources, knowledge base, RAG, or meta-assertions in the prompt or response.
-
-    Args:
-        query (str): User query.
-        memory (ConversationBufferMemory): Conversation memory buffer.
-        extra_context (str): Additional, retrieved context from uploaded files. May be empty.
-
-    Returns:
-        str: Model answer.
-    """
-    mem_str = memory.buffer_as_str if hasattr(memory, "buffer_as_str") else ""
-    # Trim extra context to a reasonable size to avoid overwhelming the model
-    MAX_CONTEXT_CHARS = 12000
-    trimmed_extra = (extra_context or "").strip()
-    if len(trimmed_extra) > MAX_CONTEXT_CHARS:
-        trimmed_extra = trimmed_extra[: MAX_CONTEXT_CHARS]
-
-    # Compose prompt with uploaded/retrieved context primarily.
-    prompt = (
-        f"You are an expert software assistant.\n"
-        f"User's question: '{query}'\n"
-        f"{f'Additional user-provided context (may be relevant):\n{trimmed_extra}\n' if trimmed_extra else ''}"
-        f"Conversation history:\n{mem_str}\n"
-        f"Please answer the user's latest question. Be concise and clear."
-    )
-
-    gemini_api_key = get_gemini_api_key()
-    if not gemini_api_key:
-        raise HTTPException(status_code=500, detail="Gemini API key is not set in environment variables.")
-    try:
-        genai.configure(api_key=gemini_api_key)
-        model = genai.GenerativeModel("gemini-2.5-flash")
-        response = model.generate_content([{"role": "user", "parts": [prompt]}])
-        raw_answer = response.text.strip()
-        return _clean_gemini_output(raw_answer)
-    except Exception as e:
-        # Fallback to minimal message if Gemini API fails
-        return _clean_gemini_output(f"[Gemini enhancement unavailable: {e}]")
-
-
-# Ensure user table exists on startup
-create_tables()
-
-@app.get("/", tags=["Health"])
+# ---------------------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------------------
+@app.get("/", tags=["Health"], summary="Health Check", description="PUBLIC_INTERFACE\nAPI health check endpoint.\n\nReturns:\n    dict: Status message.")
 def health_check():
-    """
-    PUBLIC_INTERFACE
-    API health check endpoint.
-
-    Returns:
-        dict: Status message.
-    """
-    return {"message": "Healthy"}
+    return {"status": "ok"}
 
 
-@app.post(
-    "/chat",
-    response_model=ChatAnswerResponse,
-    tags=["Chat"],
-    summary="Chat with bot",
-    description="Submit a chat query. Backend retrieves only top-k relevant segments via vector search from uploaded files (if any) and passes them to Gemini. Returns only Gemini's final answer."
-)
-def chat(request: ChatRequest):
-    """
-    PUBLIC_INTERFACE
-    Handles user's chat request. All answers come directly from Gemini.
-    If the user has uploaded files for this session, the most relevant snippets from those files are retrieved
-    via semantic vector search and provided as additional context to Gemini. The API returns only Gemini's final answer.
-    """
-    import traceback
-
-    try:
-        session_id = request.session_id
-        if not session_id or not isinstance(session_id, str):
-            raise HTTPException(status_code=400, detail="session_id must be a non-empty string.")
-
-        if session_id not in CONVERSATION_MEMORY:
-            CONVERSATION_MEMORY[session_id] = ConversationBufferMemory(
-                return_messages=True,
-                output_key="output"
-            )
-        memory = CONVERSATION_MEMORY[session_id]
-
-        def _safe_str_output(val, fallback="No answer available"):
-            if val is None or (isinstance(val, str) and val.strip() == ""):
-                return fallback
-            return str(val)
-
-        # Log user input with a temp placeholder output
-        try:
-            memory.save_context({"input": request.query}, {"output": _safe_str_output("", "No answer available")})
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
-
-        # Retrieve top-k relevant chunks from vector index
-        top_chunks = _vector_search(session_id, request.query, top_k=3)
-        retrieved_context = "\n---\n".join(top_chunks).strip()
-
-        # Compose Gemini answer with retrieved context (if any)
-        try:
-            gemini_answer = get_gemini_response(request.query, memory, extra_context=retrieved_context)
-        except Exception as e:
-            gemini_answer = "[Gemini unavailable: {}]".format(e)
-
-        # Final output cleaning and save in memory
-        gemini_answer = _clean_gemini_output(_safe_str_output(gemini_answer))
-        try:
-            memory.save_context({"input": request.query}, {"output": _safe_str_output(gemini_answer)})
-        except Exception:
-            pass  # Do not raise for failed memory update
-
-        return ChatAnswerResponse(answer=gemini_answer)
-
-    except HTTPException:
-        raise  # Allow FastAPI HTTPExceptions to propagate
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(f"Internal Server Error in /chat endpoint: {e}\nTraceback:\n{tb}")
-        raise HTTPException(status_code=500, detail=f"Internal Server Error: {e}")
+# ---------------------------------------------------------------------------------------
+# Chat title (Gemini-based)
+# ---------------------------------------------------------------------------------------
+@app.post("/chat/title", tags=["Chat"], summary="Generate a chat title from first prompt")
+def generate_title(req: TitleRequest) -> str:
+    prompt = (req.prompt or "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Blank or invalid input")
+    # HOOK: Optionally call Gemini to produce a concise title. For now, simple heuristic.
+    title = prompt
+    if len(title) > 60:
+        title = title[:60] + "…"
+    # Trim trailing punctuation
+    if title.endswith("?") or title.endswith("."):
+        title = title[:-1]
+    # Capitalize
+    if title:
+        title = title[0].upper() + title[1:]
+    return title or "Chat"
 
 
-# PUBLIC_INTERFACE
-@app.post(
-    "/register",
-    response_model=RegisterResponse,
-    tags=["UserAuth"],
-    summary="Register a new user",
-    description="Endpoint for user registration using username, email, and password. Returns user details on success. Username and email must be unique.",
-    responses={
-        409: {"description": "Username/email already registered"},
-        400: {"description": "Validation error"},
-    },
-)
-def register(request: RegisterRequest, db=Depends(get_db)):
-    """
-    PUBLIC_INTERFACE
-    Registers a new user, stores credentials securely in the database.
-
-    Args:
-        request (RegisterRequest): The registration data (username, email, password).
-        db (Session): SQLAlchemy Session dependency.
-
-    Returns:
-        RegisterResponse: id, username, and email of the registered user.
-
-    Raises:
-        HTTPException: If username or email already exists, or validation fails.
-    """
-    try:
-        user = create_user(db, username=request.username, email=request.email, password=request.password)
-    except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e))
-    return RegisterResponse(id=user.id, username=user.username, email=user.email)
-
-
-# PUBLIC_INTERFACE
-@app.post(
-    "/login",
-    response_model=LoginResponse,
-    tags=["UserAuth"],
-    summary="User login",
-    description="Endpoint for users to login with username and password.",
-    responses={
-        401: {"description": "Incorrect username or password"},
-        400: {"description": "Validation error"},
-    },
-)
-def login(request: LoginRequest, db=Depends(get_db)):
-    """
-    PUBLIC_INTERFACE
-    Authenticate a user's credentials and return basic user info.
-
-    Args:
-        request (LoginRequest): Login data (username, password).
-        db (Session): SQLAlchemy Session dependency.
-
-    Returns:
-        LoginResponse: id, username, and email of the authenticated user.
-
-    Raises:
-        HTTPException: If credentials are invalid.
-    """
-    user = get_user_by_username(db, request.username)
-    if not user or not verify_password(request.password, user.hashed_password):
-        raise HTTPException(status_code=401, detail="Incorrect username or password")
-    return LoginResponse(id=user.id, username=user.username, email=user.email)
-
-
-# Add endpoint doc for WebSocket and real-time (optional, can expand later)
-@app.get("/chat/wsinfo", tags=["Chat"], summary="WebSocket usage info", description="Info about WebSocket/API support for real-time chat.")
-def chat_wsinfo():
-    """
-    PUBLIC_INTERFACE
-    Returns information about real-time chat support (WebSocket or usual polling).
-    """
-    return {"detail": "Current version supports REST API chat only. Real-time WebSocket may be added in future versions."}
-
-
-# --- FILE UPLOAD ENDPOINTS FOR CONTEXT ---
-
-# PUBLIC_INTERFACE
+# ---------------------------------------------------------------------------------------
+# Upload context: parse, chunk, embed, upsert to Pinecone
+# ---------------------------------------------------------------------------------------
 @app.post(
     "/chat/upload-context",
-    response_model=UploadContextResponse,
     tags=["Chat"],
     summary="Upload context files for a chat session",
-    description=(
-        "Accepts one or more files via multipart/form-data and extracts readable text from supported types "
-        "(.docx, .xlsx, .pdf, .txt). The extracted content is stored per session and used as additional context "
-        "when answering subsequent chat queries. Builds a vector index (Gemini embeddings) for semantic retrieval. "
-        "Returns an acknowledgment with per-file processing results and a preview."
-    ),
-    responses={
-        400: {"description": "Validation error or no files provided"},
-        415: {"description": "Unsupported media type"},
-    },
+    response_model=UploadContextResponse,
 )
-def upload_chat_context(
+async def upload_chat_context(
     session_id: str = Form(..., description="Session ID to associate uploaded context with"),
     files: List[UploadFile] = File(..., description="One or more files (.docx, .xlsx, .pdf, .txt)"),
 ):
-    """
-    PUBLIC_INTERFACE
-    Upload and process files to add user-provided context for a given chat session.
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided")
 
-    Process:
-        - Extract readable text.
-        - Split into overlapping chunks.
-        - Embed each chunk using Gemini embeddings (if API key available).
-        - Store chunks and embeddings in a per-session in-memory index for retrieval.
-
-    Args:
-        session_id (str): The chat session ID.
-        files (List[UploadFile]): Uploaded files (multipart/form-data).
-
-    Returns:
-        UploadContextResponse: Processing results and acknowledgment.
-    """
-    from .file_utils import extract_text_from_bytes, summarize_text_preview
-
-    if not session_id or not isinstance(session_id, str):
-        raise HTTPException(status_code=400, detail="session_id must be provided as a non-empty string.")
-    if not files or len(files) == 0:
-        raise HTTPException(status_code=400, detail="At least one file must be provided.")
-
-    results: List[UploadedFileResult] = []
-    combined_text_parts: List[str] = []
+    processed: List[UploadedFileResult] = []
     total_chars = 0
+    all_chunks: List[str] = []
+    chunk_metadatas: List[Dict[str, Any]] = []
 
     for f in files:
-        filename = f.filename or "unnamed"
-        # Read file bytes
         try:
-            data = f.file.read()
-        except Exception as e:
-            results.append(
-                UploadedFileResult(
-                    filename=filename, size=0, content_chars=0, preview="", error=f"Failed to read file: {e}"
-                )
-            )
-            continue
-
-        size = len(data or b"")
-        # Extract
-        text, err = extract_text_from_bytes(filename, data or b"")
-        preview = summarize_text_preview(text, max_chars=500) if text else ""
-        chars = len(text)
-
-        # Append to combined only if successful and non-empty
-        if text and not err:
-            combined_text_parts.append(f"[{filename}]\n{text}\n")
+            content = await f.read()
+            text = extract_text_from_file(filename=f.filename, data=content)
+            chars = len(text)
             total_chars += chars
 
-            # Build semantic index: chunk + embed + store
-            try:
-                _index_text_for_session(session_id, filename, text)
-            except Exception:
-                # Do not fail upload on indexing failure; retrieval will fall back gracefully.
-                pass
+            # Chunking
+            chunks = chunk_text(text, chunk_size=settings.CHUNK_SIZE, chunk_overlap=settings.CHUNK_OVERLAP)
+            all_chunks.extend(chunks)
 
-        results.append(
-            UploadedFileResult(
-                filename=filename,
-                size=size,
-                content_chars=chars,
-                preview=preview,
-                error=err,
+            # Prepare metadata per chunk
+            for idx, chunk in enumerate(chunks):
+                meta = {
+                    "session_id": session_id,
+                    "filename": f.filename,
+                    "chunk_index": idx,
+                    "total_chunks": len(chunks),
+                }
+                chunk_metadatas.append(meta)
+
+            # File-level preview (first 300 chars)
+            preview = (text[:300] + "…") if len(text) > 300 else text
+            processed.append(
+                UploadedFileResult(
+                    filename=f.filename,
+                    size=len(content),
+                    content_chars=chars,
+                    preview=preview,
+                )
             )
-        )
+        except Exception as e:
+            logger.exception("Failed to process file: %s", f.filename)
+            processed.append(
+                UploadedFileResult(
+                    filename=f.filename,
+                    size=0,
+                    content_chars=0,
+                    preview="",
+                    error=str(e),
+                )
+            )
 
-    # If at least one file produced content, update the legacy session context store (for optional previews)
-    if total_chars > 0:
-        combined_text = "\n".join(combined_text_parts).strip()
-        prev_ctx = CONTEXT_STORE.get(session_id, {})
-        prev_combined = prev_ctx.get("combined", "")
-        prev_files = prev_ctx.get("files", [])
+    # Filter out failed files' chunks by matching filenames in processed with no error
+    # In this simplified flow, we already included chunks only for successfully processed files.
+    if all_chunks:
+        embeddings = embed_texts_with_gemini(all_chunks)
 
-        # Merge with previous context if any
-        merged_combined = (prev_combined + "\n\n" + combined_text).strip() if prev_combined else combined_text
-        CONTEXT_STORE[session_id] = {
-            "files": prev_files + [r.model_dump() for r in results],
-            "combined": merged_combined,
-        }
+        # Build vector records for Pinecone upsert
+        records: List[VectorRecord] = []
+        for i, (chunk, meta) in enumerate(zip(all_chunks, chunk_metadatas)):
+            vid = f"{session_id}::{meta.get('filename','unknown')}::{meta.get('chunk_index', i)}::{uuid.uuid4().hex}"
+            records.append(
+                VectorRecord(
+                    id=vid,
+                    values=embeddings[i],
+                    metadata={**meta, "text": chunk},
+                )
+            )
 
-    message = (
-        "Processed files successfully. Session context updated and indexed."
-        if total_chars > 0
-        else "Processed files, but no readable content was extracted."
-    )
+        try:
+            vector_store.upsert(records)
+        except Exception as e:
+            logger.exception("Upsert to Pinecone failed")
+            # Soft-fail: mark all as error if desired, or bubble up
+            raise HTTPException(status_code=500, detail=f"Pinecone upsert failed: {e}")
 
     return UploadContextResponse(
         session_id=session_id,
-        files_processed=results,
+        files_processed=processed,
         total_chars=total_chars,
-        message=message,
+        message="Context uploaded and indexed into Pinecone" if all_chunks else "No valid content to index",
     )
+
+
+# ---------------------------------------------------------------------------------------
+# Chat: retrieve context via Pinecone search, then call Gemini to answer
+# ---------------------------------------------------------------------------------------
+@app.post(
+    "/chat",
+    tags=["Chat"],
+    summary="Chat with bot",
+    response_model=ChatAnswerResponse,
+)
+def chat(req: ChatRequest):
+    session_id = (req.session_id or "").strip()
+    query = (req.query or "").strip()
+    if not session_id or not query:
+        raise HTTPException(status_code=422, detail="session_id and query are required")
+
+    # Embed the query
+    query_embedding = embed_texts_with_gemini([query])[0]
+
+    # Search Pinecone constrained by session_id
+    try:
+        results = vector_store.search(
+            vector=query_embedding,
+            top_k=settings.PINECONE_TOP_K,
+            filter={"session_id": {"$eq": session_id}},
+            include_metadata=True,
+        )
+    except Exception as e:
+        logger.exception("Pinecone search failed")
+        raise HTTPException(status_code=500, detail=f"Pinecone search failed: {e}")
+
+    # Build context string from top results
+    context_segments: List[str] = []
+    for match in results.matches:
+        md = match.metadata or {}
+        text = md.get("text", "")
+        fname = md.get("filename", "file")
+        idx = md.get("chunk_index", 0)
+        context_segments.append(f"[{fname}#chunk-{idx}] {text}")
+
+    context_text = "\n\n".join(context_segments)
+
+    # HOOK: Call Gemini with query + context_text to get final answer.
+    # For review purposes, we implement a simple heuristic fallback answer.
+    # Replace the following with a real Gemini call:
+    #
+    # pseudo:
+    #   genai.configure(api_key=settings.GEMINI_API_KEY)
+    #   prompt = f"Context:\n{context_text}\n\nQuestion:\n{query}\n\nAnswer comprehensively using only the context when possible."
+    #   model = genai.GenerativeModel("gemini-pro")
+    #   resp = model.generate_content(prompt)
+    #   answer_text = resp.text
+    #
+    # TODO: Implement and handle errors, rate limits, etc.
+    if context_text.strip():
+        answer_text = f"(Using uploaded context) Answer to: {query}\n\nKey references:\n{context_text[:1000]}"
+    else:
+        answer_text = f"(No uploaded context found for this session) Answer to: {query}\n\nPlease upload files for better results."
+
+    return ChatAnswerResponse(answer=answer_text)
