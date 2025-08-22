@@ -900,34 +900,36 @@ def upload_chat_context(
                         headers = [str(h) if h is not None else "" for h in (file_catalog.get("sheets", [])[si].get("headers_original") or [])]
                         ns = f"xlsx:{filename}:{ws.title}"
                         # iterate rows, skipping header row (assumed at 1)
-                        row_num = 0
-                        for row in ws.iter_rows(values_only=True):
-                            row_num += 1
-                            if row_num == 1:
-                                continue
-                            values = list(row)
-                            # Build text from informative columns
-                            parts = []
-                            meta: Dict[str, Any] = {"row_num": row_num}
-                            for col_idx in idxs:
-                                if col_idx < len(values):
-                                    val = values[col_idx]
-                                    if val is None or (isinstance(val, str) and val.strip() == ""):
-                                        continue
-                                    header = headers[col_idx] if col_idx < len(headers) else f"col_{col_idx}"
-                                    parts.append(f"{header}: {val}")
-                                    meta[header] = val if isinstance(val, (str, int, float, bool)) else str(val)
-                            text = " | ".join(parts).strip()
-                            if text:
-                                total_rows_enqueued += 1
-                                # For id, we can use session_id + filename + sheet + row number
-                                payload = {
-                                    "id": f"{session_id}:{filename}:{ws.title}:{row_num}",
-                                    "text": text,
-                                    "metadata": meta,
-                                }
-                                # Batch enqueued via function which slices into EMBEDDING_BATCH_SIZE
-                                enqueue_embedding_job(job.job_id, session_id, ns, [payload])
+                        # Use explicit bounds to avoid premature truncation.
+                        max_r = ws.max_row or 0
+                        if max_r > 1:
+                            for row_idx, row in enumerate(
+                                ws.iter_rows(min_row=2, max_row=max_r, values_only=True),
+                                start=2
+                            ):
+                                values = list(row) if row is not None else []
+                                # Build text from informative columns
+                                parts = []
+                                meta: Dict[str, Any] = {"row_num": row_idx}
+                                for col_idx in idxs:
+                                    if col_idx < len(values):
+                                        val = values[col_idx]
+                                        if val is None or (isinstance(val, str) and str(val).strip() == ""):
+                                            continue
+                                        header = headers[col_idx] if col_idx < len(headers) else f"col_{col_idx}"
+                                        parts.append(f"{header}: {val}")
+                                        meta[header] = val if isinstance(val, (str, int, float, bool)) else str(val)
+                                text = " | ".join(parts).strip()
+                                if text:
+                                    total_rows_enqueued += 1
+                                    # For id, we can use session_id + filename + sheet + row number
+                                    payload = {
+                                        "id": f"{session_id}:{filename}:{ws.title}:{row_idx}",
+                                        "text": text,
+                                        "metadata": meta,
+                                    }
+                                    # Batch enqueued via function which slices into EMBEDDING_BATCH_SIZE
+                                    enqueue_embedding_job(job.job_id, session_id, ns, [payload])
                     # record enqueued rows into job catalog
                     try:
                         from .job_tracker import JOBS as _JOBS

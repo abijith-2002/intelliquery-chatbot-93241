@@ -139,9 +139,18 @@ def merge_types(current: str, new: str) -> str:
 
 def _iter_sheet_rows(ws: Worksheet) -> Generator[List[Any], None, None]:
     """
-    Stream rows from a worksheet using openpyxl read_only iter_rows(values_only=True).
+    Stream rows from a worksheet using openpyxl in a robust, explicit-bounds way.
+
+    We iterate from row 1 to ws.max_row inclusive to avoid cases where a worksheet's
+    defined names or sparse data can cause iter_rows(values_only=True) without bounds
+    to yield fewer rows (e.g., 20) than actually present.
     """
-    for row in ws.iter_rows(values_only=True):
+    max_r = ws.max_row or 0
+    if max_r <= 0:
+        return
+    # Explicitly set min_row and max_row to ensure we visit all available rows.
+    for row in ws.iter_rows(min_row=1, max_row=max_r, values_only=True):
+        # Cast to list to maintain previous behavior; cells can be None.
         yield list(row)
 
 
@@ -213,18 +222,26 @@ def stream_xlsx_catalog(
 
         # Scan up to sample_rows_for_types rows
         scanned = 0
-        for row in rows_iter:
-            scanned += 1
-            # Map row cells to columns; pad/truncate to header length
-            # Guard against ragged rows
-            values = list(row) + [None] * max(0, len(col_stats) - len(row))
-            values = values[: len(col_stats)]
+        # After consuming header_row already, continue with remaining rows explicitly.
+        # Using ws.iter_rows with explicit bounds guards against unexpected truncation.
+        max_r = ws.max_row or 0
+        if max_r > header_row:
+            # Iterate from the first data row through max_row
+            for row in ws.iter_rows(min_row=header_row + 1, max_row=max_r, values_only=True):
+                scanned += 1
+                # Map row cells to columns; pad/truncate to header length
+                # Guard against ragged rows
+                row_list = list(row) if row is not None else []
+                values = row_list + [None] * max(0, len(col_stats) - len(row_list))
+                values = values[: len(col_stats)]
 
-            for stat, val in zip(col_stats, values):
-                stat.update(val)
+                for stat, val in zip(col_stats, values):
+                    stat.update(val)
 
-            if scanned >= sample_rows_for_types:
-                break
+                if scanned >= sample_rows_for_types:
+                    break
+        else:
+            scanned = 0
 
         # Finalize stats
         for stat in col_stats:
