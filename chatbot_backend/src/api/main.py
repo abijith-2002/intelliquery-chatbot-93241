@@ -65,6 +65,14 @@ openapi_tags = [
 # Register chat title router (Gemini-powered title generator)
 app.include_router(chat_title_router)
 
+# Start background worker for embeddings on app import/startup
+try:
+    from .background_worker import start_worker
+    start_worker()
+except Exception:
+    # non-fatal in case of import errors; app can still serve other endpoints
+    pass
+
 # Allow CORS from everywhere for demo/dev
 app.add_middleware(
     CORSMiddleware,
@@ -658,6 +666,79 @@ def upload_chat_context(
             try:
                 file_catalog = stream_xlsx_catalog(data, header_row=1, sample_rows_for_types=5000)
                 session_catalog["files"].append({"filename": filename, "catalog": file_catalog})
+                # After cataloging, stream the file again to build per-row texts for embedding
+                try:
+                    from openpyxl import load_workbook
+                    import io as _io
+                    from .background_worker import enqueue_embedding_job
+                    bio2 = _io.BytesIO(data)
+                    wb2 = load_workbook(bio2, data_only=True, read_only=True)
+                    # Create informative text per row from columns inferred as informative (non-null, not purely IDs).
+                    # Heuristic: choose columns with inferred_type in {"string","number"} and non_null > 0,
+                    # and ignore columns whose normalized name looks like pure id keys (e.g., 'id', 'uid')
+                    def _is_informative(col: dict) -> bool:
+                        name = (col.get("normalized_name") or "").lower()
+                        if name in {"id", "uid", "uuid", "pk", "primary_key"}:
+                            return False
+                        t = (col.get("inferred_type") or "string").lower()
+                        return t in {"string", "number"} and (col.get("non_null") or 0) > 0
+
+                    # Build a quick lookup of informative columns per sheet index
+                    informative_cols_by_sheet: dict[int, List[int]] = {}
+                    for si, sheet_meta in enumerate((file_catalog or {}).get("sheets", [])):
+                        cols = sheet_meta.get("columns", []) or []
+                        idxs = [i for i, c in enumerate(cols) if _is_informative(c)]
+                        if idxs:
+                            informative_cols_by_sheet[si] = idxs
+
+                    total_rows_enqueued = 0
+                    for si, ws in enumerate(wb2.worksheets):
+                        # skip if no informative cols
+                        if si not in informative_cols_by_sheet:
+                            continue
+                        idxs = informative_cols_by_sheet[si]
+                        headers = [str(h) if h is not None else "" for h in (file_catalog.get("sheets", [])[si].get("headers_original") or [])]
+                        ns = f"xlsx:{filename}:{ws.title}"
+                        # iterate rows, skipping header row (assumed at 1)
+                        row_num = 0
+                        for row in ws.iter_rows(values_only=True):
+                            row_num += 1
+                            if row_num == 1:
+                                continue
+                            values = list(row)
+                            # Build text from informative columns
+                            parts = []
+                            meta: Dict[str, Any] = {"row_num": row_num}
+                            for col_idx in idxs:
+                                if col_idx < len(values):
+                                    val = values[col_idx]
+                                    if val is None or (isinstance(val, str) and val.strip() == ""):
+                                        continue
+                                    header = headers[col_idx] if col_idx < len(headers) else f"col_{col_idx}"
+                                    parts.append(f"{header}: {val}")
+                                    meta[header] = val if isinstance(val, (str, int, float, bool)) else str(val)
+                            text = " | ".join(parts).strip()
+                            if text:
+                                total_rows_enqueued += 1
+                                # For id, we can use session_id + filename + sheet + row number
+                                payload = {
+                                    "id": f"{session_id}:{filename}:{ws.title}:{row_num}",
+                                    "text": text,
+                                    "metadata": meta,
+                                }
+                                # Batch enqueued via function which slices into EMBEDDING_BATCH_SIZE
+                                enqueue_embedding_job(job.job_id, session_id, ns, [payload])
+                    # record enqueued rows into job catalog
+                    try:
+                        from .job_tracker import JOBS as _JOBS
+                        if job.job_id in _JOBS:
+                            _JOBS[job.job_id].catalog.setdefault("embedding_progress", {})
+                            _JOBS[job.job_id].catalog["embedding_progress"]["rows_enqueued"] = total_rows_enqueued
+                    except Exception:
+                        pass
+                except Exception as _e:
+                    # embedding prep failed; record but do not stop file ingestion
+                    session_catalog["files"][-1]["embedding_prep_error"] = str(_e)
             except Exception as e:
                 # Non-fatal; continue with text extraction pipeline
                 session_catalog["files"].append({"filename": filename, "catalog_error": str(e)})
