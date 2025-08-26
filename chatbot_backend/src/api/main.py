@@ -65,6 +65,14 @@ openapi_tags = [
 # Register chat title router (Gemini-powered title generator)
 app.include_router(chat_title_router)
 
+# Register XLSX upload routes
+try:
+    from .xlsx_routes import router as xlsx_router
+    app.include_router(xlsx_router)
+except Exception:
+    # non-fatal if optional dependencies missing
+    pass
+
 # Start background worker for embeddings on app import/startup
 try:
     from .background_worker import start_worker
@@ -417,15 +425,10 @@ def health_check():
 def chat(request: ChatRequest):
     """
     PUBLIC_INTERFACE
-    Handles user's chat request using hybrid retrieval:
-      1) Semantic search over background vector embeddings (top-K rows).
-      2) Lightweight extraction of referenced column filters (e.g., `status: open`, `amount > 1000`)
-         and application via vector store metadata filtering/SQL where possible for precise queries.
-      3) Returns Gemini's answer and a structured data_context to power frontend display.
-
-    Notes:
-    - If embeddings are not available yet, falls back to legacy in-memory RAG chunks.
-    - Filtering supports simple equality and contains semantics; numeric comparisons are matched when values look numeric.
+    Handles user queries with two modes:
+      - Type 1 (structured XLSX retrieval): return ONLY pandas code operating on the uploaded dataframe.
+      - Type 2 (general QA): return ONLY natural language using Gemini with RAG context.
+    Never mix code and explanation in the same response.
     """
     import traceback
     import re
@@ -447,45 +450,87 @@ def chat(request: ChatRequest):
                 return fallback
             return str(val)
 
-        # Log user input with a temp placeholder output
+        # Save incoming turn
         try:
             memory.save_context({"input": request.query}, {"output": _safe_str_output("", "No answer available")})
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
+        except Exception:
+            raise HTTPException(status_code=500, detail="Failed to save user context.")
 
-        query_text = request.query or ""
+        query_text = (request.query or "").strip()
 
-        # Extract simple "field: value" pairs (case-insensitive keys) and numeric comparisons from the query
-        # Examples matched: "status: open", "department: Sales", "amount > 1000", "qty <= 5"
+        # Classification heuristic:
+        # If the session has XLSX loaded and the query appears to ask for data/table operations,
+        # classify as Type 1. Indicators: mentions of columns, filters, sort, top/first/last, sum/avg/etc.
+        from .xlsx_utils import XLSX_SESSIONS, get_default_dataframe, build_pandas_code
+
+        def looks_type1(q: str) -> bool:
+            if session_id not in XLSX_SESSIONS:
+                return False
+            patterns = [
+                r"\b(top|first|last)\s+\d+",
+                r"\b(sort|order)\s+by\b",
+                r"\blimit\s+\d+",
+                r"\b(sum|avg|average|mean|count|max|min)\s+of\b",
+                r"[A-Za-z0-9_ ]+\s*:\s*[^\n,;]+",      # contains filter like status: open
+                r"[A-Za-z0-9_ ]+\s*(>=|<=|>|<|==|=)\s*[0-9]",  # numeric comparison
+                r"\bselect\b", r"\bfilter\b", r"\bgroup\b", r"\baggregate\b",
+            ]
+            for pat in patterns:
+                if re.search(pat, q, flags=re.IGNORECASE):
+                    return True
+            # Mention of "table", "rows", "columns"
+            if re.search(r"\b(table|rows?|columns?)\b", q, flags=re.IGNORECASE):
+                return True
+            return False
+
+        if looks_type1(query_text):
+            # Type 1: Generate pandas code using the default dataframe
+            try:
+                fname, sheet, df = get_default_dataframe(session_id)
+            except Exception:
+                # If no dataframe, fall back to Type 2
+                fname, sheet, df = None, None, None
+
+            if df is not None:
+                df_var = "df"  # fixed reference name for generated code
+                code = build_pandas_code(query_text, df_var, df)
+                # For Type 1: must return ONLY code, no explanation.
+                answer_text = code.strip()
+                # Save final turn strictly as code
+                try:
+                    memory.save_context({"input": query_text}, {"output": _safe_str_output(answer_text)})
+                except Exception:
+                    pass
+                return ChatAnswerResponse(answer=answer_text, data_context={"mode": "type1", "source": {"file": fname, "sheet": sheet}})
+            # else fallback to Type 2 if dataframe not available
+
+        # Type 2: General QA with RAG (legacy retrieval path preserved)
+        # Reuse previous retrieval code for vector store + lexical fallback
+        # Extract simple filters for keyword_filter (as legacy behavior)
         field_value_pairs: Dict[str, Any] = {}
         numeric_conditions: List[Dict[str, Any]] = []
-        # field: value
         for m in re.finditer(r"([A-Za-z0-9_ ]+)\s*:\s*([^\n,;]+)", query_text):
             key = m.group(1).strip()
             val = m.group(2).strip()
             if key:
                 field_value_pairs[key] = val
-        # numeric comparators
         for m in re.finditer(r"([A-Za-z0-9_ ]+)\s*(>=|<=|>|<|=)\s*([0-9]+(?:\.[0-9]+)?)", query_text):
             key = m.group(1).strip()
             op = m.group(2)
             num = float(m.group(3))
             numeric_conditions.append({"field": key, "op": op, "value": num})
 
-        # Normalize keys to match normalized headers when possible (lowercase snakeish)
         def _norm_key(k: str) -> str:
             return re.sub(r"[^a-z0-9_]", "", re.sub(r"\s+", "_", k.strip().lower()))
 
         normalized_where = { _norm_key(k): v for k, v in field_value_pairs.items() if k.strip() }
 
-        # Build semantic retrieval using background vector store if available
         from .vector_store import get_vector_store
         from .config_utils import get_gemini_api_key as _get_key
 
         data_context: Dict[str, Any] = {"retrieval": {"top_k": 5, "used": "vector_store"}, "hits": []}
         retrieved_context_text = ""
 
-        # Attempt vector-store retrieval if we can embed the query
         query_vec = None
         try:
             key = _get_key()
@@ -511,12 +556,10 @@ def chat(request: ChatRequest):
             except Exception:
                 vector_hits = []
 
-        # Apply lightweight field filters via keyword_filter when we have any field constraints
         filtered_hits: List[Dict[str, Any]] = []
         if store and normalized_where:
             try:
                 filtered_hits = store.keyword_filter(session_id=session_id, where=normalized_where, limit=100)
-                # Post-filter numeric conditions
                 def _passes_numeric(meta: Dict[str, Any]) -> bool:
                     for cond in numeric_conditions:
                         field = _norm_key(cond["field"])
@@ -537,23 +580,17 @@ def chat(request: ChatRequest):
             except Exception:
                 filtered_hits = []
 
-        # Merge results: if filtered hits exist, prefer them; otherwise use vector hits.
         hits = filtered_hits if filtered_hits else vector_hits
 
-        # As a fallback if no vector store or embeddings, use legacy in-memory chunk retrieval
         if not hits:
             top_chunks = _vector_search(session_id, query_text, top_k=3)
             retrieved_context_text = "\n---\n".join(top_chunks).strip()
             data_context["retrieval"]["used"] = "legacy_chunk_index"
             data_context["hits"] = [{"text": t} for t in top_chunks]
         else:
-            # Build text by concatenating selected fields if present; otherwise, format metadata pairs
             contexts = []
             for h in hits:
                 meta = h.get("metadata", {}) or {}
-                # Reconstruct row text from metadata (the background worker constructed texts "header: value | ...")
-                # We'll join known informative fields first if available
-                # If the original "text" is not stored, we derive from metadata
                 parts = []
                 for k, v in meta.items():
                     parts.append(f"{k}: {v}")
@@ -562,23 +599,22 @@ def chat(request: ChatRequest):
             retrieved_context_text = "\n---\n".join(contexts[:5]).strip()
             data_context["hits"] = hits
 
-        # Compose Gemini answer with retrieved context (if any)
+        # Gemini natural language answer (Type 2)
         try:
             gemini_answer = get_gemini_response(query_text, memory, extra_context=retrieved_context_text)
-        except Exception as e:
-            gemini_answer = "[Gemini unavailable: {}]".format(e)
+        except Exception:
+            gemini_answer = "[Gemini unavailable]"
 
-        # Final output cleaning and save in memory
         gemini_answer = _clean_gemini_output(_safe_str_output(gemini_answer))
         try:
             memory.save_context({"input": query_text}, {"output": _safe_str_output(gemini_answer)})
         except Exception:
-            pass  # Do not raise for failed memory update
+            pass
 
         return ChatAnswerResponse(answer=gemini_answer, data_context=data_context)
 
     except HTTPException:
-        raise  # Allow FastAPI HTTPExceptions to propagate
+        raise
     except Exception as e:
         tb = traceback.format_exc()
         print(f"Internal Server Error in /chat endpoint: {e}\nTraceback:\n{tb}")
@@ -821,10 +857,8 @@ def upload_chat_context(
     if not files or len(files) == 0:
         raise HTTPException(status_code=400, detail="At least one file must be provided.")
 
-    # Reject .xlsx files explicitly
-    for f in files:
-        if (f.filename or "").lower().endswith(".xlsx"):
-            raise HTTPException(status_code=415, detail="Unsupported media type: .xlsx files are no longer supported.")
+    # Accepting .xlsx but not processed here; encourage dedicated endpoint for structured ingestion
+    # .xlsx will be ignored in this endpoint and not counted toward text context.
 
     # Initialize job tracking
     filenames = [(f.filename or "unnamed") for f in files]
