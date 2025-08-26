@@ -894,27 +894,37 @@ def upload_chat_context(
                 pass
             continue
 
-        # Extract text for supported types
+        # Extract text for supported types (.txt, .pdf, .docx). For .xlsx we provide a helpful preview note.
+        is_xlsx = (filename or "").lower().endswith(".xlsx")
+
         text, err = extract_text_from_bytes(filename, data or b"")
-        preview = summarize_text_preview(text, max_chars=500) if text else ""
-        chars = len(text)
+        # Provide a preview note for XLSX to indicate proper route
+        if is_xlsx and not err:
+            preview = "XLSX detected. Use /chat/upload-xlsx for sheet catalog and data retrieval."
+            chars = 0
+        else:
+            preview = summarize_text_preview(text, max_chars=500) if text else ""
+            chars = len(text)
 
         # store to job record
         try:
             rec = JOBS[job.job_id].files[idx]
             rec.preview = preview
             rec.content_chars = chars
-            rec.message = "Processed"
+            rec.message = "Processed" if not is_xlsx else "XLSX acknowledged (use /chat/upload-xlsx)"
             if err:
                 rec.status = "error"
                 rec.error = err
             else:
+                # XLSX is accepted but not ingested in this endpoint
                 rec.status = "done"
+                if is_xlsx:
+                    rec.error = None
         except Exception:
             pass
 
-        # Append to combined only if successful and non-empty
-        if text and not err:
+        # Append to combined only if successful and non-empty AND not xlsx
+        if (text and not err) and (not is_xlsx):
             combined_text_parts.append(f"[{filename}]\n{text}\n")
             total_chars += chars
             # Build semantic index: chunk + embed + store

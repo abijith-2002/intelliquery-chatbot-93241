@@ -19,6 +19,7 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
         - .txt  : UTF-8 decode with errors ignored
         - .pdf  : pdfminer.six text extraction
         - .docx : python-docx extraction (paragraphs and table cells)
+        - .xlsx : routed to spreadsheet ingestion, not text-extracted here
 
     Args:
         filename (str): Original filename (used for type detection).
@@ -26,7 +27,7 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
 
     Returns:
         Tuple[str, Optional[str]]: (text, error)
-            - text: extracted text content (empty if error)
+            - text: extracted text content (empty if non-text file like .xlsx)
             - error: error message if extraction failed, otherwise None
     """
     name_lower = (filename or "").lower()
@@ -38,8 +39,11 @@ def extract_text_from_bytes(filename: str, content: bytes) -> Tuple[str, Optiona
             return _extract_pdf(content), None
         if name_lower.endswith(".docx"):
             return _extract_docx(content), None
-        # XLSX support removed
-        return "", f"Unsupported file type for '{filename}'. Allowed: .txt, .pdf, .docx"
+        if name_lower.endswith(".xlsx"):
+            # Accept XLSX in general handler but no text extraction here.
+            # Frontend/backend should use /chat/upload-xlsx for catalog + embeddings.
+            return "", None
+        return "", f"Unsupported file type for '{filename}'. Allowed: .txt, .pdf, .docx, .xlsx"
     except Exception as e:
         return "", f"Failed to extract '{filename}': {e}"
 
