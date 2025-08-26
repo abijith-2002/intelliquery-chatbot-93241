@@ -79,9 +79,27 @@ def upload_xlsx(
             # ingest and catalog
             res = ingest_xlsx_for_session(session_id, filename, data)
             try:
+                # Update job file record with a meaningful preview
+                sheet_summaries = []
+                total_rows = 0
+                for s in res.sheets:
+                    # compute rows from in-memory df to ensure accurate cap consideration
+                    rows = 0
+                    try:
+                        from . import xlsx_utils as _xlsx
+                        rows = len(_xlsx.XLSX_SESSIONS[session_id]["files"][filename]["sheets"][s]["df"])
+                    except Exception:
+                        rows = 0
+                    cols = res.columns_per_sheet.get(s, [])
+                    total_rows += int(rows)
+                    sheet_summaries.append(f"{s} ({rows} rows, {len(cols)} cols)")
+                preview_msg = f"{len(res.sheets)} sheet(s): " + ", ".join(sheet_summaries)
+                # set record fields
                 JOBS[job.job_id].files[idx].status = "done"
                 JOBS[job.job_id].files[idx].size = len(data or b"")
                 JOBS[job.job_id].files[idx].message = "XLSX ingested"
+                JOBS[job.job_id].files[idx].preview = preview_msg
+                JOBS[job.job_id].files[idx].content_chars = 0  # not text-based; keep 0
             except Exception:
                 pass
 
