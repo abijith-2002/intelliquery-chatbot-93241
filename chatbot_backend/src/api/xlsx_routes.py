@@ -61,7 +61,10 @@ def upload_xlsx(
     for idx, f in enumerate(files):
         filename = f.filename or "unnamed.xlsx"
         try:
+            # Read the entire content once
             data = f.file.read()
+            if not data or len(data) == 0:
+                raise ValueError("Uploaded file is empty.")
         except Exception as e:
             # mark error
             try:
@@ -110,6 +113,9 @@ def upload_xlsx(
             filemeta = sess.get("files", {}).get(filename, {})
             for sheet_name, sh in (filemeta.get("sheets") or {}).items():
                 df: pd.DataFrame = sh["df"]
+                # Skip empty dataframes
+                if df is None or getattr(df, "empty", False):
+                    continue
                 namespace = f"xlsx:{filename}:{sheet_name}"
                 payloads = []
                 # Create a concatenated row text and normalized metadata
@@ -118,7 +124,12 @@ def upload_xlsx(
                     parts = []
                     for col in df.columns:
                         val = row[col]
-                        sval = "" if pd.isna(val) else str(val)
+                        # pd.isna expects scalar; fallback defensively
+                        try:
+                            is_na = pd.isna(val)
+                        except Exception:
+                            is_na = False
+                        sval = "" if is_na else str(val)
                         norm_key = re_norm(col)
                         meta[norm_key] = sval
                         parts.append(f"{norm_key}: {sval}")

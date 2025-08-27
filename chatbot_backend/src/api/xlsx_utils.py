@@ -133,25 +133,54 @@ def ingest_xlsx_for_session(session_id: str, filename: str, content: bytes) -> X
     """
     PUBLIC_INTERFACE
     Load XLSX into memory for the session. Caps rows to 50k per sheet to avoid memory pressure.
+
+    Robustness:
+    - Parses with engine='openpyxl'
+    - Reads all columns as strings (dtype=str) to avoid dtype inference issues
+    - Skips sheets that fail to parse instead of failing the entire file
     """
+    if not content or len(content) == 0:
+        raise ValueError(f"Empty file received for '{filename}'.")
     bio = io.BytesIO(content)
-    xl = pd.ExcelFile(bio, engine="openpyxl")
+
+    try:
+        xl = pd.ExcelFile(bio, engine="openpyxl")
+    except Exception as e:
+        raise ValueError(f"Failed to open '{filename}' as XLSX: {e}")
+
     sess = XLSX_SESSIONS.setdefault(session_id, {"files": {}, "default": None})
     files = sess["files"].setdefault(filename, {"sheets": {}})
 
     rows_total = 0
     columns_per_sheet: Dict[str, List[str]] = {}
+    parsed_sheets: List[str] = []
+
     for sheet in xl.sheet_names:
-        df = xl.parse(sheet)
+        try:
+            # Read everything as text to ensure safe downstream processing/embeddings
+            df = xl.parse(sheet, dtype=str)
+        except Exception as e:
+            # Skip problematic sheet but continue others
+            continue
         if len(df) > 50000:
             df = df.iloc[:50000].copy()
+        # Ensure column names are strings
+        df.columns = [str(c) for c in df.columns]
         files["sheets"][sheet] = {"df": df, "columns": [str(c) for c in df.columns]}
         rows_total += len(df)
         columns_per_sheet[sheet] = [str(c) for c in df.columns]
+        parsed_sheets.append(sheet)
 
-    # set default to the first sheet of last uploaded file
-    sess["default"] = (filename, xl.sheet_names[0] if xl.sheet_names else None)
-    return XLSXIngestResult(filename=filename, sheets=xl.sheet_names, rows_total=rows_total, columns_per_sheet=columns_per_sheet)
+    # set default to the first successfully parsed sheet of last uploaded file
+    default_sheet = parsed_sheets[0] if parsed_sheets else (xl.sheet_names[0] if xl.sheet_names else None)
+    sess["default"] = (filename, default_sheet)
+
+    return XLSXIngestResult(
+        filename=filename,
+        sheets=parsed_sheets,
+        rows_total=rows_total,
+        columns_per_sheet=columns_per_sheet
+    )
 
 
 # PUBLIC_INTERFACE
