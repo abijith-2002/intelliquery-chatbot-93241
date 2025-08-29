@@ -527,14 +527,16 @@ def health_check():
 def chat(request: ChatRequest):
     """
     PUBLIC_INTERFACE
-    Handles user's chat request. All answers come directly from Gemini.
-    If the user has uploaded files for this session, the most relevant snippets from those files are retrieved
-    via semantic vector search and provided as additional context to Gemini. The API returns only Gemini's final answer.
+    Handles user's chat request. For Type 1 (data lookup) queries, the backend:
+      1) Generates a prompt including the user query, relevant (top-5) columns, and XLSX schema,
+      2) Uses Gemini to generate SAFE Pandas code (read-only, <= 20 rows),
+      3) Safely executes this code on the uploaded XLSX file(s),
+      4) Returns the resulting table/summary as the chat answer.
 
-    Internal step (for future use): The user's query is first classified using a rule-based detector:
-        - Type 1: data lookup (keywords: show, list, get rows, display, find, filter, where)
-        - Type 2: knowledge/explanation (default when uncertain)
-    The classification result is stored per-session but does not change answer generation yet.
+    For Type 2 queries (knowledge/explanation), the backend retrieves top-k relevant text chunks
+    via vector search and uses Gemini to produce a natural language answer.
+
+    All answers returned are concise and avoid source/meta disclaimers.
     """
     import traceback
 
@@ -555,7 +557,7 @@ def chat(request: ChatRequest):
                 return fallback
             return str(val)
 
-        # Rule-based classification (stored for future use)
+        # Classify query and persist meta
         c_type, c_label, c_kw = classify_query_type(request.query)
         try:
             SESSION_META.setdefault(session_id, {})
@@ -563,36 +565,95 @@ def chat(request: ChatRequest):
                 type=c_type, label=c_label, matched_keyword=c_kw
             ).model_dump()
         except Exception:
-            # Non-fatal; proceed even if meta storage fails
-            pass
+            pass  # non-fatal
 
-        # Log user input with a temp placeholder output
+        # Save incoming message (temp output placeholder)
         try:
             memory.save_context({"input": request.query}, {"output": _safe_str_output("", "No answer available")})
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
 
-        # Retrieve top-k relevant chunks from vector index
+        # If Type 1 data lookup, attempt XLSX/Pandas flow
+        if c_type == 1:
+            try:
+                from .xlsx_pandas_exec import (
+                    extract_xlsx_schema_from_bytes,
+                    get_top_k_relevant_columns_for_query,
+                    generate_pandas_code_with_gemini,
+                    execute_safe_pandas_code_on_xlsx,
+                )
+                # We need a recent uploaded XLSX. We don't persist raw files on disk; we can leverage
+                # the CONTEXT_STORE to find file names, but it contains extracted text only.
+                # To support execution, we store last XLSX bytes per session during upload (new small cache).
+            except Exception:
+                # If imports fail, fallback to Type 2 behavior
+                pass
+
+            # Try to use in-memory cache of last XLSX bytes (created by upload endpoint enhancement below)
+            xlsx_cache: Dict[str, bytes] = SESSION_META.setdefault(session_id, {}).get("__xlsx_cache__", {})  # type: ignore
+            if isinstance(xlsx_cache, dict) and xlsx_cache:
+                # choose the most recently added XLSX bytes
+                last_key = list(xlsx_cache.keys())[-1]
+                xbytes = xlsx_cache[last_key]
+                try:
+                    # Build schema
+                    schema = extract_xlsx_schema_from_bytes(xbytes)
+                    # choose relevant columns (top-5)
+                    header_store = get_session_header_embeddings(session_id)
+                    top_cols = get_top_k_relevant_columns_for_query(request.query, header_store, k=5)
+                    # Generate SAFE pandas code with Gemini
+                    code = generate_pandas_code_with_gemini(request.query, top_cols, schema)
+                    # Execute safely
+                    rendered = execute_safe_pandas_code_on_xlsx(code, xbytes)
+                    answer_text = rendered if rendered.strip() else "No matching rows found."
+                    # Save and return
+                    answer_text = _clean_gemini_output(_safe_str_output(answer_text))
+                    try:
+                        memory.save_context({"input": request.query}, {"output": _safe_str_output(answer_text)})
+                    except Exception:
+                        pass
+                    return ChatAnswerResponse(answer=answer_text)
+                except Exception as e:
+                    # If anything fails in the pandas path, fall back to normal Gemini answer with context
+                    fallback_err = f"[Data lookup flow failed: {e}]"
+                    # continue to Type 2 flow below with retrieved context, but include a short note
+                    fallback_note = fallback_err
+            else:
+                fallback_note = "[No XLSX available for data lookup]"
+
+            # Fallback to Type 2-like behavior if we reach here
+            top_chunks = _vector_search(session_id, request.query, top_k=3)
+            retrieved_context = "\n---\n".join(top_chunks).strip()
+            try:
+                gemini_answer = get_gemini_response(request.query, memory, extra_context=retrieved_context)
+            except Exception as e:
+                gemini_answer = f"[Gemini unavailable: {e}]"
+            final = (fallback_note + " " if fallback_note else "") + _clean_gemini_output(_safe_str_output(gemini_answer))
+            try:
+                memory.save_context({"input": request.query}, {"output": _safe_str_output(final)})
+            except Exception:
+                pass
+            return ChatAnswerResponse(answer=final)
+
+        # Type 2: knowledge/explanation (existing behavior)
         top_chunks = _vector_search(session_id, request.query, top_k=3)
         retrieved_context = "\n---\n".join(top_chunks).strip()
 
-        # Compose Gemini answer with retrieved context (if any)
         try:
             gemini_answer = get_gemini_response(request.query, memory, extra_context=retrieved_context)
         except Exception as e:
             gemini_answer = "[Gemini unavailable: {}]".format(e)
 
-        # Final output cleaning and save in memory
         gemini_answer = _clean_gemini_output(_safe_str_output(gemini_answer))
         try:
             memory.save_context({"input": request.query}, {"output": _safe_str_output(gemini_answer)})
         except Exception:
-            pass  # Do not raise for failed memory update
+            pass
 
         return ChatAnswerResponse(answer=gemini_answer)
 
     except HTTPException:
-        raise  # Allow FastAPI HTTPExceptions to propagate
+        raise
     except Exception as e:
         tb = traceback.format_exc()
         print(f"Internal Server Error in /chat endpoint: {e}\nTraceback:\n{tb}")
@@ -780,7 +841,24 @@ def upload_chat_context(
             continue
 
         size = len(data or b"")
-        # Extract
+        # If XLSX, cache raw bytes for later pandas execution (per-session, small in-memory cache)
+        try:
+            if (filename or "").lower().endswith(".xlsx") and data:
+                sess = SESSION_META.setdefault(session_id, {})
+                xcache: Dict[str, bytes] = sess.setdefault("__xlsx_cache__", {})  # type: ignore
+                # keep up to last 3 files to cap memory
+                if len(xcache) >= 3:
+                    to_del = list(xcache.keys())[0]
+                    try:
+                        del xcache[to_del]
+                    except Exception:
+                        pass
+                xcache[filename] = data  # store bytes
+        except Exception:
+            # non-fatal
+            pass
+
+        # Extract for previews and RAG
         text, err = extract_text_from_bytes(filename, data or b"")
         preview = summarize_text_preview(text, max_chars=500) if text else ""
         chars = len(text)
