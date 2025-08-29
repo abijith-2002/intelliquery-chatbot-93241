@@ -522,21 +522,24 @@ def health_check():
     response_model=ChatAnswerResponse,
     tags=["Chat"],
     summary="Chat with bot",
-    description="Submit a chat query. Backend retrieves only top-k relevant segments via vector search from uploaded files (if any) and passes them to Gemini. Returns only Gemini's final answer."
+    description=(
+        "Submit a chat query. For Type 2 (knowledge/explanation) queries, only the user's query "
+        "and optional chat context are sent to Gemini. No embeddings/column matching or Pandas "
+        "execution are invoked. For Type 1 (data lookup), a safe Pandas flow may be used."
+    ),
 )
 def chat(request: ChatRequest):
     """
     PUBLIC_INTERFACE
-    Handles user's chat request. For Type 1 (data lookup) queries, the backend:
-      1) Generates a prompt including the user query, relevant (top-5) columns, and XLSX schema,
-      2) Uses Gemini to generate SAFE Pandas code (read-only, <= 20 rows),
-      3) Safely executes this code on the uploaded XLSX file(s),
-      4) Returns the resulting table/summary as the chat answer.
+    Handles user's chat request.
 
-    For Type 2 queries (knowledge/explanation), the backend retrieves top-k relevant text chunks
-    via vector search and uses Gemini to produce a natural language answer.
+    Safety and efficiency rules:
+      - Type 2 (knowledge/explanation): STRICTLY bypass all Pandas/data lookup logic. Do not perform
+        column matching, embeddings for columns, or any Pandas execution. Only the user query plus
+        optional chat history/context is sent to Gemini for a natural-language answer.
+      - Type 1 (data lookup): May use the safe XLSX/Pandas flow guarded by strict validation.
 
-    All answers returned are concise and avoid source/meta disclaimers.
+    Returns concise answers without source/meta disclaimers.
     """
     import traceback
 
@@ -548,7 +551,7 @@ def chat(request: ChatRequest):
         if session_id not in CONVERSATION_MEMORY:
             CONVERSATION_MEMORY[session_id] = ConversationBufferMemory(
                 return_messages=True,
-                output_key="output"
+                output_key="output",
             )
         memory = CONVERSATION_MEMORY[session_id]
 
@@ -573,84 +576,101 @@ def chat(request: ChatRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to save user context: {e}")
 
-        # If Type 1 data lookup, attempt XLSX/Pandas flow
-        if c_type == 1:
+        # EARLY RETURN: Type 2 strictly bypasses any Pandas/data lookup and column/embedding logic.
+        if c_type == 2:
+            # Retrieve only top-k text chunks from previously uploaded context (optional)
+            # Note: This retrieval does not involve column embeddings nor Pandas execution.
+            top_chunks = _vector_search(session_id, request.query, top_k=3)
+            retrieved_context = "\n---\n".join(top_chunks).strip()
+
             try:
-                from .xlsx_pandas_exec import (
-                    extract_xlsx_schema_from_bytes,
-                    get_top_k_relevant_columns_for_query,
-                    generate_pandas_code_with_gemini,
-                    execute_safe_pandas_code_on_xlsx,
-                )
-                # We need a recent uploaded XLSX. We don't persist raw files on disk; we can leverage
-                # the CONTEXT_STORE to find file names, but it contains extracted text only.
-                # To support execution, we store last XLSX bytes per session during upload (new small cache).
+                gemini_answer = get_gemini_response(request.query, memory, extra_context=retrieved_context)
+            except Exception as e:
+                gemini_answer = f"[Gemini unavailable: {e}]"
+
+            gemini_answer = _clean_gemini_output(_safe_str_output(gemini_answer))
+            try:
+                memory.save_context({"input": request.query}, {"output": _safe_str_output(gemini_answer)})
             except Exception:
-                # If imports fail, fallback to Type 2 behavior
                 pass
 
-            # Try to use in-memory cache of last XLSX bytes (created by upload endpoint enhancement below)
-            xlsx_cache: Dict[str, bytes] = SESSION_META.setdefault(session_id, {}).get("__xlsx_cache__", {})  # type: ignore
-            if isinstance(xlsx_cache, dict) and xlsx_cache:
-                # choose the most recently added XLSX bytes
-                last_key = list(xlsx_cache.keys())[-1]
-                xbytes = xlsx_cache[last_key]
-                try:
-                    # Build schema
-                    schema = extract_xlsx_schema_from_bytes(xbytes)
-                    # choose relevant columns (top-5)
-                    header_store = get_session_header_embeddings(session_id)
-                    top_cols = get_top_k_relevant_columns_for_query(request.query, header_store, k=5)
-                    # Generate SAFE pandas code with Gemini
-                    code = generate_pandas_code_with_gemini(request.query, top_cols, schema)
-                    # Execute safely
-                    rendered = execute_safe_pandas_code_on_xlsx(code, xbytes)
-                    answer_text = rendered if rendered.strip() else "No matching rows found."
-                    # Save and return
-                    answer_text = _clean_gemini_output(_safe_str_output(answer_text))
-                    try:
-                        memory.save_context({"input": request.query}, {"output": _safe_str_output(answer_text)})
-                    except Exception:
-                        pass
-                    return ChatAnswerResponse(answer=answer_text)
-                except Exception as e:
-                    # If anything fails in the pandas path, fall back to normal Gemini answer with context
-                    fallback_err = f"[Data lookup flow failed: {e}]"
-                    # continue to Type 2 flow below with retrieved context, but include a short note
-                    fallback_note = fallback_err
-            else:
-                fallback_note = "[No XLSX available for data lookup]"
+            return ChatAnswerResponse(answer=gemini_answer)
 
-            # Fallback to Type 2-like behavior if we reach here
+        # Type 1 data lookup: attempt XLSX/Pandas flow
+        try:
+            from .xlsx_pandas_exec import (
+                extract_xlsx_schema_from_bytes,
+                get_top_k_relevant_columns_for_query,
+                generate_pandas_code_with_gemini,
+                execute_safe_pandas_code_on_xlsx,
+            )
+        except Exception:
+            # If imports fail, fall back to Type 2 behavior (natural language only)
             top_chunks = _vector_search(session_id, request.query, top_k=3)
             retrieved_context = "\n---\n".join(top_chunks).strip()
             try:
                 gemini_answer = get_gemini_response(request.query, memory, extra_context=retrieved_context)
             except Exception as e:
                 gemini_answer = f"[Gemini unavailable: {e}]"
-            final = (fallback_note + " " if fallback_note else "") + _clean_gemini_output(_safe_str_output(gemini_answer))
+            final = _clean_gemini_output(_safe_str_output(gemini_answer))
             try:
                 memory.save_context({"input": request.query}, {"output": _safe_str_output(final)})
             except Exception:
                 pass
             return ChatAnswerResponse(answer=final)
 
-        # Type 2: knowledge/explanation (existing behavior)
-        top_chunks = _vector_search(session_id, request.query, top_k=3)
-        retrieved_context = "\n---\n".join(top_chunks).strip()
-
-        try:
-            gemini_answer = get_gemini_response(request.query, memory, extra_context=retrieved_context)
-        except Exception as e:
-            gemini_answer = "[Gemini unavailable: {}]".format(e)
-
-        gemini_answer = _clean_gemini_output(_safe_str_output(gemini_answer))
-        try:
-            memory.save_context({"input": request.query}, {"output": _safe_str_output(gemini_answer)})
-        except Exception:
-            pass
-
-        return ChatAnswerResponse(answer=gemini_answer)
+        # Use in-memory cache of last XLSX bytes (created by upload endpoint)
+        xlsx_cache: Dict[str, bytes] = SESSION_META.setdefault(session_id, {}).get("__xlsx_cache__", {})  # type: ignore
+        if isinstance(xlsx_cache, dict) and xlsx_cache:
+            # choose the most recently added XLSX bytes
+            last_key = list(xlsx_cache.keys())[-1]
+            xbytes = xlsx_cache[last_key]
+            try:
+                # Build schema
+                schema = extract_xlsx_schema_from_bytes(xbytes)
+                # choose relevant columns (top-5) from header store
+                header_store = get_session_header_embeddings(session_id)
+                top_cols = get_top_k_relevant_columns_for_query(request.query, header_store, k=5)
+                # Generate SAFE pandas code with Gemini
+                code = generate_pandas_code_with_gemini(request.query, top_cols, schema)
+                # Execute safely
+                rendered = execute_safe_pandas_code_on_xlsx(code, xbytes)
+                answer_text = rendered if rendered.strip() else "No matching rows found."
+                # Save and return
+                answer_text = _clean_gemini_output(_safe_str_output(answer_text))
+                try:
+                    memory.save_context({"input": request.query}, {"output": _safe_str_output(answer_text)})
+                except Exception:
+                    pass
+                return ChatAnswerResponse(answer=answer_text)
+            except Exception as e:
+                # If anything fails in the pandas path, fall back to natural language with minimal context
+                top_chunks = _vector_search(session_id, request.query, top_k=3)
+                retrieved_context = "\n---\n".join(top_chunks).strip()
+                try:
+                    gemini_answer = get_gemini_response(request.query, memory, extra_context=retrieved_context)
+                except Exception as ge:
+                    gemini_answer = f"[Gemini unavailable: {ge}]"
+                final = _clean_gemini_output(f"[Data lookup flow failed: {e}] {_safe_str_output(gemini_answer)}")
+                try:
+                    memory.save_context({"input": request.query}, {"output": _safe_str_output(final)})
+                except Exception:
+                    pass
+                return ChatAnswerResponse(answer=final)
+        else:
+            # No XLSX available; respond with natural language using optional text context
+            top_chunks = _vector_search(session_id, request.query, top_k=3)
+            retrieved_context = "\n---\n".join(top_chunks).strip()
+            try:
+                gemini_answer = get_gemini_response(request.query, memory, extra_context=retrieved_context)
+            except Exception as e:
+                gemini_answer = f"[Gemini unavailable: {e}]"
+            final = _clean_gemini_output(_safe_str_output(gemini_answer))
+            try:
+                memory.save_context({"input": request.query}, {"output": _safe_str_output(final)})
+            except Exception:
+                pass
+            return ChatAnswerResponse(answer=final)
 
     except HTTPException:
         raise
