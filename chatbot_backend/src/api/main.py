@@ -12,7 +12,7 @@
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 import google.generativeai as genai
 
 from dotenv import load_dotenv
@@ -40,6 +40,13 @@ CONVERSATION_MEMORY: Dict[str, ConversationBufferMemory] = {}
 # Per-session uploaded context store (legacy tracking for previews).
 # Structure: { session_id: { "files": [ {filename, size, chars, preview, error?} ], "combined": str } }
 CONTEXT_STORE: Dict[str, Dict[str, Any]] = {}
+
+# Per-session metadata store for chat handling (e.g., classification for future increments).
+# Structure:
+#   SESSION_META[session_id] = {
+#       "last_classification": _ChatClassification
+#   }
+SESSION_META: Dict[str, Dict[str, Any]] = {}
 
 # Per-session in-memory vector index for RAG.
 # Structure:
@@ -95,6 +102,13 @@ class ChatAnswerResponse(BaseModel):
     answer: str = Field(..., description="Final natural language answer returned by Gemini.")
 
 
+class _ChatClassification(BaseModel):
+    """Internal schema to hold classification result for future increments."""
+    type: int = Field(..., description="1 for data lookup; 2 for knowledge/explanation.")
+    label: str = Field(..., description="Human-readable label of the classification type.")
+    matched_keyword: Optional[str] = Field(default=None, description="Matched keyword if any.")
+
+
 # --- AUTH SCHEMAS FOR REGISTRATION & LOGIN ---
 
 class RegisterRequest(BaseModel):
@@ -139,6 +153,39 @@ class UploadContextResponse(BaseModel):
     files_processed: List[UploadedFileResult] = Field(..., description="Per-file processing results")
     total_chars: int = Field(..., description="Total number of characters added to session context")
     message: str = Field(..., description="Status message/acknowledgment")
+
+
+def _normalize_query(q: str) -> str:
+    """Normalize a query string for keyword checks."""
+    return (q or "").strip().lower()
+
+
+# PUBLIC_INTERFACE
+def classify_query_type(query: str) -> Tuple[int, str, Optional[str]]:
+    """
+    PUBLIC_INTERFACE
+    Classify the user's query as either:
+      - Type 1 (data lookup): if it contains any of the rule-based keywords,
+      - Type 2 (knowledge/explanation): otherwise. Defaults to Type 2 when uncertain.
+
+    Rule-based, case-insensitive detection. Current keywords:
+      ['show', 'list', 'get rows', 'display', 'find', 'filter', 'where']
+
+    Args:
+        query (str): The user query to classify.
+
+    Returns:
+        Tuple[int, str, Optional[str]]: (type_number, label, matched_keyword)
+            type_number: 1 or 2
+            label: 'data_lookup' or 'knowledge_explanation'
+            matched_keyword: the keyword that triggered Type 1, if any
+    """
+    keywords = ["show", "list", "get rows", "display", "find", "filter", "where"]
+    q = _normalize_query(query)
+    for kw in keywords:
+        if kw in q:
+            return 1, "data_lookup", kw
+    return 2, "knowledge_explanation", None
 
 
 def _clean_gemini_output(text: str) -> str:
@@ -483,6 +530,11 @@ def chat(request: ChatRequest):
     Handles user's chat request. All answers come directly from Gemini.
     If the user has uploaded files for this session, the most relevant snippets from those files are retrieved
     via semantic vector search and provided as additional context to Gemini. The API returns only Gemini's final answer.
+
+    Internal step (for future use): The user's query is first classified using a rule-based detector:
+        - Type 1: data lookup (keywords: show, list, get rows, display, find, filter, where)
+        - Type 2: knowledge/explanation (default when uncertain)
+    The classification result is stored per-session but does not change answer generation yet.
     """
     import traceback
 
@@ -502,6 +554,17 @@ def chat(request: ChatRequest):
             if val is None or (isinstance(val, str) and val.strip() == ""):
                 return fallback
             return str(val)
+
+        # Rule-based classification (stored for future use)
+        c_type, c_label, c_kw = classify_query_type(request.query)
+        try:
+            SESSION_META.setdefault(session_id, {})
+            SESSION_META[session_id]["last_classification"] = _ChatClassification(
+                type=c_type, label=c_label, matched_keyword=c_kw
+            ).model_dump()
+        except Exception:
+            # Non-fatal; proceed even if meta storage fails
+            pass
 
         # Log user input with a temp placeholder output
         try:
@@ -630,6 +693,26 @@ def get_session_header_embeddings(session_id: str) -> Dict[str, Any]:
         } or empty dict if none stored.
     """
     return SESSION_XLSX_HEADER_EMBEDDINGS.get(session_id, {})
+
+
+# PUBLIC_INTERFACE
+def get_last_query_classification(session_id: str) -> Dict[str, Any]:
+    """
+    PUBLIC_INTERFACE
+    Retrieve the most recent query classification metadata for a session.
+
+    Args:
+        session_id (str): Chat session identifier.
+
+    Returns:
+        dict: {
+            "type": int,                       # 1 or 2
+            "label": str,                      # 'data_lookup' or 'knowledge_explanation'
+            "matched_keyword": Optional[str],  # keyword that triggered Type 1, if any
+        }
+        or empty dict if none stored.
+    """
+    return (SESSION_META.get(session_id, {}) or {}).get("last_classification", {}) or {}
 
 
 # --- FILE UPLOAD ENDPOINTS FOR CONTEXT ---
