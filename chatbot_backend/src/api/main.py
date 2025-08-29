@@ -631,10 +631,55 @@ def chat(request: ChatRequest):
                 # choose relevant columns (top-5) from header store
                 header_store = get_session_header_embeddings(session_id)
                 top_cols = get_top_k_relevant_columns_for_query(request.query, header_store, k=5)
-                # Generate SAFE pandas code with Gemini
-                code = generate_pandas_code_with_gemini(request.query, top_cols, schema)
-                # Execute safely
-                rendered = execute_safe_pandas_code_on_xlsx(code, xbytes)
+
+                # If no relevant columns, do not call Gemini; reply immediately
+                if not top_cols:
+                    answer_text = "No relevant column found in the uploaded Excel."
+                    answer_text = _clean_gemini_output(_safe_str_output(answer_text))
+                    try:
+                        memory.save_context({"input": request.query}, {"output": _safe_str_output(answer_text)})
+                    except Exception:
+                        pass
+                    return ChatAnswerResponse(answer=answer_text)
+
+                # Helper to execute with robust error handling and optional retry hint
+                def _try_execute_with_retry(original_query: str, columns: List[str], schema_dict: Dict[str, Any], xbytes_local: bytes) -> str:
+                    """
+                    Generate code with Gemini, execute safely; on execution failure,
+                    retry Gemini by appending the error message and re-execute.
+                    Returns final rendered output or raises last exception.
+                    """
+                    # First generation
+                    code_primary = generate_pandas_code_with_gemini(original_query, columns, schema_dict)
+                    try:
+                        rendered_primary = execute_safe_pandas_code_on_xlsx(code_primary, xbytes_local)
+                        return rendered_primary if rendered_primary.strip() else "No matching rows found."
+                    except Exception as exec_err:
+                        # Retry: include error in the prompt to Gemini for correction
+                        err_msg = f"{type(exec_err).__name__}: {exec_err}"
+                        retry_query = (
+                            f"{original_query}\n\nThe previous attempt raised an error while running the pandas code:\n"
+                            f"{err_msg}\n\nPlease correct the code accordingly. Keep it read-only and assign to RESULT."
+                        )
+                        try:
+                            code_retry = generate_pandas_code_with_gemini(retry_query, columns, schema_dict)
+                        except Exception as gen_retry_err:
+                            # If code generation itself fails on retry, surface a friendly message
+                            raise RuntimeError(f"Failed to generate corrected Pandas code: {gen_retry_err}") from gen_retry_err
+
+                        try:
+                            rendered_retry = execute_safe_pandas_code_on_xlsx(code_retry, xbytes_local)
+                            return rendered_retry if rendered_retry.strip() else "No matching rows found."
+                        except Exception as exec_retry_err:
+                            # Bubble up with a friendly error for the caller to handle
+                            raise RuntimeError(
+                                f"Your request could not be fulfilled due to data query errors. "
+                                f"Please refine your question or check the Excel structure. Details: "
+                                f"{type(exec_retry_err).__name__}: {exec_retry_err}"
+                            ) from exec_retry_err
+
+                # Generate SAFE pandas code with Gemini + execute with retry if needed
+                rendered = _try_execute_with_retry(request.query, top_cols, schema, xbytes)
                 answer_text = rendered if rendered.strip() else "No matching rows found."
                 # Save and return
                 answer_text = _clean_gemini_output(_safe_str_output(answer_text))
