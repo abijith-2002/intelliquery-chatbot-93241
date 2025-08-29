@@ -50,6 +50,15 @@ CONTEXT_STORE: Dict[str, Dict[str, Any]] = {}
 #   }
 RAG_INDEX_STORE: Dict[str, Dict[str, Any]] = {}
 
+# Per-session XLSX header embeddings store for future use (preprocessing).
+# Structure:
+#   SESSION_XLSX_HEADER_EMBEDDINGS[session_id] = {
+#       "headers": [str, ...],                  # unique column names across uploaded XLSX files
+#       "embeddings": [Optional[List[float]], ...],  # one-to-one with headers
+#       "embedding_model": str
+#   }
+SESSION_XLSX_HEADER_EMBEDDINGS: Dict[str, Dict[str, Any]] = {}
+
 app = FastAPI(
     title="IntelliQuery Chatbot API",
     version="1.0.0",
@@ -296,6 +305,74 @@ def _index_text_for_session(session_id: str, filename: str, text: str):
         store["embeddings"].append(vec)  # vec could be None; retrieval handles fallback
 
 
+def _ensure_session_header_store(session_id: str):
+    """
+    Ensure XLSX header embedding store exists for the session.
+    """
+    if session_id not in SESSION_XLSX_HEADER_EMBEDDINGS:
+        SESSION_XLSX_HEADER_EMBEDDINGS[session_id] = {
+            "headers": [],
+            "embeddings": [],
+            "embedding_model": _get_embedding_model_name(),
+        }
+
+
+def _extract_xlsx_headers_from_bytes(content: bytes) -> List[str]:
+    """
+    Extract unique column headers from all sheets in an XLSX file.
+    Uses the first non-empty row of each sheet as header row.
+    """
+    from openpyxl import load_workbook
+    import io
+
+    headers: List[str] = []
+    wb = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
+    for ws in wb.worksheets:
+        # find first non-empty row
+        header_row = None
+        for row in ws.iter_rows(values_only=True):
+            if row and any((str(c).strip() if c is not None else "") for c in row):
+                header_row = row
+                break
+        if header_row:
+            for cell in header_row:
+                name = (str(cell).strip() if cell is not None else "")
+                if name:
+                    headers.append(name)
+    # deduplicate while preserving order
+    seen = set()
+    uniq = []
+    for h in headers:
+        if h not in seen:
+            seen.add(h)
+            uniq.append(h)
+    return uniq
+
+
+def _store_session_header_embeddings(session_id: str, headers: List[str]):
+    """
+    Generate embeddings for the provided headers and store them per-session.
+    If embeddings are unavailable, None entries are stored to preserve alignment.
+    """
+    if not headers:
+        return
+    _ensure_session_header_store(session_id)
+    vectors = _embed_texts(headers)
+    store = SESSION_XLSX_HEADER_EMBEDDINGS[session_id]
+
+    # Merge with any existing headers, avoiding duplicates.
+    existing_index = {h: i for i, h in enumerate(store["headers"])}
+    for h, v in zip(headers, vectors):
+        if h in existing_index:
+            # optionally update embedding if missing
+            idx = existing_index[h]
+            if store["embeddings"][idx] is None and v is not None:
+                store["embeddings"][idx] = v
+        else:
+            store["headers"].append(h)
+            store["embeddings"].append(v)
+
+
 def _vector_search(session_id: str, query: str, top_k: int = 3) -> List[str]:
     """
     Perform semantic vector search for the top_k relevant chunks using cosine similarity
@@ -536,6 +613,25 @@ def chat_wsinfo():
     return {"detail": "Current version supports REST API chat only. Real-time WebSocket may be added in future versions."}
 
 
+# PUBLIC_INTERFACE
+def get_session_header_embeddings(session_id: str) -> Dict[str, Any]:
+    """
+    PUBLIC_INTERFACE
+    Retrieve the stored XLSX header embeddings for the given session.
+
+    Args:
+        session_id (str): Chat session identifier.
+
+    Returns:
+        dict: {
+            "headers": List[str],
+            "embeddings": List[Optional[List[float]]],
+            "embedding_model": str
+        } or empty dict if none stored.
+    """
+    return SESSION_XLSX_HEADER_EMBEDDINGS.get(session_id, {})
+
+
 # --- FILE UPLOAD ENDPOINTS FOR CONTEXT ---
 
 # PUBLIC_INTERFACE
@@ -605,6 +701,16 @@ def upload_chat_context(
         text, err = extract_text_from_bytes(filename, data or b"")
         preview = summarize_text_preview(text, max_chars=500) if text else ""
         chars = len(text)
+
+        # If XLSX, also extract unique column headers and precompute embeddings (preprocessing only)
+        try:
+            if (filename or "").lower().endswith(".xlsx") and data:
+                headers = _extract_xlsx_headers_from_bytes(data)
+                if headers:
+                    _store_session_header_embeddings(session_id, headers)
+        except Exception:
+            # Header extraction is best-effort; ignore failures to not block upload flow
+            pass
 
         # Append to combined only if successful and non-empty
         if text and not err:
