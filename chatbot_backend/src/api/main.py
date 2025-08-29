@@ -66,6 +66,13 @@ RAG_INDEX_STORE: Dict[str, Dict[str, Any]] = {}
 #   }
 SESSION_XLSX_HEADER_EMBEDDINGS: Dict[str, Dict[str, Any]] = {}
 
+# Per-session cache of last relevant columns detected for Type 1 queries.
+# Structure:
+#   SESSION_RELEVANT_COLUMNS[session_id] = [
+#       {"column": str, "score": float, "components": {"exact": float, "fuzzy": float, "semantic": float}}
+#   ]
+SESSION_RELEVANT_COLUMNS: Dict[str, List[Dict[str, Any]]] = {}
+
 app = FastAPI(
     title="IntelliQuery Chatbot API",
     version="1.0.0",
@@ -453,6 +460,111 @@ def _vector_search(session_id: str, query: str, top_k: int = 3) -> List[str]:
 
 
 # PUBLIC_INTERFACE
+def _safe_cosine(query_vec: Optional[List[float]], col_vec: Optional[List[float]]) -> float:
+    """
+    Cosine similarity with None-safety. Returns 0.0 if either vector is missing.
+    """
+    if not query_vec or not col_vec:
+        return 0.0
+    return _cosine_similarity(query_vec, col_vec)
+
+
+def _fuzzy_ratio(a: str, b: str) -> float:
+    """
+    RapidFuzz-based similarity ratio in [0,1]. Falls back to simple similarity if rapidfuzz is unavailable.
+    """
+    try:
+        from rapidfuzz import fuzz
+        return float(fuzz.token_set_ratio(a, b)) / 100.0
+    except Exception:
+        return _simple_similarity(a, b)
+
+
+def _exact_match_score(a: str, b: str) -> float:
+    """
+    Case-insensitive exact match score: 1.0 if equal after strip/lower, else 0.0
+    """
+    return 1.0 if (a or "").strip().lower() == (b or "").strip().lower() else 0.0
+
+
+# PUBLIC_INTERFACE
+def compute_relevant_columns_for_query(
+    session_id: str,
+    query: str,
+    top_k: int = 5,
+    weights: Optional[Dict[str, float]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    PUBLIC_INTERFACE
+    Compute top relevant XLSX columns for a given query by aggregating:
+      - exact string match score
+      - fuzzy token-set ratio (rapidfuzz)
+      - semantic cosine similarity (Gemini embeddings)
+
+    Args:
+        session_id (str): The chat session id.
+        query (str): User query text.
+        top_k (int): Number of top results to return.
+        weights (Optional[Dict[str, float]]): Weights for components {"exact": w1, "fuzzy": w2, "semantic": w3}.
+
+    Returns:
+        List[Dict[str, Any]]: Sorted list of columns with scores:
+            [
+              {"column": "Customer Name",
+               "score": 0.83,
+               "components": {"exact": 1.0, "fuzzy": 0.90, "semantic": 0.60}}
+            ]
+        Returns empty list if no headers stored for session.
+    """
+    store = SESSION_XLSX_HEADER_EMBEDDINGS.get(session_id)
+    if not store or not store.get("headers"):
+        return []
+
+    headers: List[str] = store["headers"]
+    header_vecs: List[Optional[List[float]]] = store.get("embeddings", [None] * len(headers))
+
+    # Prepare components
+    q_norm = (query or "").strip()
+    query_vec = _embed_one(q_norm)
+
+    # Default weights: prioritize fuzzy and semantic, keep exact as strong signal if present
+    w = {"exact": 0.5, "fuzzy": 0.3, "semantic": 0.6}
+    if weights:
+        w.update(weights)
+
+    scored: List[Dict[str, Any]] = []
+    for name, vec in zip(headers, header_vecs):
+        comp_exact = _exact_match_score(q_norm, name)
+        comp_fuzzy = _fuzzy_ratio(q_norm, name)
+        comp_sem = _safe_cosine(query_vec, vec)
+
+        # Aggregate score: weighted sum, clipped to [0,1]
+        agg = w["exact"] * comp_exact + w["fuzzy"] * comp_fuzzy + w["semantic"] * comp_sem
+        agg = max(0.0, min(1.0, float(agg)))
+
+        scored.append({
+            "column": name,
+            "score": agg,
+            "components": {
+                "exact": round(comp_exact, 4),
+                "fuzzy": round(comp_fuzzy, 4),
+                "semantic": round(comp_sem, 4),
+            },
+        })
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[: max(1, top_k)]
+
+
+# PUBLIC_INTERFACE
+def get_last_relevant_columns(session_id: str) -> List[Dict[str, Any]]:
+    """
+    PUBLIC_INTERFACE
+    Retrieve the last computed relevant columns for the session (Type 1 queries).
+    """
+    return SESSION_RELEVANT_COLUMNS.get(session_id, [])
+
+
 def get_gemini_response(
     query: str,
     memory: ConversationBufferMemory,
@@ -575,6 +687,18 @@ def chat(request: ChatRequest):
         # Retrieve top-k relevant chunks from vector index
         top_chunks = _vector_search(session_id, request.query, top_k=3)
         retrieved_context = "\n---\n".join(top_chunks).strip()
+
+        # For Type 1 (data lookup) queries, compute relevant XLSX columns and store in session meta.
+        if c_type == 1:
+            try:
+                top_columns = compute_relevant_columns_for_query(session_id, request.query, top_k=5)
+                SESSION_RELEVANT_COLUMNS[session_id] = top_columns
+                # Also expose in SESSION_META to make discoverable by future increments
+                SESSION_META.setdefault(session_id, {})
+                SESSION_META[session_id]["last_relevant_columns"] = top_columns
+            except Exception:
+                # Non-fatal; ignore failure
+                pass
 
         # Compose Gemini answer with retrieved context (if any)
         try:
