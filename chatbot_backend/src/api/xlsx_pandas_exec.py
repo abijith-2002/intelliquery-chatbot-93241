@@ -2,13 +2,14 @@ import io
 import re
 import ast
 import textwrap
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 
 import pandas as pd
 from openpyxl import load_workbook
 
 from .config_utils import get_gemini_api_key
 import google.generativeai as genai
+from rapidfuzz import fuzz
 
 
 SAFE_BUILTINS = {
@@ -73,29 +74,128 @@ def extract_xlsx_schema_from_bytes(content: bytes) -> Dict[str, Any]:
     return {"sheets": sheets_info, "all_columns": all_cols_ordered}
 
 
-def _pick_top_k_columns(query: str, columns: List[str], k: int = 5) -> List[str]:
+def _normalize_text(s: str) -> str:
+    """Lowercase and collapse whitespace for matching."""
+    return " ".join((s or "").strip().lower().split())
+
+def _tokenize(s: str) -> List[str]:
+    """Simple alnum tokenization."""
+    return re.findall(r"[A-Za-z0-9]+", (s or "").lower())
+
+def _lexical_overlap_score(query: str, candidate: str) -> float:
+    """Token overlap ratio as simple lexical score."""
+    qset = set(_tokenize(query))
+    cset = set(_tokenize(candidate))
+    if not qset or not cset:
+        return 0.0
+    shared = qset.intersection(cset)
+    return len(shared) / max(len(qset), len(cset))
+
+def _fuzzy_ratio_score(query: str, candidate: str) -> float:
+    """RapidFuzz partial ratio normalized to 0..1."""
+    if not query or not candidate:
+        return 0.0
+    return fuzz.partial_ratio(_normalize_text(query), _normalize_text(candidate)) / 100.0
+
+def _cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
+    """Cosine similarity between vectors, zero-safe."""
+    if not vec_a or not vec_b or len(vec_a) != len(vec_b):
+        return 0.0
+    import math
+    dot = sum(x * y for x, y in zip(vec_a, vec_b))
+    a_norm = math.sqrt(sum(x * x for x in vec_a))
+    b_norm = math.sqrt(sum(y * y for y in vec_b))
+    if a_norm == 0 or b_norm == 0:
+        return 0.0
+    return dot / (a_norm * b_norm)
+
+def _embed_one(text: str) -> Optional[List[float]]:
     """
-    Pick top-k columns using simple lexical overlap as fallback relevance.
+    Local wrapper to embed a single text using Gemini; returns None if unavailable.
+    We re-define here to avoid importing from main to keep module isolation.
+    """
+    key = get_gemini_api_key()
+    if not key:
+        return None
+    try:
+        genai.configure(api_key=key)
+        model_name = "models/text-embedding-004"
+        result = genai.embed_content(model=model_name, content=text)
+        vec = result.get("embedding", {}).get("values")
+        if isinstance(vec, list) and vec and isinstance(vec[0], (int, float)):
+            return [float(v) for v in vec]
+        return None
+    except Exception:
+        return None
+
+def _semantic_similarity_score(query: str, candidate: str) -> float:
+    """Cosine similarity of embeddings if available; else 0.0."""
+    qv = _embed_one(query)
+    cv = _embed_one(candidate)
+    if qv and cv:
+        return _cosine_similarity(qv, cv)
+    return 0.0
+
+def _rank_columns_by_combined_scores(query: str, columns: List[str], k: int = 5) -> List[str]:
+    """
+    Combine exact match, fuzzy match, and semantic similarity to rank columns.
+
+    Scoring approach:
+    - exact_boost: 1.0 if normalized exact string match, else 0
+    - fuzzy_score: RapidFuzz partial ratio in 0..1
+    - lexical_score: token overlap 0..1 (fallback signal)
+    - semantic_score: cosine similarity on embeddings 0..1 if embeddings available; else 0
+
+    Final score = exact_boost*2.0 + 0.6*fuzzy_score + 0.3*semantic_score + 0.2*lexical_score
+
+    We also give an additional small boost if candidate is a substring of query or vice versa.
     """
     if not columns:
         return []
-    q = (query or "").lower()
-    scored = []
+    nq = _normalize_text(query)
+
+    # Try to compute embedding for query once to avoid repeated calls
+    # but keep _semantic_similarity_score for candidates (most lightweight approach here)
+    q_embed = _embed_one(query)
+
+    scored: List[Tuple[float, str]] = []
     for c in columns:
-        name = c or ""
-        tokens = re.findall(r"[A-Za-z0-9]+", name.lower())
-        score = sum(1 for t in tokens if t and t in q)
-        scored.append((score, c))
+        if not c:
+            continue
+        nc = _normalize_text(c)
+        exact_boost = 1.0 if nq == nc else 0.0
+        fuzzy_score = _fuzzy_ratio_score(query, c)
+        lexical_score = _lexical_overlap_score(query, c)
+
+        # semantic: prefer using precomputed query embedding if available
+        semantic_score = 0.0
+        if q_embed:
+            c_embed = _embed_one(c)
+            if c_embed:
+                semantic_score = _cosine_similarity(q_embed, c_embed)
+        # small containment boost
+        containment_boost = 0.1 if (nc in nq or nq in nc) and not exact_boost else 0.0
+
+        combined = exact_boost * 2.0 + 0.6 * fuzzy_score + 0.3 * semantic_score + 0.2 * lexical_score + containment_boost
+        scored.append((combined, c))
+
+    # Sort by score desc and return top k unique
     scored.sort(key=lambda x: x[0], reverse=True)
-    top = [c for _, c in scored[:k]]
-    # ensure uniqueness and with non-empty
     seen = set()
-    out = []
-    for c in top:
-        if c and c not in seen:
-            out.append(c)
-            seen.add(c)
+    out: List[str] = []
+    for _, name in scored:
+        if name not in seen:
+            out.append(name)
+            seen.add(name)
+        if len(out) >= k:
+            break
     return out
+
+def _pick_top_k_columns(query: str, columns: List[str], k: int = 5) -> List[str]:
+    """
+    Backward-compatible wrapper that now uses combined ranking (exact + fuzzy + semantic).
+    """
+    return _rank_columns_by_combined_scores(query, columns, k=k)
 
 
 def _build_gemini_pandas_prompt(user_query: str, top_columns: List[str], schema: Dict[str, Any]) -> str:
@@ -274,15 +374,27 @@ def execute_safe_pandas_code_on_xlsx(code: str, xlsx_bytes: bytes) -> str:
 def get_top_k_relevant_columns_for_query(user_query: str, header_store: Dict[str, Any], k: int = 5) -> List[str]:
     """
     PUBLIC_INTERFACE
-    Determine the top-k relevant columns from the stored header embedding store using lexical fallback.
+    Determine the top-k relevant columns from the stored header information by combining:
+      1) Exact match (strong boost if query equals the column name post-normalization)
+      2) Fuzzy match (RapidFuzz partial ratio)
+      3) Semantic similarity (cosine similarity on Gemini embeddings)
+    with lexical token-overlap as an additional weak signal.
+
+    If embeddings are unavailable, semantic score gracefully degrades to 0 and the
+    ranking relies on exact + fuzzy + lexical.
 
     Args:
-        user_query (str): The question.
-        header_store (dict): From session header store (get_session_header_embeddings).
-        k (int): Number to select.
+        user_query (str): The user question or instruction.
+        header_store (dict): Store from get_session_header_embeddings(session_id), containing:
+            {
+                "headers": List[str],
+                "embeddings": Optional[List[List[float] or None]],  # kept for future extension
+                "embedding_model": str
+            }
+        k (int): Number of top columns to return.
 
     Returns:
-        List[str]: up to k column names
+        List[str]: Up to k column names ranked by combined relevance.
     """
     headers = (header_store or {}).get("headers", []) or []
     return _pick_top_k_columns(user_query, headers, k=k)
